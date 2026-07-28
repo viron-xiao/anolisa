@@ -5,10 +5,14 @@ use crate::approval::broker::{
     provider_deny_response, ApprovalExecutionMetadata, ApprovalOutcome, ApprovalOutcomeInput,
     ProviderApprovalStatus, ProviderResponseInput,
 };
+use crate::approval::handoff::shell_handoff_command_from_request;
 use crate::approval::journal::approval_audit_input;
 use crate::approval::provider::mark_provider_approval_resolved;
 use crate::approval::resolution::request_can_receive_host_executed_result;
+use crate::runtime::evidence_delivery::record_readonly_compound_completion;
 use crate::runtime::prelude::*;
+use crate::tools::readonly_compound::{build_readonly_compound_plan, run_readonly_compound};
+use crate::tools::{ReadonlyPipelineConfig, ReadonlyPipelineOutput};
 
 pub(crate) fn render_trusted_tool<W: Write>(
     state: &mut InlineState,
@@ -203,8 +207,20 @@ pub(crate) fn render_auto_approved_tool<W: Write>(
         ) else {
             continue;
         };
-        if auto_policy.route(&assessment) != AutoExecutionRoute::DirectReadonlyBroker {
-            continue;
+        // Issue #1882: a fully readonly compound runs through the
+        // dedicated argv executor instead of a shell handoff, so the
+        // executed argv never passes through a shell parsing layer.
+        match auto_policy.route(&assessment) {
+            AutoExecutionRoute::DirectReadonlyBroker => {}
+            AutoExecutionRoute::CompoundReadonlyExecutor => {
+                if run_auto_approved_readonly_compound(state, request, output)?
+                    == AutoApprovalFlow::Handled
+                {
+                    return Ok(true);
+                }
+                continue;
+            }
+            _ => continue,
         }
 
         if request_is_executable_bash_tool(&request)
@@ -398,28 +414,7 @@ fn apply_auto_approved_request_outcome<W: Write>(
         )?;
         return Ok(AutoApprovalFlow::Handled);
     }
-    // DR-6: When hooks had something to say but the tool is auto-approved,
-    // render an independent hook notice panel before the tool call header
-    // so that the user is aware of the hook's intervention.
-    if !request.hook_warnings.is_empty() {
-        let mut body: Vec<String> = Vec::new();
-        for w in &request.hook_warnings {
-            let icon = hook_warning_icon(w.decision.as_deref());
-            body.push(format!("\u{2502} {icon} {}", w.hook_name));
-            for msg_line in w.message.lines() {
-                body.push(format!("\u{2502}   {msg_line}"));
-            }
-        }
-        let renderer = RatatuiInlineRenderer::for_terminal().with_language(state.language);
-        renderer.write_notice_panel(
-            output,
-            NoticePanelModel {
-                title: "Hook",
-                body,
-                footer: None,
-            },
-        )?;
-    }
+    render_hook_warning_notices(state, request, output)?;
     let outcome = approval_outcome_for_auto_request(request);
     if outcome == ApprovalOutcome::ForegroundShellHandoff {
         let authorized = state
@@ -463,6 +458,111 @@ fn apply_auto_approved_request_outcome<W: Write>(
             Ok(AutoApprovalFlow::Handled)
         }
     }
+}
+
+// DR-6: When hooks had something to say but the tool is auto-approved,
+// render an independent hook notice panel before the tool call header
+// so that the user is aware of the hook's intervention.
+fn render_hook_warning_notices<W: Write>(
+    state: &InlineState,
+    request: &RuntimeApprovalRequest,
+    output: &mut W,
+) -> std::io::Result<()> {
+    if request.hook_warnings.is_empty() {
+        return Ok(());
+    }
+    let mut body: Vec<String> = Vec::new();
+    for w in &request.hook_warnings {
+        let icon = hook_warning_icon(w.decision.as_deref());
+        body.push(format!("\u{2502} {icon} {}", w.hook_name));
+        for msg_line in w.message.lines() {
+            body.push(format!("\u{2502}   {msg_line}"));
+        }
+    }
+    let renderer = RatatuiInlineRenderer::for_terminal().with_language(state.language);
+    renderer.write_notice_panel(
+        output,
+        NoticePanelModel {
+            title: "Hook",
+            body,
+            footer: None,
+        },
+    )
+}
+
+/// Issue #1882: runs an auto-approved readonly compound through the
+/// dedicated argv executor. Eligibility and the executed plan come
+/// from the same predicate (`build_readonly_compound_plan`), so the
+/// assessment above and the execution here can never disagree about
+/// what would run.
+fn run_auto_approved_readonly_compound<W: Write>(
+    state: &mut InlineState,
+    request: RuntimeApprovalRequest,
+    output: &mut W,
+) -> std::io::Result<AutoApprovalFlow> {
+    let Ok(command) = shell_handoff_command_from_request(&request) else {
+        // The command text cannot be reconstructed from the request;
+        // fall back to the manual flow rather than executing anything.
+        return Ok(AutoApprovalFlow::Continue);
+    };
+    let Some(plan) = build_readonly_compound_plan(&command) else {
+        // Route and plan are built by the same predicate, so a miss
+        // here means the request changed between assessment and
+        // execution; fall back to the manual flow rather than
+        // executing anything.
+        return Ok(AutoApprovalFlow::Continue);
+    };
+
+    let mut request = record_auto_approved_request(state, request);
+    let authorized = state
+        .audit
+        .as_mut()
+        .map(|audit| audit.authorize_host_execution(approval_audit_input(&request)))
+        .transpose();
+    if authorized.is_err() {
+        request.status = ApprovalRequestStatus::Blocked;
+        request.execution_path = Some("blocked_audit_required");
+        render_approval_resolution(
+            state,
+            &request,
+            MessageId::ApprovalResolutionBlockedTitle,
+            output,
+        )?;
+        return Ok(AutoApprovalFlow::Handled);
+    }
+    render_hook_warning_notices(state, &request, output)?;
+    render_approval_resolution(
+        state,
+        &request,
+        MessageId::ApprovalResolutionAutoApprovedTitle,
+        output,
+    )?;
+
+    let started = std::time::Instant::now();
+    let executed = run_readonly_compound(&plan, &ReadonlyPipelineConfig::default());
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let pipeline_output = executed.unwrap_or_else(|err| ReadonlyPipelineOutput {
+        exit_code: None,
+        stdout: String::new(),
+        stderr: format!(
+            "readonly compound executor error [{}]: {}",
+            err.reason, err.detail
+        ),
+    });
+    let evidence = record_readonly_compound_completion(
+        state,
+        &request,
+        &command,
+        &pipeline_output,
+        duration_ms,
+    );
+    mark_provider_approval_resolved(state);
+    if !evidence.provider_result_delivered
+        && !request_can_receive_host_executed_result(state, &request)
+    {
+        stop_active_agent_run_without_rendering(state, output)?;
+    }
+    Ok(AutoApprovalFlow::Handled)
 }
 
 fn respond_provider_native_shell_fallback(
@@ -658,6 +758,146 @@ mod tests {
             user_confirmed: true,
             hook_finding: None,
             recommended_skill: None,
+        }
+    }
+
+    fn compound_tool_call_event(command: &str) -> GovernedEvent {
+        GovernedEvent {
+            decision: GovernanceDecision::Display,
+            policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+            event: AgentEvent::ToolCall {
+                run_id: "run-1".to_string(),
+                tool_id: None,
+                name: "run_shell_command".to_string(),
+                input: format!(r#"{{"command":"{command}"}}"#),
+            },
+            reason: "visible streamed tool call".to_string(),
+            display_text: "visible streamed tool call".to_string(),
+            auto_execute: false,
+        }
+    }
+
+    #[test]
+    fn auto_mode_runs_fully_readonly_compound_through_executor() {
+        // Issue #1882: a compound whose every segment carries direct-
+        // readonly evidence is auto-approved and executed by the
+        // dedicated argv executor; without a provider result channel
+        // the completion falls back to shell evidence continuation,
+        // and no shell handoff is ever queued.
+        let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+        let mut state = InlineState {
+            approval_mode: CoshApprovalMode::Auto,
+            ..InlineState::default()
+        };
+        let mut output = Vec::new();
+
+        let handled = render_auto_approved_tool(
+            &mut state,
+            &[compound_tool_call_event("pwd && df -h")],
+            None,
+            AgentRunOrigin::Standard,
+            &mut output,
+            &adapter,
+        )
+        .expect("render auto approval");
+
+        assert!(handled);
+        assert!(state.control.shell_handoff().approved_is_empty());
+        let evidence = state
+            .evidence
+            .latest_shell_command_completed()
+            .expect("executor completion evidence");
+        assert_eq!(evidence.command, "pwd && df -h");
+        assert!(!evidence.provider_result_delivered);
+        assert_eq!(
+            evidence.provider_result_delivery_status,
+            "not_provider_tool_request"
+        );
+        assert_eq!(state.approvals.requests.len(), 1);
+        assert_eq!(
+            state.approvals.requests[0].status,
+            ApprovalRequestStatus::Approved
+        );
+    }
+
+    #[test]
+    fn auto_mode_executor_accepts_expanded_readonly_forms() {
+        // Issue #1882 executor widenings: a quoted separator is literal
+        // argv rather than a connector, and a history-style token
+        // stays literal argv, so both run through the executor. (The
+        // newline-separated form is covered at the assessment and
+        // executor levels; this ToolCall harness cannot carry a raw
+        // newline inside a JSON string.)
+        let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+        for command in ["echo 'a && b' ; pwd", "echo !-2 && pwd"] {
+            let mut state = InlineState {
+                approval_mode: CoshApprovalMode::Auto,
+                ..InlineState::default()
+            };
+            let mut output = Vec::new();
+
+            let handled = render_auto_approved_tool(
+                &mut state,
+                &[compound_tool_call_event(command)],
+                None,
+                AgentRunOrigin::Standard,
+                &mut output,
+                &adapter,
+            )
+            .expect("render auto approval");
+
+            assert!(handled, "{command}");
+            assert!(
+                state.control.shell_handoff().approved_is_empty(),
+                "{command}"
+            );
+            let evidence = state
+                .evidence
+                .latest_shell_command_completed()
+                .expect("executor completion evidence");
+            assert_eq!(evidence.command, command);
+            assert!(!evidence.provider_result_delivered, "{command}");
+        }
+    }
+
+    #[test]
+    fn auto_mode_keeps_ineligible_compound_on_the_manual_path() {
+        // Issue #1882 counter-cases: a segment without direct-readonly
+        // evidence, an expansion token in argv, and a null-redirected
+        // compound all fail plan building, so nothing is auto-approved,
+        // executed, or recorded.
+        let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+        for command in [
+            "cd /tmp && git status",
+            "echo $(pwd) && df -h",
+            "pwd && df -h >/dev/null",
+            "pwd\u{000c}&&\u{000c}df -h",
+        ] {
+            let mut state = InlineState {
+                approval_mode: CoshApprovalMode::Auto,
+                ..InlineState::default()
+            };
+            let mut output = Vec::new();
+
+            render_auto_approved_tool(
+                &mut state,
+                &[compound_tool_call_event(command)],
+                None,
+                AgentRunOrigin::Standard,
+                &mut output,
+                &adapter,
+            )
+            .expect("render auto approval");
+
+            assert!(
+                state.control.shell_handoff().approved_is_empty(),
+                "{command}"
+            );
+            assert!(
+                state.evidence.latest_shell_command_completed().is_none(),
+                "{command}"
+            );
+            assert!(state.approvals.requests.is_empty(), "{command}");
         }
     }
 
