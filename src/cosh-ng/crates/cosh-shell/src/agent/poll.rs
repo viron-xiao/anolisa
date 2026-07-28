@@ -353,12 +353,43 @@ fn poll_active_agent_run_with_policy<W: Write>(
                 | AgentEvent::Action { .. }
                 | AgentEvent::ToolPermissionRequest { .. }
         );
+        // #1940: register every control approval on first sight so the
+        // batch drain and run-terminal sweeps can prove it reached a
+        // terminal state even if a later pipeline stage drops it.
+        if let AgentEvent::ToolPermissionRequest {
+            run_id, request_id, ..
+        } = &event
+        {
+            if run_id != &active_run.request.id {
+                // The terminal-state guarantee is keyed on the owning
+                // run; a foreign-run entry can only be drained while
+                // that run is active, so make the contract violation
+                // visible for diagnostics.
+                tracing::debug!(
+                    event_run_id = %run_id,
+                    active_run_id = %active_run.request.id,
+                    request_id = %request_id,
+                    "control approval registered under a non-active run id"
+                );
+            }
+            state
+                .control
+                .approval_ledger_mut()
+                .register(run_id, request_id);
+        }
         let deny_reentrant_shell_request = deny_shell_during_recovery;
-        deny_reentrant_shell_request_after_foreground_evidence(
-            active_run,
-            &event,
-            deny_reentrant_shell_request,
-        );
+        if let Some((denied_run_id, denied_request_id)) =
+            deny_reentrant_shell_request_after_foreground_evidence(
+                active_run,
+                &event,
+                deny_reentrant_shell_request,
+            )
+        {
+            state
+                .control
+                .approval_ledger_mut()
+                .mark_responded(&denied_run_id, &denied_request_id);
+        }
         let provider_progress_observed = shell_evidence_provider_progress_observed(&event);
         let text_hold_reason = text_hold_reason_for_poll(TextHoldInputs {
             pending_interaction_before_poll,
@@ -403,6 +434,14 @@ fn poll_active_agent_run_with_policy<W: Write>(
 
     if let Some((fallback, origin, selectable_after_event_index)) = first_text_fallback {
         if let Some(mut active_run) = state.agent_run.active.take() {
+            // #1940: fresh-turn recovery discards the run; sweep it first
+            // so dropped control requests still reach a terminal state
+            // and the ledger cannot grow across turns.
+            crate::approval::runtime::drain_unhomed_control_requests_with_handle(
+                state,
+                &active_run.request.id,
+                &active_run.handle,
+            );
             active_run.handle.cancel();
             active_run.status_animation.clear(output)?;
         }
@@ -548,11 +587,12 @@ fn deny_reentrant_shell_request_after_foreground_evidence(
     active_run: &ActiveAgentRun,
     event: &AgentEvent,
     deny_shell_after_foreground_evidence: bool,
-) {
+) -> Option<(String, String)> {
     if !deny_shell_after_foreground_evidence {
-        return;
+        return None;
     }
     let AgentEvent::ToolPermissionRequest {
+        run_id,
         request_id,
         tool_name,
         tool_input,
@@ -560,11 +600,14 @@ fn deny_reentrant_shell_request_after_foreground_evidence(
         ..
     } = event
     else {
-        return;
+        return None;
     };
     if !is_shell_tool_name(tool_name) {
-        return;
+        return None;
     }
+    // #1940: report the response either way so the ledger sweep does not
+    // double-deny this request; a failed send means the channel is gone
+    // and the sweep could not deliver a second response anyway.
     let _ = active_run.handle.respond_approval(provider_deny_response(
         ProviderResponseInput {
             request_id,
@@ -573,6 +616,7 @@ fn deny_reentrant_shell_request_after_foreground_evidence(
         },
         "The foreground shell command already completed and its output was injected. Summarize the existing shell evidence or ask the user to start a new request before running another shell command.".to_string(),
     ));
+    Some((run_id.clone(), request_id.clone()))
 }
 
 fn active_run_has_pending_provider_native_shell_result(

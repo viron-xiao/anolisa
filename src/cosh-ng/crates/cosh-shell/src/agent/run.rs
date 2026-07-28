@@ -463,6 +463,13 @@ pub(crate) fn stop_active_agent_run_without_rendering<W: Write>(
     // Turn-scope batch consent never outlives its run (issue #1773).
     state.control.trust.clear_run_batch_consent();
 
+    // #1940 run-terminal sweep before the handle is cancelled, while the
+    // response channel is still usable.
+    crate::approval::runtime::drain_unhomed_control_requests_with_handle(
+        state,
+        &active_run.request.id,
+        &active_run.handle,
+    );
     active_run.handle.cancel();
     active_run.status_animation.clear(output)?;
     active_run.held_events.clear();
