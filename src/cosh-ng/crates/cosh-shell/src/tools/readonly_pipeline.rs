@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{is_sensitive_target, strip_ansi};
@@ -297,13 +298,20 @@ pub(crate) fn wait_child_with_deadline(
     }
 }
 
+// Process-wide sequence keeping temp paths unique across concurrent
+// runs: wall-clock nanos can repeat between parallel callers (test
+// threads, sibling compounds), and a collided path lets one run's
+// cleanup delete a file another run is about to read.
+static TEMP_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn temp_path(kind: &str, stage: usize) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
+    let sequence = TEMP_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "cosh-readonly-pipeline-{}-{nanos}-{stage}-{kind}",
+        "cosh-readonly-pipeline-{}-{nanos}-{sequence}-{stage}-{kind}",
         std::process::id()
     ))
 }
