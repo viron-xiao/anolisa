@@ -121,23 +121,11 @@ fn run_plan(
             + config
                 .stage_timeout
                 .min(deadline.saturating_duration_since(Instant::now()));
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    final_exit_code = status.code();
-                    break;
-                }
-                Ok(None) if Instant::now() >= stage_deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    cleanup_paths(&cleanup);
-                    return Err(error("stage-timeout", stage.argv.join(" ")));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(err) => {
-                    cleanup_paths(&cleanup);
-                    return Err(error("executor-wait", err.to_string()));
-                }
+        match wait_child_with_deadline(&mut child, stage_deadline, stage.argv.join(" ")) {
+            Ok(code) => final_exit_code = code,
+            Err(err) => {
+                cleanup_paths(&cleanup);
+                return Err(err);
             }
         }
 
@@ -287,7 +275,29 @@ fn push_token(tokens: &mut Vec<String>, token: &mut String) {
     }
 }
 
-fn temp_path(kind: &str, stage: usize) -> PathBuf {
+/// Waits for a spawned child, killing it once `stage_deadline` passes.
+/// Shared by the readonly pipeline and compound executors; the caller
+/// owns any temp-file cleanup on the error path.
+pub(crate) fn wait_child_with_deadline(
+    child: &mut std::process::Child,
+    stage_deadline: Instant,
+    timeout_detail: impl Into<String>,
+) -> Result<Option<i32>, ReadonlyPipelineError> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code()),
+            Ok(None) if Instant::now() >= stage_deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error("stage-timeout", timeout_detail));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(err) => return Err(error("executor-wait", err.to_string())),
+        }
+    }
+}
+
+pub(crate) fn temp_path(kind: &str, stage: usize) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -298,7 +308,7 @@ fn temp_path(kind: &str, stage: usize) -> PathBuf {
     ))
 }
 
-fn read_limited_clean(
+pub(crate) fn read_limited_clean(
     path: &Path,
     byte_limit: usize,
     line_limit: usize,
@@ -317,13 +327,13 @@ fn read_limited_clean(
     Ok(text)
 }
 
-fn cleanup_paths(paths: &[PathBuf]) {
+pub(crate) fn cleanup_paths(paths: &[PathBuf]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
     }
 }
 
-fn error(reason: &'static str, detail: impl Into<String>) -> ReadonlyPipelineError {
+pub(crate) fn error(reason: &'static str, detail: impl Into<String>) -> ReadonlyPipelineError {
     ReadonlyPipelineError {
         reason,
         detail: detail.into(),
