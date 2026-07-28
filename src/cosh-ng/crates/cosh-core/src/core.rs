@@ -303,6 +303,16 @@ impl CoshCore {
                     );
                     return Ok(());
                 }
+                ApprovalResult::TimedOut => {
+                    self.emit(
+                        writer,
+                        &OutputMessage::assistant_text(
+                            &self.session_id,
+                            "Prompt approval timed out before reaching a decision surface. Nothing was executed; please retry.",
+                        ),
+                    );
+                    return Ok(());
+                }
                 ApprovalResult::Interrupted | ApprovalResult::HostExecutedShell { .. } => {
                     return Ok(());
                 }
@@ -1195,6 +1205,12 @@ impl CoshCore {
                                 interrupted = true;
                                 ToolResult::error("Interrupted by user")
                             }
+                            ApprovalResult::TimedOut => {
+                                self.metrics.approval_deny += 1;
+                                ToolResult::error(
+                                    "approval timed out: the request never reached a decision surface; the tool was not executed",
+                                )
+                            }
                         }
                     }
                     Outcome::Deny => {
@@ -1695,7 +1711,19 @@ impl CoshCore {
         accepts_host_executed_shell: bool,
         reader: &mut tokio::io::Lines<R>,
     ) -> ApprovalResult {
-        while let Ok(Some(line)) = reader.next_line().await {
+        // #1940 residual guard: the shell owns the terminal state of every
+        // request it can see, so a legitimate wait (a card pending on the
+        // user, a host-executed command running) must never be timed out
+        // from here. This whole-wait deadline only ends the form where the
+        // request never reached the shell's decision surface at all —
+        // without it the turn would hang forever with no visible cause.
+        let deadline = tokio::time::Instant::now() + approval_response_timeout();
+        loop {
+            let line = match tokio::time::timeout_at(deadline, reader.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) | Ok(Err(_)) => return ApprovalResult::Interrupted,
+                Err(_) => return ApprovalResult::TimedOut,
+            };
             let line = line.trim().to_string();
             if line.is_empty() {
                 continue;
@@ -1748,7 +1776,6 @@ impl CoshCore {
                 _ => {}
             }
         }
-        ApprovalResult::Interrupted
     }
 }
 
@@ -1760,6 +1787,44 @@ enum ApprovalResult {
         exit_code: Option<i32>,
     },
     Interrupted,
+    /// #1940 residual guard: the wait exceeded the last-resort deadline,
+    /// meaning the request never reached a decision surface on the shell
+    /// side. Always surfaced as an error result, never as an execution.
+    TimedOut,
+}
+
+/// #1940 residual guard: hours-scale by design so legitimate waits (card
+/// pending, host-executed command running) effectively never hit it. A
+/// card left untouched beyond this horizon is failed closed as
+/// "session presumed dead": the late decision degrades through the
+/// shell's OwnerUnavailable recovery path instead of splitting state.
+/// env override exists for tests and incident response.
+const APPROVAL_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 6 * 60 * 60;
+/// Upper bound for the env override: an absurd value would overflow
+/// `Instant + Duration` and panic at the next approval wait.
+const APPROVAL_RESPONSE_TIMEOUT_MAX_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn approval_response_timeout() -> std::time::Duration {
+    let fallback = || std::time::Duration::from_secs(APPROVAL_RESPONSE_TIMEOUT_DEFAULT_SECS);
+    let Ok(raw) = std::env::var("COSH_CORE_APPROVAL_TIMEOUT_SECS") else {
+        return fallback();
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > 0 && secs <= APPROVAL_RESPONSE_TIMEOUT_MAX_SECS => {
+            std::time::Duration::from_secs(secs)
+        }
+        _ => {
+            // Loud fallback (PR #1968 review): an ignored override must not
+            // leave the operator wondering why their timeout did not apply.
+            tracing::warn!(
+                value = %raw,
+                "invalid COSH_CORE_APPROVAL_TIMEOUT_SECS (want 1..={} secs); \
+                 falling back to the default approval timeout",
+                APPROVAL_RESPONSE_TIMEOUT_MAX_SECS
+            );
+            fallback()
+        }
+    }
 }
 
 fn hook_decision_name(decision: &HookDecision) -> &'static str {
@@ -1785,6 +1850,7 @@ fn approval_audit_outcome(approval: &ApprovalResult) -> (AuditOutcomeStatus, &'s
             (AuditOutcomeStatus::Allowed, "allow")
         }
         ApprovalResult::Denied(_) => (AuditOutcomeStatus::Denied, "deny"),
+        ApprovalResult::TimedOut => (AuditOutcomeStatus::Denied, "timeout"),
         ApprovalResult::Interrupted => (AuditOutcomeStatus::Cancelled, "interrupted"),
     }
 }

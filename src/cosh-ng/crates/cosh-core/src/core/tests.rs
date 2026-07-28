@@ -1011,6 +1011,57 @@ async fn request_id_skips_mismatched() {
     assert!(matches!(result, ApprovalResult::Denied(_)));
 }
 
+/// Serializes the two tests that mutate the process-wide
+/// `COSH_CORE_APPROVAL_TIMEOUT_SECS`; without it a concurrent
+/// `remove_var` could send the hanging test back to the 6h default.
+static APPROVAL_TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn unanswered_approval_times_out_instead_of_hanging_forever() {
+    // #1940 residual guard: hours-scale by default, overridden here so the
+    // wait ends quickly. A peer that never answers and never closes the
+    // channel must not hang the turn forever.
+    let _guard = APPROVAL_TIMEOUT_ENV_LOCK.lock().await;
+    std::env::set_var("COSH_CORE_APPROVAL_TIMEOUT_SECS", "1");
+    let core = make_core(MockProvider::text_only(""));
+    let (client, _server) = tokio::io::duplex(64);
+    let mut reader = BufReader::new(client).lines();
+
+    let result = core
+        .wait_for_approval("expected-id", false, &mut reader)
+        .await;
+    std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
+    assert!(matches!(result, ApprovalResult::TimedOut));
+}
+
+#[tokio::test]
+async fn answered_approval_beats_the_residual_timeout() {
+    // A response that arrives normally must win over the deadline: the
+    // guard only fires when nothing ever comes back.
+    let _guard = APPROVAL_TIMEOUT_ENV_LOCK.lock().await;
+    std::env::set_var("COSH_CORE_APPROVAL_TIMEOUT_SECS", "1");
+    let core = make_core(MockProvider::text_only(""));
+    let (mut client, server) = tokio::io::duplex(256);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut server = server;
+        server
+            .write_all(
+                br#"{"type":"control_response","response":{"subtype":"success","request_id":"expected-id","response":{"behavior":"allow"}}}
+"#,
+            )
+            .await
+            .expect("write response");
+    });
+    let mut reader = BufReader::new(&mut client).lines();
+
+    let result = core
+        .wait_for_approval("expected-id", false, &mut reader)
+        .await;
+    std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
+    assert!(matches!(result, ApprovalResult::Allowed));
+}
+
 #[tokio::test]
 async fn approval_flow_host_executed_shell_uses_tool_result() {
     let shell_calls = Arc::new(AtomicUsize::new(0));
