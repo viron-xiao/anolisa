@@ -131,8 +131,18 @@ mod tests {
         // segment so pre-existing discriminants never shift.
         assert_eq!(MessageId::HelpSummaryMcp as usize, 834);
         assert_eq!(MessageId::SlashMcpTitle as usize, 835);
-        assert_eq!(MessageId::SlashMcpTitle as usize, MessageId::ALL.len() - 1);
-        assert_eq!(MessageId::HelpSummaryMcp as usize, MessageId::ALL.len() - 2);
+        // The #1913 capture-notice segment is the current tail; the tail
+        // ownership assertions move with each appended segment.
+        assert_eq!(MessageId::CaptureInputRejectedTitle as usize, 836);
+        assert_eq!(MessageId::CaptureInputRejectedBody as usize, 837);
+        assert_eq!(
+            MessageId::CaptureInputRejectedBody as usize,
+            MessageId::ALL.len() - 1
+        );
+        assert_eq!(
+            MessageId::CaptureInputRejectedTitle as usize,
+            MessageId::ALL.len() - 2
+        );
     }
 
     #[test]
