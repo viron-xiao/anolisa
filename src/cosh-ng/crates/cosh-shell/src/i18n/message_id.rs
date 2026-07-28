@@ -91,4 +91,5 @@ collect_message_ids!([
     prompt_soft_newline_ids,
     tool_argument_status_ids,
     multiline_entry_ids,
+    capture_notice_ids,
 ],);

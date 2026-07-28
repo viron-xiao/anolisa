@@ -2,20 +2,47 @@ use super::*;
 
 const CAPTURE_QUARANTINE_MAX_BYTES: usize = 64 * 1024;
 
+/// Submit-window deadline before an unacknowledged capture chain expires.
+/// Tests shrink it so expiry paths stay testable without real waits, while
+/// leaving enough headroom for the ack helper threads on loaded CI hosts.
+fn capture_submit_drain_deadline() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+/// Bounded buffer for bytes that arrive while a submitted capture chain is
+/// still draining. The bytes are retained (not just counted) so a cleanly
+/// finished chain can replay them into the main-prompt owner instead of
+/// silently dropping type-ahead (#1913); unsafe terminal states reject them
+/// with user-visible feedback instead.
 #[derive(Default)]
 pub(super) struct CaptureOwnedInput {
-    bytes: usize,
+    bytes: Vec<u8>,
     overflowed: bool,
 }
 
 impl CaptureOwnedInput {
-    fn observe(&mut self, bytes: &[u8]) -> bool {
-        self.bytes = self.bytes.saturating_add(bytes.len());
-        if self.overflowed || self.bytes <= CAPTURE_QUARANTINE_MAX_BYTES {
+    pub(super) fn observe(&mut self, bytes: &[u8]) -> bool {
+        if self.overflowed {
             return false;
         }
-        self.overflowed = true;
-        true
+        if self.bytes.len().saturating_add(bytes.len()) > CAPTURE_QUARANTINE_MAX_BYTES {
+            // Past the cap nothing can be replayed faithfully anymore:
+            // discard the whole batch and report the overflow edge once.
+            self.bytes.clear();
+            self.overflowed = true;
+            return true;
+        }
+        self.bytes.extend_from_slice(bytes);
+        false
+    }
+
+    fn take_bytes(&mut self) -> Vec<u8> {
+        self.overflowed = false;
+        std::mem::take(&mut self.bytes)
     }
 
     fn clear(&mut self) {
@@ -82,6 +109,7 @@ pub(super) fn relay_input_chunk(
                         relay_late_capture_bytes(
                             bytes,
                             expected_generation,
+                            card_state,
                             capture_owned_input,
                             relay,
                         )?;
@@ -101,6 +129,7 @@ pub(super) fn relay_input_chunk(
                         relay_late_capture_bytes(
                             bytes,
                             expected_generation,
+                            card_state,
                             capture_owned_input,
                             relay,
                         )?;
@@ -114,6 +143,7 @@ pub(super) fn relay_input_chunk(
                     relay.native_line_state.clear();
                     drain_capture_submission(
                         result,
+                        card_state,
                         capture_owned_input,
                         deferred_input,
                         read_ahead,
@@ -128,7 +158,7 @@ pub(super) fn relay_input_chunk(
             }
             RawInputMode::Draining { .. } => {
                 card_state.reset();
-                drain_abandoned_capture(capture_owned_input, relay)?;
+                drain_abandoned_capture(card_state, capture_owned_input, relay)?;
                 mode = current_raw_input_mode(relay.input_mode);
             }
             RawInputMode::Hold => {
@@ -176,6 +206,7 @@ pub(super) fn relay_input_chunk(
 
 pub(super) fn drain_capture_submission(
     result: CaptureConsumeResult,
+    card_state: &mut CardInputState,
     capture_owned_input: &mut CaptureOwnedInput,
     deferred_input: &mut Option<InputRead>,
     read_ahead: Option<&Receiver<InputRead>>,
@@ -192,12 +223,16 @@ pub(super) fn drain_capture_submission(
         expire_capture_submission(relay.input_mode, generation);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let chain_invalidated;
+    let deadline = Instant::now() + capture_submit_drain_deadline();
     loop {
         match current_raw_input_mode(relay.input_mode) {
             RawInputMode::Draining {
-                generation: active, ..
+                generation: active,
+                invalidated,
+                ..
             } if active == generation => {
+                chain_invalidated = invalidated;
                 if !overflow {
                     overflow = drain_capture_read_ahead(
                         generation,
@@ -252,19 +287,83 @@ pub(super) fn drain_capture_submission(
         }
     }
     if !overflow && complete_capture_chain_if_pending(relay.input_mode, generation) {
-        capture_owned_input.clear();
+        // T2: a follow-up card armed; the no-leak invariant outranks
+        // delivery, so the quarantined bytes are rejected visibly (#1913 D5).
+        reject_quarantined_input(capture_owned_input, generation, relay);
         let _ = relay
             .input_events
             .send(RawInputEvent::CaptureDrained { generation });
         return Ok(());
     }
 
-    capture_owned_input.clear();
     complete_capture_replay(relay.input_mode, generation);
     let _ = relay
         .input_events
         .send(RawInputEvent::CaptureDrained { generation });
+    if overflow || chain_invalidated {
+        // T3/T4: expired or overflowed chains never replay (#1913 D6).
+        reject_quarantined_input(capture_owned_input, generation, relay);
+        return Ok(());
+    }
+    replay_or_reject_after_drain(card_state, capture_owned_input, generation, relay)
+}
+
+/// Deliver the quarantined bytes when the chain landed back at the
+/// main-prompt owner for this generation; the bytes re-enter the relay
+/// exactly like live input read under a Terminal snapshot (no PTY bypass,
+/// #1913 D4). Any other landing rejects visibly (fail-safe C4).
+fn replay_or_reject_after_drain(
+    card_state: &mut CardInputState,
+    capture_owned_input: &mut CaptureOwnedInput,
+    generation: u64,
+    relay: &mut InputRelayContext<'_>,
+) -> io::Result<()> {
+    let bytes = capture_owned_input.take_bytes();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mode = current_raw_input_mode(relay.input_mode);
+    if matches!(
+        mode,
+        RawInputMode::Terminal { generation: active, .. } if active == generation
+    ) {
+        let mut deferred_input = None;
+        return relay_input_chunk(
+            &bytes,
+            mode,
+            card_state,
+            capture_owned_input,
+            &mut deferred_input,
+            None,
+            None,
+            relay,
+        );
+    }
+    let _ = relay
+        .input_events
+        .send(RawInputEvent::CaptureInputRejected {
+            generation,
+            byte_len: bytes.len(),
+        });
     Ok(())
+}
+
+/// Discard the quarantined bytes with user-visible feedback; an empty
+/// buffer stays silent (nothing was lost).
+fn reject_quarantined_input(
+    capture_owned_input: &mut CaptureOwnedInput,
+    generation: u64,
+    relay: &mut InputRelayContext<'_>,
+) {
+    let bytes = capture_owned_input.take_bytes();
+    if !bytes.is_empty() {
+        let _ = relay
+            .input_events
+            .send(RawInputEvent::CaptureInputRejected {
+                generation,
+                byte_len: bytes.len(),
+            });
+    }
 }
 
 pub(in super::super) fn relay_late_capture_input(
@@ -277,6 +376,7 @@ pub(in super::super) fn relay_late_capture_input(
     state: &mut RawInputRelayState,
 ) -> io::Result<()> {
     let RawInputRelayState {
+        card_state,
         line_buffer,
         native_line_state,
         exit_tracker,
@@ -300,12 +400,19 @@ pub(in super::super) fn relay_late_capture_input(
         main_prompt_gate,
         slash_route_enabled: *slash_route_enabled,
     };
-    relay_late_capture_bytes(bytes, generation, capture_owned_input, &mut relay)
+    relay_late_capture_bytes(
+        bytes,
+        generation,
+        card_state,
+        capture_owned_input,
+        &mut relay,
+    )
 }
 
 fn relay_late_capture_bytes(
     bytes: &[u8],
     generation: u64,
+    card_state: &mut CardInputState,
     capture_owned_input: &mut CaptureOwnedInput,
     relay: &mut InputRelayContext<'_>,
 ) -> io::Result<()> {
@@ -322,7 +429,18 @@ fn relay_late_capture_bytes(
         _ => None,
     };
     if active_generation != Some(generation) {
+        // The chain these bytes were typed against is gone; delivering them
+        // to whatever owns input now would be a leak, so reject visibly
+        // instead of the pre-#1913 silent discard.
         capture_owned_input.clear();
+        if !bytes.is_empty() {
+            let _ = relay
+                .input_events
+                .send(RawInputEvent::CaptureInputRejected {
+                    generation,
+                    byte_len: bytes.len(),
+                });
+        }
         return Ok(());
     }
 
@@ -347,9 +465,11 @@ fn relay_late_capture_bytes(
 
     match current_raw_input_mode(relay.input_mode) {
         RawInputMode::Capture { .. } | RawInputMode::Submitted { .. } if !overflow => Ok(()),
-        RawInputMode::Draining { .. } => drain_abandoned_capture(capture_owned_input, relay),
+        RawInputMode::Draining { .. } => {
+            drain_abandoned_capture(card_state, capture_owned_input, relay)
+        }
         _ => {
-            capture_owned_input.clear();
+            reject_quarantined_input(capture_owned_input, generation, relay);
             Ok(())
         }
     }
@@ -386,18 +506,30 @@ fn drain_capture_read_ahead(
 }
 
 pub(super) fn drain_abandoned_capture(
+    card_state: &mut CardInputState,
     capture_owned_input: &mut CaptureOwnedInput,
     relay: &mut InputRelayContext<'_>,
 ) -> io::Result<()> {
-    let RawInputMode::Draining { generation, .. } = current_raw_input_mode(relay.input_mode) else {
+    let RawInputMode::Draining {
+        generation,
+        invalidated,
+        ..
+    } = current_raw_input_mode(relay.input_mode)
+    else {
         return Ok(());
     };
-    capture_owned_input.clear();
     complete_capture_replay(relay.input_mode, generation);
     let _ = relay
         .input_events
         .send(RawInputEvent::CaptureDrained { generation });
-    Ok(())
+    if invalidated {
+        // T3/T6: an invalidated chain never replays (#1913 D6).
+        reject_quarantined_input(capture_owned_input, generation, relay);
+        return Ok(());
+    }
+    // T8: the buffered bytes replay before whatever live input triggered
+    // this drain, preserving arrival order (#1913 C3).
+    replay_or_reject_after_drain(card_state, capture_owned_input, generation, relay)
 }
 
 pub(in super::super) fn finish_input_relay(
@@ -445,6 +577,7 @@ pub(in super::super) fn finish_input_relay(
         RawInputMode::Draining { .. }
     ) {
         let RawInputRelayState {
+            card_state,
             line_buffer,
             native_line_state,
             exit_tracker,
@@ -467,7 +600,7 @@ pub(in super::super) fn finish_input_relay(
             main_prompt_gate,
             slash_route_enabled: false,
         };
-        drain_abandoned_capture(capture_owned_input, &mut relay)?;
+        drain_abandoned_capture(card_state, capture_owned_input, &mut relay)?;
     }
     // Bytes held as a possible split paste delimiter never got a routing
     // verdict: forward them byte-identically before the trailing exit
@@ -497,147 +630,9 @@ pub(in super::super) fn finish_input_relay(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs::{self, OpenOptions};
-    use std::io::{Seek, SeekFrom};
+#[path = "capture_matrix_tests.rs"]
+mod matrix_tests;
 
-    use super::*;
-    use crate::raw_input::RawInputCapture;
-
-    #[test]
-    fn generation_cutoff_does_not_retry_input_into_the_replacement_capture() {
-        let path = std::env::temp_dir().join(format!(
-            "cosh-shell-capture-cutoff-retry-{}",
-            std::process::id()
-        ));
-        let mut master = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("test output file");
-        let previous = RawInputCapture::Question {
-            id: "q-1".to_string(),
-            option_count: 0,
-            allow_free_text: true,
-            multiple: false,
-            secret: false,
-        };
-        let next = RawInputCapture::Question {
-            id: "q-2".to_string(),
-            option_count: 0,
-            allow_free_text: true,
-            multiple: false,
-            secret: false,
-        };
-        let stale_mode = RawInputMode::Capture {
-            capture: previous.clone(),
-            generation: 41,
-            installed_at: Instant::now(),
-        };
-        let input_mode = Arc::new(Mutex::new(RawInputMode::Draining {
-            previous_capture: previous.clone(),
-            generation: 41,
-            next_capture: Some(next.clone()),
-            invalidated: false,
-        }));
-        let (input_tx, input_rx) = mpsc::channel();
-        let classifier = InputClassifier::default();
-        let mut card_state = CardInputState::default();
-        let mut quarantine = CaptureOwnedInput::default();
-        let mut deferred_input = None;
-        let mut line_buffer = CandidateLineBuffer::default();
-        let mut native_line_state = NativeLineState::default();
-        let mut exit_tracker = ExplicitExitTracker::default();
-        let input_generation = UserPtyInputGeneration::default();
-        let mut line_submits = LineSubmitCounter::default();
-        let main_prompt_gate = super::super::super::MainPromptGate::default();
-        let mut relay = InputRelayContext {
-            master: &mut master,
-            input_classifier: &classifier,
-            input_events: &input_tx,
-            input_mode: &input_mode,
-            input_generation: &input_generation,
-            line_submits: &mut line_submits,
-            line_buffer: &mut line_buffer,
-            native_line_state: &mut native_line_state,
-            exit_tracker: &mut exit_tracker,
-            main_prompt_gate: &main_prompt_gate,
-            slash_route_enabled: false,
-        };
-
-        relay_input_chunk(
-            b"stale",
-            stale_mode,
-            &mut card_state,
-            &mut quarantine,
-            &mut deferred_input,
-            None,
-            Some(41),
-            &mut relay,
-        )
-        .expect("relay stale input");
-
-        assert!(!input_rx
-            .try_iter()
-            .any(|event| matches!(event, RawInputEvent::CardInput(target, _) if target == "q-2")));
-        master.sync_all().expect("sync test output");
-        assert!(fs::read(&path).expect("read test output").is_empty());
-        assert!(matches!(
-            current_raw_input_mode(&input_mode),
-            RawInputMode::Capture {
-                capture: RawInputCapture::Question { id, .. },
-                ..
-            } if id == "q-2"
-        ));
-
-        master.set_len(0).expect("truncate test output");
-        master.seek(SeekFrom::Start(0)).expect("rewind test output");
-        *input_mode.lock().expect("input mode") = RawInputMode::Draining {
-            previous_capture: previous,
-            generation: 41,
-            next_capture: Some(next),
-            invalidated: false,
-        };
-        let draining_snapshot = current_raw_input_mode(&input_mode);
-        let mut card_state = CardInputState::default();
-        let mut quarantine = CaptureOwnedInput::default();
-        let mut deferred_input = None;
-        let mut line_submits = LineSubmitCounter::default();
-        let main_prompt_gate = super::super::super::MainPromptGate::default();
-        let mut relay = InputRelayContext {
-            master: &mut master,
-            input_classifier: &classifier,
-            input_events: &input_tx,
-            input_mode: &input_mode,
-            input_generation: &input_generation,
-            line_submits: &mut line_submits,
-            line_buffer: &mut line_buffer,
-            native_line_state: &mut native_line_state,
-            exit_tracker: &mut exit_tracker,
-            main_prompt_gate: &main_prompt_gate,
-            slash_route_enabled: false,
-        };
-        relay_input_chunk(
-            b"later",
-            draining_snapshot,
-            &mut card_state,
-            &mut quarantine,
-            &mut deferred_input,
-            None,
-            Some(41),
-            &mut relay,
-        )
-        .expect("relay input across draining snapshot");
-        abandon_active_capture(&input_mode);
-        drain_abandoned_capture(&mut quarantine, &mut relay).expect("drain replacement capture");
-
-        assert!(!input_rx
-            .try_iter()
-            .any(|event| matches!(event, RawInputEvent::CardInput(target, _) if target == "q-2")));
-        master.sync_all().expect("sync test output");
-        assert!(fs::read(&path).expect("read test output").is_empty());
-        fs::remove_file(path).ok();
-    }
-}
+#[cfg(test)]
+#[path = "capture_tests.rs"]
+mod tests;
