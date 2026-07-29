@@ -267,4 +267,48 @@ mod tests {
         };
         assert!(CmdlineGlobMatcher::from_deny_rule(&rule).is_none());
     }
+
+    /// Regression test: default rules must capture Claude Code across its
+    /// common launch styles (native binary, absolute path, npm shebang via
+    /// node). See rule set in agentsight.json.
+    #[test]
+    fn test_default_rules_match_claude_code_invocations() {
+        let matchers: Vec<CmdlineGlobMatcher> = crate::config::default_cmdline_rules()
+            .iter()
+            .filter_map(CmdlineGlobMatcher::from_config)
+            .collect();
+        let match_name = |cmdline: &[&str]| -> Option<String> {
+            let ctx = ProcessContext {
+                comm: String::new(),
+                cmdline_args: cmdline.iter().map(|s| s.to_string()).collect(),
+                exe_path: String::new(),
+            };
+            matchers
+                .iter()
+                .find(|m| m.matches(&ctx))
+                .map(|m| m.info().name.clone())
+        };
+
+        // Native binary launched from shell
+        assert_eq!(match_name(&["claude"]), Some("Claude".to_string()));
+        // Launched with absolute path (e.g. by IDE extensions)
+        assert_eq!(
+            match_name(&["/root/.local/bin/claude"]),
+            Some("Claude".to_string())
+        );
+        // npm install: shebang expands to `node <bin> ...`
+        assert_eq!(
+            match_name(&["node", "/usr/local/bin/claude"]),
+            Some("Claude".to_string())
+        );
+        assert_eq!(
+            match_name(&[
+                "/usr/bin/node",
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            ]),
+            Some("Claude".to_string())
+        );
+        // Unrelated node process must not match
+        assert_eq!(match_name(&["node", "/srv/app/server.js"]), None);
+    }
 }
