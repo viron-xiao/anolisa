@@ -3,7 +3,8 @@
 //! This module provides the `discover` subcommand which scans the system
 //! for running AI agent processes.
 
-use agentsight::{AgentScanner, CmdlineGlobMatcher};
+use agentsight::AgentScanner;
+use agentsight::config::CmdlineRule;
 use structopt::StructOpt;
 
 /// Discover subcommand for finding AI agents running on the system
@@ -31,22 +32,17 @@ impl DiscoverCommand {
     /// List all known agents that can be detected
     fn list_known_agents(&self) {
         let rules = agentsight::default_cmdline_rules();
-        let scanner = AgentScanner::from_rules(&rules, &[]);
-        let count = scanner.matcher_count();
+        let grouped = group_known_agents(&rules);
 
-        println!("Known AI Agents ({count} total):");
+        println!("Known AI Agents ({} total):", grouped.len());
         println!("{}", "=".repeat(60));
         println!();
 
-        // Use CmdlineGlobMatcher to list agent info
-        for matcher in agentsight::default_cmdline_rules()
-            .iter()
-            .filter_map(CmdlineGlobMatcher::from_config)
-        {
-            let agent = matcher.info();
-            println!("  {} ({})", agent.name, agent.category);
-            println!("    Process names: {}", agent.process_names.join(", "));
-            println!("    {}", agent.description);
+        for (name, patterns) in &grouped {
+            println!("  {name}");
+            for pattern in patterns {
+                println!("    Match: {pattern}");
+            }
             println!();
         }
     }
@@ -88,5 +84,89 @@ impl DiscoverCommand {
         }
 
         println!("Total: {} agent(s) found", agents.len());
+    }
+}
+
+/// Group allow rules by agent name (first-seen order).
+///
+/// Each agent maps to the list of its cmdline glob rules, one display string
+/// per rule with the positional patterns joined by spaces.
+fn group_known_agents(rules: &[CmdlineRule]) -> Vec<(String, Vec<String>)> {
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    for rule in rules {
+        if !rule.allow || rule.patterns.is_empty() {
+            continue;
+        }
+        let name = rule.agent_name.as_deref().unwrap_or("Custom Agent");
+        let display = rule.patterns.join(" ");
+        match grouped.iter_mut().find(|(n, _)| n == name) {
+            Some((_, patterns)) => patterns.push(display),
+            None => grouped.push((name.to_string(), vec![display])),
+        }
+    }
+    grouped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow_rule(name: &str, patterns: &[&str]) -> CmdlineRule {
+        CmdlineRule {
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            agent_name: Some(name.to_string()),
+            allow: true,
+        }
+    }
+
+    #[test]
+    fn group_known_agents_merges_rules_of_same_agent() {
+        let rules = vec![
+            allow_rule("Cosh", &["node*", "*/bin/cosh*"]),
+            allow_rule("Claude", &["claude*"]),
+            allow_rule("Cosh", &["*node*", "*cosh*"]),
+        ];
+        let grouped = group_known_agents(&rules);
+        assert_eq!(grouped.len(), 2);
+        // First-seen order is preserved
+        assert_eq!(grouped[0].0, "Cosh");
+        assert_eq!(
+            grouped[0].1,
+            vec!["node* */bin/cosh*".to_string(), "*node* *cosh*".to_string()]
+        );
+        assert_eq!(grouped[1].0, "Claude");
+        assert_eq!(grouped[1].1, vec!["claude*".to_string()]);
+    }
+
+    #[test]
+    fn group_known_agents_skips_deny_and_empty_rules() {
+        let rules = vec![
+            CmdlineRule {
+                patterns: vec!["*spam*".to_string()],
+                agent_name: None,
+                allow: false,
+            },
+            CmdlineRule {
+                patterns: vec![],
+                agent_name: Some("Empty".to_string()),
+                allow: true,
+            },
+            allow_rule("Claude", &["claude*"]),
+        ];
+        let grouped = group_known_agents(&rules);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0, "Claude");
+    }
+
+    #[test]
+    fn group_known_agents_default_rules_not_empty() {
+        let grouped = group_known_agents(&agentsight::default_cmdline_rules());
+        assert!(!grouped.is_empty());
+        // Every entry has a non-empty name and at least one match pattern
+        for (name, patterns) in &grouped {
+            assert!(!name.is_empty());
+            assert!(!patterns.is_empty());
+            assert!(patterns.iter().all(|p| !p.is_empty()));
+        }
     }
 }
