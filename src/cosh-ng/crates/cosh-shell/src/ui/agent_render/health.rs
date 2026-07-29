@@ -31,11 +31,23 @@ const HEALTH_MAX_VISIBLE_PROMPTS: usize = 3;
 #[derive(Debug, Clone, Copy)]
 pub struct HealthBannerModel<'a> {
     pub report: &'a HealthScanReport,
+    /// Render the full panel (including the checks coverage line) even for a
+    /// healthy report, instead of compressing to the one-line startup row.
+    /// Used by the `/health` slash command so its output matches the checks
+    /// coverage reported by the `cosh-shell doctor` CLI.
+    pub full: bool,
 }
 
 impl<'a> HealthBannerModel<'a> {
     pub fn new(report: &'a HealthScanReport) -> Self {
-        Self { report }
+        Self {
+            report,
+            full: false,
+        }
+    }
+
+    pub fn full(report: &'a HealthScanReport) -> Self {
+        Self { report, full: true }
     }
 }
 
@@ -53,7 +65,7 @@ impl RatatuiInlineRenderer {
     }
 
     pub fn health_banner_lines(&self, model: HealthBannerModel<'_>) -> Vec<String> {
-        if health_uses_startup_row(model.report) {
+        if !model.full && health_uses_startup_row(model.report) {
             return self.health_startup_row_lines(model);
         }
         if self.plain {
@@ -62,7 +74,7 @@ impl RatatuiInlineRenderer {
 
         let width = self.health_attention_width();
         let i18n = self.i18n();
-        let sections = health_panel_sections(model.report, i18n, width, true);
+        let sections = health_panel_sections(model.report, i18n, width, true, model.full);
         let height = sections.body_len().saturating_add(2).min(14) as u16;
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
@@ -71,7 +83,7 @@ impl RatatuiInlineRenderer {
     }
 
     fn health_banner_write_lines(&self, model: HealthBannerModel<'_>) -> Vec<String> {
-        if health_uses_startup_row(model.report) {
+        if !model.full && health_uses_startup_row(model.report) {
             return self.health_startup_row_lines(model);
         }
         if self.plain {
@@ -80,7 +92,7 @@ impl RatatuiInlineRenderer {
 
         let width = self.health_attention_width();
         let i18n = self.i18n();
-        let sections = health_panel_sections(model.report, i18n, width, true);
+        let sections = health_panel_sections(model.report, i18n, width, true, model.full);
         let height = sections.body_len().saturating_add(2).min(14) as u16;
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
@@ -101,6 +113,11 @@ impl RatatuiInlineRenderer {
             i18n.t(crate::MessageId::HealthBannerTitle),
             severity_label(model.report.overall_severity, i18n)
         )];
+        if model.full {
+            if let Some(checks) = checks_summary_text(model.report, i18n) {
+                lines.extend(wrap_prefixed_line("  ", &checks, content_width));
+            }
+        }
         for line in health_body_lines(model.report, i18n, width, false) {
             lines.extend(wrap_prefixed_line("  ", &line.plain_text(), content_width));
         }
@@ -229,11 +246,15 @@ fn health_panel_sections(
     i18n: crate::I18n,
     width: u16,
     allow_meter: bool,
+    include_checks: bool,
 ) -> HealthPanelSections {
     let content_width = width.saturating_sub(2).max(20) as usize;
 
     if report.findings.is_empty() {
         let mut main = vec![summary_line(report, i18n, allow_meter)];
+        if include_checks {
+            main.extend(checks_lines(report, i18n, content_width));
+        }
         main.extend(metric_band_lines(report, i18n, content_width, allow_meter));
         main.extend(unavailable_lines(
             report,
@@ -253,7 +274,12 @@ fn health_panel_sections(
         };
     }
 
-    let mut main = metric_band_lines(report, i18n, content_width, allow_meter);
+    let mut main = if include_checks {
+        checks_lines(report, i18n, content_width)
+    } else {
+        Vec::new()
+    };
+    main.extend(metric_band_lines(report, i18n, content_width, allow_meter));
     let mut findings = Vec::new();
     findings.push(section_line(
         i18n.t(crate::MessageId::HealthBannerFindingsSection),
@@ -508,6 +534,39 @@ fn section_line(title: &str, content_width: usize) -> HealthBannerLine {
             ),
         ],
     }
+}
+
+/// Sorted, deduplicated checks coverage line, matching the `checks: <names>`
+/// line printed by `cosh-shell doctor` (`format_doctor_report_plain`).
+fn checks_summary_text(report: &HealthScanReport, i18n: crate::I18n) -> Option<String> {
+    if report.checks_done.is_empty() {
+        return None;
+    }
+    let mut checks = report.checks_done.clone();
+    checks.sort();
+    checks.dedup();
+    Some(format!(
+        "{}: {}",
+        i18n.t(crate::MessageId::DoctorChecksLabel),
+        checks.join(", ")
+    ))
+}
+
+fn checks_lines(
+    report: &HealthScanReport,
+    i18n: crate::I18n,
+    content_width: usize,
+) -> Vec<HealthBannerLine> {
+    let Some(text) = checks_summary_text(report, i18n) else {
+        return Vec::new();
+    };
+    wrap_plain_line(&text, content_width)
+        .into_iter()
+        .take(2)
+        .map(|line| HealthBannerLine {
+            spans: vec![Span::styled(line, Style::default().fg(Color::Gray))],
+        })
+        .collect()
 }
 
 fn health_startup_row_text(report: &HealthScanReport, i18n: crate::I18n) -> String {
