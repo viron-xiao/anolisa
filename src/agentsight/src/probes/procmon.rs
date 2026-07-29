@@ -50,7 +50,38 @@ pub enum Event {
         uid: u32,
         timestamp_ns: u64,
         comm: String,
+        /// Raw `task_struct->exit_code` in wait(2) encoding; decode with
+        /// [`ProcessExitStatus::decode`].
+        exit_code: u32,
     },
+}
+
+/// Decoded `task_struct->exit_code` (wait(2) status encoding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessExitStatus {
+    /// Terminating signal number; 0 when the process exited voluntarily.
+    pub signal: u32,
+    /// Whether the kernel produced a core dump.
+    pub core_dump: bool,
+    /// Exit code passed to exit(); meaningful only when `signal == 0`.
+    pub code: u32,
+}
+
+impl ProcessExitStatus {
+    /// Decode the raw kernel exit_code: low 7 bits = terminating signal,
+    /// bit 7 = core-dump flag, bits 8..=15 = exit code.
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            signal: raw & 0x7f,
+            core_dump: (raw & 0x80) != 0,
+            code: (raw >> 8) & 0xff,
+        }
+    }
+
+    /// True when the process terminated voluntarily with exit code 0.
+    pub fn is_clean(self) -> bool {
+        self.signal == 0 && self.code == 0
+    }
 }
 
 impl Event {
@@ -88,6 +119,7 @@ impl Event {
                 uid: raw.uid,
                 timestamp_ns: config::ktime_to_unix_ns(raw.timestamp_ns),
                 comm,
+                exit_code: raw.exit_code,
             }),
             _ => None,
         }
@@ -184,5 +216,104 @@ impl ProcMon {
 
         self._links = links;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Raw values below were captured on a real kernel (issue #1989):
+    // exit 0 → 0x0, exit 3 → 0x300, SIGKILL → 0x9, SIGSEGV+core → 0x8b.
+
+    #[test]
+    fn test_decode_clean_exit() {
+        let s = ProcessExitStatus::decode(0x0);
+        assert_eq!(s.signal, 0);
+        assert!(!s.core_dump);
+        assert_eq!(s.code, 0);
+        assert!(s.is_clean());
+    }
+
+    #[test]
+    fn test_decode_nonzero_exit_code() {
+        let s = ProcessExitStatus::decode(0x300);
+        assert_eq!(s.signal, 0);
+        assert!(!s.core_dump);
+        assert_eq!(s.code, 3);
+        assert!(!s.is_clean());
+    }
+
+    #[test]
+    fn test_decode_sigkill() {
+        let s = ProcessExitStatus::decode(0x9);
+        assert_eq!(s.signal, 9);
+        assert!(!s.core_dump);
+        assert_eq!(s.code, 0);
+        assert!(!s.is_clean());
+    }
+
+    #[test]
+    fn test_decode_sigsegv_with_core_dump() {
+        let s = ProcessExitStatus::decode(0x8b);
+        assert_eq!(s.signal, 11);
+        assert!(s.core_dump);
+        assert_eq!(s.code, 0);
+        assert!(!s.is_clean());
+    }
+
+    #[test]
+    fn test_decode_exit_code_255_boundary() {
+        let s = ProcessExitStatus::decode(0xff00);
+        assert_eq!(s.signal, 0);
+        assert!(!s.core_dump);
+        assert_eq!(s.code, 255);
+        assert!(!s.is_clean());
+    }
+
+    // Locks the C/Rust shared layout: exit_code fills the tail padding after
+    // comm[16], so the struct size must stay 56 bytes and any accidental
+    // mid-struct insertion (which would shift exit_code away from offset 52)
+    // fails here.
+    #[test]
+    fn test_procmon_event_layout() {
+        assert_eq!(std::mem::size_of::<ProcMonEvent>(), 56);
+        assert_eq!(std::mem::offset_of!(ProcMonEvent, comm), 36);
+        assert_eq!(std::mem::offset_of!(ProcMonEvent, exit_code), 52);
+    }
+
+    #[test]
+    fn test_exit_event_from_bytes_carries_exit_code() {
+        // SAFETY: procmon_event is a plain-old-data C struct; all-zero is valid.
+        let mut raw: ProcMonEvent = unsafe { std::mem::zeroed() };
+        raw.timestamp_ns = 1;
+        raw.pid = 42;
+        raw.tid = 42;
+        raw.ppid = 1;
+        raw.event_type = PROCMON_EVENT_EXIT;
+        raw.exit_code = 0x8b;
+        // c_char is i8 on x86_64 but u8 on aarch64; let inference pick.
+        for (i, &b) in b"cosh".iter().enumerate() {
+            raw.comm[i] = b as _;
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw as *const ProcMonEvent) as *const u8,
+                std::mem::size_of::<ProcMonEvent>(),
+            )
+        };
+        match Event::from_bytes(bytes) {
+            Some(Event::Exit {
+                pid,
+                comm,
+                exit_code,
+                ..
+            }) => {
+                assert_eq!(pid, 42);
+                assert_eq!(comm, "cosh");
+                assert_eq!(exit_code, 0x8b);
+            }
+            other => panic!("expected Exit event, got {other:?}"),
+        }
     }
 }
