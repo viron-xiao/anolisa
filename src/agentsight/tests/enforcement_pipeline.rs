@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 
 use agentsight::enforcement::{
     EnforcementClient, EnforcementCoordinator, EnforcementCoordinatorError, EnforcementError,
-    EnforcementStore, EnforcementStoreError,
+    EnforcementStore, EnforcementStoreError, TransitionDirection, TransitionKey, TransitionPhase,
 };
 use agentsight_enforcement_protocol::{
-    ApplyPolicy, Binding, BindingState, Command, Effect, HealthStatus, RemoteError, Request,
-    Response, ResponseBody, ViolationEvent, read_frame, write_frame,
+    ApplyPolicy, Binding, BindingState, Command, Effect, HealthStatus, RemoteError,
+    ReplaceFailureCode, ReplaceOutcome, ReplacePolicy, ReplacementPolicy, Request, Response,
+    ResponseBody, ViolationEvent, read_frame, write_frame,
 };
 use agentsight_enforcer::{EnforcementBackend, EnforcerService, MockBackend};
 use uuid::Uuid;
@@ -433,6 +434,51 @@ fn handle_controlled_connection(
             state.bindings.push(binding.clone());
             Ok(ResponseBody::Applied(binding))
         }
+        Command::ReplacePolicy(request) => {
+            let target_request = match request.replacement {
+                ReplacementPolicy::Generic(target) => target,
+                ReplacementPolicy::Credential(target) => {
+                    let policy = target.policy;
+                    ApplyPolicy {
+                        binding_id: target.binding_id,
+                        agent_id: target.agent_id,
+                        session_id: target.session_id,
+                        root_pid: target.root_pid,
+                        process_start_time: target.process_start_time,
+                        policy_id: policy.policy_id,
+                        policy_revision: policy.revision.to_string(),
+                        policy_dsl: String::new(),
+                    }
+                }
+            };
+            let target = Binding {
+                request: target_request,
+                state: BindingState::Enforced,
+                message: None,
+                domain_id: Some(1),
+            };
+            let mut state = state
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let actual = state.bindings.first().cloned();
+            let outcome = match actual {
+                Some(actual) if actual == target => ReplaceOutcome::Applied(actual),
+                Some(actual) if actual == request.expected => {
+                    state.bindings.clear();
+                    state.bindings.push(target.clone());
+                    ReplaceOutcome::Applied(target)
+                }
+                None => {
+                    state.bindings.push(target.clone());
+                    ReplaceOutcome::Applied(target)
+                }
+                Some(_) => ReplaceOutcome::Conflict {
+                    code: ReplaceFailureCode::BindingConflict,
+                },
+            };
+            Ok(ResponseBody::Replaced(outcome))
+        }
         Command::ListBindings => {
             let (shared, changed) = &*state;
             let mut shared = shared
@@ -764,6 +810,71 @@ fn apply_persists_enforced_state_and_deduplicates_violation() {
     );
     coordinator.stop_ingestion();
     ingestion.join().expect("ingestion should stop");
+}
+
+#[test]
+fn transition_replaces_runtime_and_persisted_ownership_through_uds() {
+    let fixture = TestEnforcer::start();
+    let store = EnforcementStore::open(&fixture.database_path)
+        .expect("temporary enforcement store should open");
+    let coordinator =
+        EnforcementCoordinator::new(EnforcementClient::new(&fixture.socket_path), store.clone());
+    let ingestion = coordinator
+        .start_ingestion()
+        .expect("ingestion should start");
+    assert!(poll_until(|| coordinator
+        .health()
+        .is_ok_and(|health| health.ready)));
+
+    let source_request = fixture.apply_request();
+    let source = coordinator
+        .apply(source_request.clone())
+        .expect("source binding should apply");
+    let mut target_request = source_request;
+    target_request.binding_id = Uuid::new_v4();
+    target_request.policy_id = "pipeline-containment".into();
+    target_request.policy_revision = "revision-2".into();
+    target_request.policy_dsl = "label AGENT\ndeny network".into();
+    let key = TransitionKey {
+        action_id: Uuid::new_v4(),
+        direction: TransitionDirection::Forward,
+    };
+
+    let transition = coordinator
+        .begin_transition(
+            key.clone(),
+            ReplacePolicy {
+                expected: source.clone(),
+                replacement: ReplacementPolicy::Generic(target_request.clone()),
+            },
+        )
+        .expect("atomic transition should complete");
+    let persisted = coordinator
+        .bindings()
+        .expect("persisted bindings should load");
+    let backend = fixture
+        .backend
+        .bindings()
+        .expect("backend bindings should load");
+    let stored_transition = store
+        .transition(&key)
+        .expect("transition query should work")
+        .expect("transition should exist");
+    coordinator.stop_ingestion();
+    ingestion.join().expect("ingestion should stop");
+
+    assert_eq!(transition.phase, TransitionPhase::Completed);
+    assert_eq!(stored_transition, transition);
+    assert_eq!(persisted.len(), 2);
+    assert!(persisted.iter().any(|binding| {
+        binding.request.binding_id == source.request.binding_id
+            && binding.state == BindingState::Detached
+    }));
+    assert!(persisted.iter().any(|binding| {
+        binding.request == target_request && binding.state == BindingState::Enforced
+    }));
+    assert_eq!(backend.len(), 1);
+    assert_eq!(backend[0].request, target_request);
 }
 
 #[test]

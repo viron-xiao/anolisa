@@ -9,6 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod transition;
+
 const MIN_REASONABLE_UNIX_EPOCH_NS: u64 = 946_684_800_000_000_000;
 
 /// Persistence failures for enforcement state.
@@ -32,6 +34,20 @@ pub enum EnforcementStoreError {
     /// A stable idempotency key names a different desired request.
     #[error("binding conflict for {0}")]
     BindingConflict(Uuid),
+    /// A stable transition key names a different replacement request.
+    #[error("transition conflict for action {0}")]
+    TransitionConflict(Uuid),
+    /// A requested transition is not persisted.
+    #[error("transition for action {0} is not persisted")]
+    MissingTransition(Uuid),
+    /// A persisted transition contains an unknown enum value.
+    #[error("invalid transition {field} value: {value}")]
+    InvalidTransitionState {
+        /// Column containing the invalid value.
+        field: &'static str,
+        /// Value rejected by the exhaustive parser.
+        value: String,
+    },
 }
 
 /// Thread-safe local enforcement state.
@@ -70,7 +86,19 @@ impl EnforcementStore {
                 event_json TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_enforcement_violations_time
-                ON enforcement_violations(occurred_at_ns DESC);",
+                ON enforcement_violations(occurred_at_ns DESC);
+             CREATE TABLE IF NOT EXISTS enforcement_transitions (
+                action_id TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                acknowledgement_json TEXT,
+                failure_code TEXT,
+                updated_at_ns INTEGER NOT NULL,
+                PRIMARY KEY(action_id, direction)
+             );
+             CREATE INDEX IF NOT EXISTS idx_enforcement_transitions_phase
+                ON enforcement_transitions(phase, updated_at_ns ASC);",
         )?;
         migrate_legacy_violation_timestamps(&mut connection)?;
         Ok(Self {
@@ -84,43 +112,8 @@ impl EnforcementStore {
     ///
     /// Returns a mutex, serialization, SQLite, or immutable-request conflict error.
     pub fn upsert_binding(&self, binding: &Binding) -> Result<(), EnforcementStoreError> {
-        let json = serde_json::to_string(binding)?;
         let connection = self.connection()?;
-        let existing_json: Option<String> = connection
-            .query_row(
-                "SELECT desired_json FROM enforcement_bindings WHERE binding_id = ?1",
-                params![binding.request.binding_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing_json) = existing_json {
-            let existing: Binding = serde_json::from_str(&existing_json)?;
-            if existing.request != binding.request {
-                return Err(EnforcementStoreError::BindingConflict(
-                    binding.request.binding_id,
-                ));
-            }
-        }
-        connection.execute(
-            "INSERT INTO enforcement_bindings
-               (binding_id, desired_json, state, message, domain_id, updated_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(binding_id) DO UPDATE SET
-               desired_json=excluded.desired_json,
-               state=excluded.state,
-               message=excluded.message,
-               domain_id=excluded.domain_id,
-               updated_at_ns=excluded.updated_at_ns",
-            params![
-                binding.request.binding_id.to_string(),
-                json,
-                state_name(binding.state),
-                binding.message.as_deref(),
-                binding.domain_id.map(i64::from),
-                sqlite_i64(now_ns()),
-            ],
-        )?;
-        Ok(())
+        upsert_binding_on(&connection, binding, now_ns())
     }
 
     /// Reads one binding by ID.
@@ -226,6 +219,48 @@ impl EnforcementStore {
     }
 }
 
+fn upsert_binding_on(
+    connection: &Connection,
+    binding: &Binding,
+    updated_at_ns: u64,
+) -> Result<(), EnforcementStoreError> {
+    let existing_json: Option<String> = connection
+        .query_row(
+            "SELECT desired_json FROM enforcement_bindings WHERE binding_id = ?1",
+            params![binding.request.binding_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing_json) = existing_json {
+        let existing: Binding = serde_json::from_str(&existing_json)?;
+        if existing.request != binding.request {
+            return Err(EnforcementStoreError::BindingConflict(
+                binding.request.binding_id,
+            ));
+        }
+    }
+    connection.execute(
+        "INSERT INTO enforcement_bindings
+           (binding_id, desired_json, state, message, domain_id, updated_at_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(binding_id) DO UPDATE SET
+           desired_json=excluded.desired_json,
+           state=excluded.state,
+           message=excluded.message,
+           domain_id=excluded.domain_id,
+           updated_at_ns=excluded.updated_at_ns",
+        params![
+            binding.request.binding_id.to_string(),
+            serde_json::to_string(binding)?,
+            state_name(binding.state),
+            binding.message.as_deref(),
+            binding.domain_id.map(i64::from),
+            sqlite_i64(updated_at_ns),
+        ],
+    )?;
+    Ok(())
+}
+
 fn migrate_legacy_violation_timestamps(
     connection: &mut Connection,
 ) -> Result<(), EnforcementStoreError> {
@@ -302,9 +337,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use agentsight_enforcement_protocol::Effect;
+    use agentsight_enforcement_protocol::{ApplyPolicy, Effect, ReplacePolicy, ReplacementPolicy};
 
     use super::*;
+    use crate::enforcement::{
+        PolicyTransition, TransitionDirection, TransitionKey, TransitionPhase,
+    };
 
     const LEGACY_OCCURRED_AT_NS: u64 = 270_000_000_000_000;
     const LEGACY_OBSERVED_AT_NS: u64 = 1_784_000_000_000_000_000;
@@ -367,6 +405,72 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("test violation should exist")
+    }
+
+    fn binding(state: BindingState) -> Binding {
+        Binding {
+            request: ApplyPolicy {
+                binding_id: Uuid::new_v4(),
+                agent_id: "transition-agent".into(),
+                session_id: Some("transition-session".into()),
+                root_pid: 42,
+                process_start_time: 99,
+                policy_id: "transition-policy".into(),
+                policy_revision: "1".into(),
+                policy_dsl: "source AGENT = exec \"**\"".into(),
+            },
+            state,
+            message: None,
+            domain_id: Some(7),
+        }
+    }
+
+    #[test]
+    fn completing_forward_transition_updates_bindings_atomically() {
+        let store = EnforcementStore::open(":memory:").expect("test store should open");
+        let source = binding(BindingState::Enforced);
+        let target = binding(BindingState::Enforced);
+        let transition = PolicyTransition::pending(
+            TransitionKey {
+                action_id: Uuid::new_v4(),
+                direction: TransitionDirection::Forward,
+            },
+            ReplacePolicy {
+                expected: source.clone(),
+                replacement: ReplacementPolicy::Generic(target.request.clone()),
+            },
+        );
+        store.upsert_binding(&source).expect("source should seed");
+        store
+            .begin_transition(&transition)
+            .expect("transition should begin");
+
+        store
+            .complete_transition(&transition.key, &target)
+            .expect("transition should complete");
+
+        assert_eq!(
+            store
+                .binding(source.request.binding_id)
+                .expect("source should load")
+                .expect("source should exist")
+                .state,
+            BindingState::Detached
+        );
+        assert_eq!(
+            store
+                .binding(target.request.binding_id)
+                .expect("target should load"),
+            Some(target)
+        );
+        assert_eq!(
+            store
+                .transition(&transition.key)
+                .expect("transition should load")
+                .expect("transition should exist")
+                .phase,
+            TransitionPhase::Completed
+        );
     }
 
     #[test]
