@@ -76,6 +76,11 @@ require_literal src/anolisa/manifests/components/agentsight/component.toml \
 require_literal src/anolisa/manifests/components/agentsight/component.toml \
     'unit = "agentsight-enforcer.service"'
 
+require_count src/agentsight/tests/security_pipeline.rs \
+    "let required_subscription = client.subscribe_required().expect(\"subscribe required\");" 2
+require_count src/agentsight/tests/security_pipeline.rs \
+    ".apply(request.clone(), required_subscription.subscription_id())" 2
+
 for document in docs/QUICKSTART.md docs/QUICKSTART_zh.md src/agentsight/README.md src/agentsight/README_zh.md; do
     require_literal "$document" "agentsight-enforcer"
 done
