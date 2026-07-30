@@ -1272,6 +1272,30 @@ export interface SecurityContainmentPlan {
   existing_action: SecurityContainmentAction | null;
 }
 
+export function containmentTargetCandidates(
+  plan: SecurityContainmentPlan,
+  health: EnforcementHealth | null,
+): SecurityContainmentCandidate[] {
+  if (plan.original_target_valid && plan.original_target) {
+    return [plan.original_target];
+  }
+  if (
+    health?.ready !== true
+    || health.capabilities.alternate_pid_retarget !== true
+  ) {
+    return [];
+  }
+  return plan.candidates;
+}
+
+export function defaultContainmentTargetPid(
+  plan: SecurityContainmentPlan,
+  health: EnforcementHealth | null,
+): number | null {
+  const candidates = containmentTargetCandidates(plan, health);
+  return candidates.length === 1 ? candidates[0].root_pid : null;
+}
+
 export interface SecurityContainmentRequest {
   root_pid: number;
   duration_secs: number | null;

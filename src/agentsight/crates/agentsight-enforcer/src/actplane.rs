@@ -610,13 +610,11 @@ fn validation_failure_code(error: &ReplaceValidationError) -> ReplaceFailureCode
     match error {
         ReplaceValidationError::CredentialPolicy(_)
         | ReplaceValidationError::SourcePolicySnapshot(_) => ReplaceFailureCode::CompileFailure,
-        ReplaceValidationError::ProcessStartTimeMismatch => ReplaceFailureCode::StaleProcess,
         ReplaceValidationError::SameBindingId
         | ReplaceValidationError::SourceNotEnforced
         | ReplaceValidationError::SourceDomainMissing
         | ReplaceValidationError::AgentMismatch
         | ReplaceValidationError::SessionMismatch
-        | ReplaceValidationError::RootPidMismatch
         | ReplaceValidationError::SourcePolicyMismatch
         | ReplaceValidationError::TargetAcknowledgementMismatch
         | ReplaceValidationError::RuntimeDomainMismatch => ReplaceFailureCode::BindingConflict,

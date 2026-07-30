@@ -605,10 +605,10 @@ fn rollback_replacement<B: EnforcementBackend>(
         };
     };
     let reverse = request.reverse(target.clone());
+    let expected = reverse.clone();
     match backend.replace(reverse)? {
         ReplaceOutcome::Applied(restored)
-            if restored.request == request.expected.request
-                && restored.state == agentsight_enforcement_protocol::BindingState::Enforced =>
+            if expected.validate_acknowledgement(&restored).is_ok() =>
         {
             Ok(())
         }
@@ -972,5 +972,39 @@ mod tests {
             result,
             Err(error) if error.code == REQUIRED_SUBSCRIPTION_UNAVAILABLE
         ));
+    }
+
+    #[test]
+    fn replacement_rollback_accepts_a_restored_live_process_identity() {
+        let backend = crate::MockBackend::new();
+        let source_request = replacement_policy().expected.request;
+        let source = backend
+            .apply(source_request.clone())
+            .expect("source policy should apply");
+        let mut target_request = source_request;
+        target_request.binding_id = Uuid::new_v4();
+        target_request.policy_id = "fixture-enforce".into();
+        target_request.root_pid = 77;
+        target_request.process_start_time = 123;
+        let replacement = ReplacePolicy {
+            expected: source,
+            source: ReplacementSource::Generic,
+            replacement: ReplacementPolicy::Generic(target_request),
+        };
+        let outcome = backend
+            .replace(replacement.clone())
+            .expect("replacement should apply");
+
+        rollback_replacement(&backend, &replacement, &outcome)
+            .expect("rollback should accept the restored live process identity");
+
+        let restored = backend
+            .bindings()
+            .expect("bindings should load")
+            .into_iter()
+            .find(|binding| binding.request.binding_id == replacement.expected.request.binding_id)
+            .expect("source policy should be restored");
+        assert_eq!(restored.request.root_pid, 77);
+        assert_eq!(restored.request.process_start_time, 123);
     }
 }
