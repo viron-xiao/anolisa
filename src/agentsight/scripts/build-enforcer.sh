@@ -24,7 +24,7 @@ PATCH_0006_FILE="$PATCH_DIR/0006-bound-startup-event-drain.patch"
 PATCH_0007_FILE="$PATCH_DIR/0007-gate-pinned-ring-consumption.patch"
 PATCH_0008_FILE="$PATCH_DIR/0008-reserve-network-policy-hooks.patch"
 PATCH_0009_FILE="$PATCH_DIR/0009-add-credential-exfiltration-profile.patch"
-LATEST_PATCH_FILE="$PATCH_DIR/0010-enable-credential-notify-connect.patch"
+PATCH_0010_FILE="$PATCH_DIR/0010-enable-credential-notify-connect.patch"
 PATCH_FILES="$PATCH_DIR/0001-add-file-enforcement-profile.patch
 $PATCH_DIR/0002-validate-file-enforcement-profile.patch
 $PATCH_DIR/0003-pin-profile-metadata.patch
@@ -34,29 +34,29 @@ $PATCH_0006_FILE
 $PATCH_0007_FILE
 $PATCH_0008_FILE
 $PATCH_0009_FILE
-$LATEST_PATCH_FILE"
+$PATCH_0010_FILE"
 POST_0003_PATCH_FILES="$PATCH_0004_FILE
 $PATCH_0005_FILE
 $PATCH_0006_FILE
 $PATCH_0007_FILE
 $PATCH_0008_FILE
 $PATCH_0009_FILE
-$LATEST_PATCH_FILE"
+$PATCH_0010_FILE"
 POST_0004_PATCH_FILES="$PATCH_0005_FILE
 $PATCH_0006_FILE
 $PATCH_0007_FILE
 $PATCH_0008_FILE
 $PATCH_0009_FILE
-$LATEST_PATCH_FILE"
+$PATCH_0010_FILE"
 POST_0005_PATCH_FILES="$PATCH_0006_FILE
 $PATCH_0007_FILE
 $PATCH_0008_FILE
 $PATCH_0009_FILE
-$LATEST_PATCH_FILE"
+$PATCH_0010_FILE"
 POST_0006_PATCH_FILES="$PATCH_0007_FILE
 $PATCH_0008_FILE
 $PATCH_0009_FILE
-$LATEST_PATCH_FILE"
+$PATCH_0010_FILE"
 CARGO=${CARGO:-cargo}
 
 DECLARED_REVISION_COUNT=$(grep -F -c "rev = \"$ACTPLANE_REVISION\"" "$AGENTSIGHT_ROOT/Cargo.toml" || true)
@@ -157,18 +157,20 @@ elif [ "$ACTUAL_BPF_LIB_BLOB" = "$ACTPLANE_POST_0006_BPF_LIB_BLOB" ]; then
         git -C "$SOURCE_DIR" apply --unidiff-zero "$patch_file"
     done
 elif [ "$ACTUAL_BPF_LIB_BLOB" = "$ACTPLANE_POST_0007_BPF_LIB_BLOB" ]; then
-    for patch_file in "$PATCH_0008_FILE" "$PATCH_0009_FILE" "$LATEST_PATCH_FILE"; do
+    for patch_file in "$PATCH_0008_FILE" "$PATCH_0009_FILE" "$PATCH_0010_FILE"; do
         git -C "$SOURCE_DIR" apply --unidiff-zero --check "$patch_file"
         git -C "$SOURCE_DIR" apply --unidiff-zero "$patch_file"
     done
 elif [ "$ACTUAL_BPF_LIB_BLOB" = "$ACTPLANE_POST_0008_BPF_LIB_BLOB" ]; then
-    for patch_file in "$PATCH_0009_FILE" "$LATEST_PATCH_FILE"; do
+    for patch_file in "$PATCH_0009_FILE" "$PATCH_0010_FILE"; do
         git -C "$SOURCE_DIR" apply --unidiff-zero --check "$patch_file"
         git -C "$SOURCE_DIR" apply --unidiff-zero "$patch_file"
     done
 elif [ "$ACTUAL_BPF_LIB_BLOB" = "$ACTPLANE_POST_0009_BPF_LIB_BLOB" ]; then
-    git -C "$SOURCE_DIR" apply --unidiff-zero --check "$LATEST_PATCH_FILE"
-    git -C "$SOURCE_DIR" apply --unidiff-zero "$LATEST_PATCH_FILE"
+    for patch_file in "$PATCH_0010_FILE"; do
+        git -C "$SOURCE_DIR" apply --unidiff-zero --check "$patch_file"
+        git -C "$SOURCE_DIR" apply --unidiff-zero "$patch_file"
+    done
 elif [ "$ACTUAL_BPF_LIB_BLOB" != "$ACTPLANE_PATCHED_BPF_LIB_BLOB" ]; then
     echo "ActPlane BPF loader does not match the pinned revision or reviewed patch queue" >&2
     exit 1
