@@ -104,6 +104,13 @@ impl ContainmentEnforcer for FakeEnforcer {
             .ok_or(ContainmentEnforcerError::MissingTransition(key.action_id))
     }
 
+    fn begin_reverse_transition(
+        &self,
+        action_id: Uuid,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        Err(ContainmentEnforcerError::MissingTransition(action_id))
+    }
+
     fn detach(&self, _: Uuid) -> Result<(), String> {
         Ok(())
     }

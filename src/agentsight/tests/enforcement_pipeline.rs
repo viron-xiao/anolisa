@@ -813,7 +813,7 @@ fn apply_persists_enforced_state_and_deduplicates_violation() {
 }
 
 #[test]
-fn transition_replaces_runtime_and_persisted_ownership_through_uds() {
+fn transition_replaces_and_restores_runtime_ownership_through_uds() {
     let fixture = TestEnforcer::start();
     let store = EnforcementStore::open(&fixture.database_path)
         .expect("temporary enforcement store should open");
@@ -835,8 +835,9 @@ fn transition_replaces_runtime_and_persisted_ownership_through_uds() {
     target_request.policy_id = "pipeline-containment".into();
     target_request.policy_revision = "revision-2".into();
     target_request.policy_dsl = "label AGENT\ndeny network".into();
+    let action_id = Uuid::new_v4();
     let key = TransitionKey {
-        action_id: Uuid::new_v4(),
+        action_id,
         direction: TransitionDirection::Forward,
     };
 
@@ -849,6 +850,9 @@ fn transition_replaces_runtime_and_persisted_ownership_through_uds() {
             },
         )
         .expect("atomic transition should complete");
+    let reverse = coordinator
+        .begin_reverse_transition(action_id)
+        .expect("reverse transition should restore the original request");
     let persisted = coordinator
         .bindings()
         .expect("persisted bindings should load");
@@ -860,21 +864,30 @@ fn transition_replaces_runtime_and_persisted_ownership_through_uds() {
         .transition(&key)
         .expect("transition query should work")
         .expect("transition should exist");
+    let stored_reverse = store
+        .transition(&TransitionKey {
+            action_id,
+            direction: TransitionDirection::Reverse,
+        })
+        .expect("reverse transition query should work")
+        .expect("reverse transition should exist");
     coordinator.stop_ingestion();
     ingestion.join().expect("ingestion should stop");
 
     assert_eq!(transition.phase, TransitionPhase::Completed);
     assert_eq!(stored_transition, transition);
+    assert_eq!(reverse.phase, TransitionPhase::Completed);
+    assert_eq!(stored_reverse, reverse);
     assert_eq!(persisted.len(), 2);
     assert!(persisted.iter().any(|binding| {
         binding.request.binding_id == source.request.binding_id
-            && binding.state == BindingState::Detached
+            && binding.state == BindingState::Enforced
     }));
     assert!(persisted.iter().any(|binding| {
-        binding.request == target_request && binding.state == BindingState::Enforced
+        binding.request == target_request && binding.state == BindingState::Detached
     }));
     assert_eq!(backend.len(), 1);
-    assert_eq!(backend[0].request, target_request);
+    assert_eq!(backend[0].request, source.request);
 }
 
 #[test]

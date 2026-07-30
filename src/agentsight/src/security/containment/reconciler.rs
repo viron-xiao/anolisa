@@ -1,6 +1,8 @@
 //! Bounded restart recovery and expiry handling for containment actions.
 
-use super::pending::{record_pending_unavailable, retry_delay_ns};
+mod expiry;
+
+use super::pending::record_pending_unavailable;
 use super::{
     ContainmentAction, ContainmentActivationResult, ContainmentCoordinator, ContainmentEnforcer,
     ContainmentEnforcerError, ContainmentError, ContainmentFailureStage, ContainmentLifecycle,
@@ -12,7 +14,6 @@ use crate::security::store::DueContainmentAction;
 use agentsight_enforcement_protocol::{BindingState, ReplacePolicy, ReplacementPolicy};
 
 const DUE_BATCH_LIMIT: usize = 100;
-const DETACH_MAX_RETRIES: u32 = 5;
 
 impl ContainmentCoordinator {
     /// Reconciles at most one bounded batch of due persisted actions.
@@ -335,41 +336,6 @@ impl Reconciler<'_> {
         Err(ContainmentError::Enforcer(reason))
     }
 
-    fn expire_pending_binding(
-        &self,
-        action: ContainmentAction,
-        claimed_at_ns: u64,
-        current_time_ns: u64,
-    ) -> Result<(), ContainmentError> {
-        let Some(mut cleanup) = self.store.begin_containment_cleanup(
-            &action,
-            ContainmentLifecycle::Pending,
-            claimed_at_ns,
-            current_time_ns,
-            "expired pending containment binding requires detachment".into(),
-        )?
-        else {
-            return Err(ContainmentError::ClaimLost(action.action_id));
-        };
-        let cleanup_claim_ns = cleanup.updated_at_ns;
-        match self.enforcer.detach(action.binding_id) {
-            Ok(()) => {
-                cleanup.lifecycle_state = ContainmentLifecycle::Expired;
-                cleanup.failure_stage = None;
-                cleanup.failure_reason = None;
-                cleanup.next_retry_at_ns = None;
-                self.finish_claimed(&cleanup, ContainmentLifecycle::Expiring, cleanup_claim_ns)
-            }
-            Err(message) => self.record_detach_failure(
-                &mut cleanup,
-                ContainmentLifecycle::Expiring,
-                cleanup_claim_ns,
-                current_time_ns,
-                sanitize_failure(&message),
-            ),
-        }
-    }
-
     fn fail_pending(
         &self,
         mut action: ContainmentAction,
@@ -380,50 +346,7 @@ impl Reconciler<'_> {
     ) -> Result<(), ContainmentError> {
         let reason = sanitize_failure(reason);
         if cleanup_binding {
-            let Some(mut cleanup) = self.store.begin_containment_cleanup(
-                &action,
-                ContainmentLifecycle::Pending,
-                claimed_at_ns,
-                current_time_ns,
-                reason.clone(),
-            )?
-            else {
-                return Err(ContainmentError::ClaimLost(action.action_id));
-            };
-            let cleanup_claim_ns = cleanup.updated_at_ns;
-            return match self.enforcer.detach(action.binding_id) {
-                Ok(()) => {
-                    cleanup.lifecycle_state = ContainmentLifecycle::Failed;
-                    cleanup.failure_stage = Some(ContainmentFailureStage::Reconcile);
-                    cleanup.failure_reason = Some(reason.clone());
-                    cleanup.next_retry_at_ns = None;
-                    self.finish_claimed(
-                        &cleanup,
-                        ContainmentLifecycle::Expiring,
-                        cleanup_claim_ns,
-                    )?;
-                    Err(ContainmentError::RecoveryFailed {
-                        action_id: cleanup.action_id,
-                        reason,
-                    })
-                }
-                Err(message) => {
-                    let detach_reason =
-                        sanitize_failure(&format!("{reason}; detach failed: {message}"));
-                    self.record_detach_failure(
-                        &mut cleanup,
-                        ContainmentLifecycle::Expiring,
-                        cleanup_claim_ns,
-                        current_time_ns,
-                        detach_reason.clone(),
-                    )?;
-                    Err(ContainmentError::CleanupRequired {
-                        action_id: cleanup.action_id,
-                        binding_id: cleanup.binding_id,
-                        reason: detach_reason,
-                    })
-                }
-            };
+            return self.restore_failed_pending(action, claimed_at_ns, current_time_ns, reason);
         }
         action.lifecycle_state = ContainmentLifecycle::Failed;
         action.failure_stage = Some(ContainmentFailureStage::Reconcile);
@@ -434,52 +357,6 @@ impl Reconciler<'_> {
             action_id: action.action_id,
             reason,
         })
-    }
-
-    fn reconcile_detach(
-        &self,
-        mut action: ContainmentAction,
-        current_time_ns: u64,
-    ) -> Result<(), ContainmentError> {
-        let claimed_at_ns = action.updated_at_ns;
-        match self.enforcer.detach(action.binding_id) {
-            Ok(()) => {
-                action.lifecycle_state = ContainmentLifecycle::Expired;
-                action.failure_stage = None;
-                action.failure_reason = None;
-                action.next_retry_at_ns = None;
-                self.finish_claimed(&action, ContainmentLifecycle::Expiring, claimed_at_ns)
-            }
-            Err(message) => self.record_detach_failure(
-                &mut action,
-                ContainmentLifecycle::Expiring,
-                claimed_at_ns,
-                current_time_ns,
-                sanitize_failure(&message),
-            ),
-        }
-    }
-
-    fn record_detach_failure(
-        &self,
-        action: &mut ContainmentAction,
-        claimed_lifecycle: ContainmentLifecycle,
-        claimed_at_ns: u64,
-        current_time_ns: u64,
-        reason: String,
-    ) -> Result<(), ContainmentError> {
-        action.attempt_count = action.attempt_count.saturating_add(1);
-        action.failure_stage = Some(ContainmentFailureStage::Detach);
-        action.failure_reason = Some(reason);
-        if action.attempt_count > DETACH_MAX_RETRIES {
-            action.lifecycle_state = ContainmentLifecycle::Failed;
-            action.next_retry_at_ns = None;
-        } else {
-            action.lifecycle_state = ContainmentLifecycle::Expiring;
-            action.next_retry_at_ns =
-                Some(current_time_ns.saturating_add(retry_delay_ns(action.attempt_count)));
-        }
-        self.finish_claimed(action, claimed_lifecycle, claimed_at_ns)
     }
 
     fn finish_claimed(

@@ -97,6 +97,11 @@ pub trait ContainmentEnforcer: Send + Sync {
         &self,
         key: &TransitionKey,
     ) -> Result<StampedBinding, ContainmentEnforcerError>;
+    /// Builds and executes the reverse transition from durable forward state.
+    fn begin_reverse_transition(
+        &self,
+        action_id: Uuid,
+    ) -> Result<StampedBinding, ContainmentEnforcerError>;
     /// Detaches a previously applied binding.
     fn detach(&self, binding_id: Uuid) -> Result<(), String>;
     /// Lists persisted enforcement bindings.
@@ -133,6 +138,17 @@ impl ContainmentEnforcer for EnforcementCoordinator {
     ) -> Result<StampedBinding, ContainmentEnforcerError> {
         let stamp = current_stamp(self)?;
         let transition = EnforcementCoordinator::resume_transition(self, key)
+            .map_err(containment_enforcer_error)?;
+        ensure_current_stamp(self, stamp)?;
+        stamped_completed_transition(transition, stamp)
+    }
+
+    fn begin_reverse_transition(
+        &self,
+        action_id: Uuid,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        let stamp = current_stamp(self)?;
+        let transition = EnforcementCoordinator::begin_reverse_transition(self, action_id)
             .map_err(containment_enforcer_error)?;
         ensure_current_stamp(self, stamp)?;
         stamped_completed_transition(transition, stamp)

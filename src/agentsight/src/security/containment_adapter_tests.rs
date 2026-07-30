@@ -106,6 +106,13 @@ impl ContainmentEnforcer for PausingProductionEnforcer {
         ContainmentEnforcer::resume_transition(self.coordinator.as_ref(), key)
     }
 
+    fn begin_reverse_transition(
+        &self,
+        action_id: Uuid,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        ContainmentEnforcer::begin_reverse_transition(self.coordinator.as_ref(), action_id)
+    }
+
     fn detach(&self, _: Uuid) -> Result<(), String> {
         self.detach_calls.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -300,6 +307,13 @@ impl ContainmentEnforcer for ApplyingGenerationEnforcer {
             .cloned()
             .map(|binding| StampedBinding::new(binding, stamp))
             .ok_or(ContainmentEnforcerError::MissingTransition(key.action_id))
+    }
+
+    fn begin_reverse_transition(
+        &self,
+        action_id: Uuid,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        Err(ContainmentEnforcerError::MissingTransition(action_id))
     }
 
     fn detach(&self, _: Uuid) -> Result<(), String> {

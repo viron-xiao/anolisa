@@ -4,6 +4,7 @@ pub(super) mod enforcer;
 mod pending;
 mod policy;
 mod reconciler;
+mod rollback;
 mod worker;
 
 use std::sync::Arc;
@@ -30,7 +31,6 @@ use crate::enforcement::{TransitionDirection, TransitionKey, read_process_start_
 const DEFAULT_DURATION_SECS: u64 = 900;
 const MIN_DURATION_SECS: u64 = 60;
 const MAX_DURATION_SECS: u64 = 86_400;
-const CLEANUP_RETRY_DELAY_NS: u64 = 1_000_000_000;
 
 /// User-selected process and duration for one containment request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,78 +412,6 @@ impl ContainmentCoordinator {
             .map_err(|error| ContainmentError::Enforcer(sanitize_failure(&error.to_string())))?;
         let (bindings, _) = snapshot.into_parts();
         resolve_policy(detail, bindings).ok_or(ContainmentError::SourcePolicyUnavailable(case_id))
-    }
-
-    fn detach_and_fail(
-        &self,
-        action: &mut ContainmentAction,
-        stage: ContainmentFailureStage,
-        message: &str,
-    ) -> Result<(), ContainmentError> {
-        let reason = sanitize_failure(message);
-        let claimed_at_ns = action.updated_at_ns;
-        let current_time_ns = now_ns();
-        let Some(mut cleanup) = self.store.begin_containment_cleanup(
-            action,
-            ContainmentLifecycle::Pending,
-            claimed_at_ns,
-            current_time_ns,
-            reason.clone(),
-        )?
-        else {
-            return Err(ContainmentError::ClaimLost(action.action_id));
-        };
-        let cleanup_claim_ns = cleanup.updated_at_ns;
-        match self.enforcer.detach(action.binding_id) {
-            Ok(()) => {
-                cleanup.lifecycle_state = ContainmentLifecycle::Failed;
-                cleanup.failure_stage = Some(stage);
-                cleanup.failure_reason = Some(reason);
-                cleanup.next_retry_at_ns = None;
-                cleanup.updated_at_ns = now_ns().max(cleanup_claim_ns.saturating_add(1));
-                self.finish_direct_claim(
-                    &cleanup,
-                    ContainmentLifecycle::Expiring,
-                    cleanup_claim_ns,
-                )?;
-                *action = cleanup;
-                Ok(())
-            }
-            Err(error) => {
-                let reason = sanitize_failure(&format!("{message}; detach failed: {error}"));
-                cleanup.failure_reason = Some(reason.clone());
-                cleanup.attempt_count = cleanup.attempt_count.saturating_add(1);
-                cleanup.next_retry_at_ns =
-                    Some(current_time_ns.saturating_add(CLEANUP_RETRY_DELAY_NS));
-                cleanup.updated_at_ns = now_ns().max(cleanup_claim_ns.saturating_add(1));
-                self.finish_direct_claim(
-                    &cleanup,
-                    ContainmentLifecycle::Expiring,
-                    cleanup_claim_ns,
-                )?;
-                *action = cleanup;
-                Err(ContainmentError::CleanupRequired {
-                    action_id: action.action_id,
-                    binding_id: action.binding_id,
-                    reason,
-                })
-            }
-        }
-    }
-
-    fn finish_direct_claim(
-        &self,
-        action: &ContainmentAction,
-        claimed_lifecycle: ContainmentLifecycle,
-        claimed_at_ns: u64,
-    ) -> Result<(), ContainmentError> {
-        if self
-            .store
-            .finish_containment_reconciliation(action, claimed_lifecycle, claimed_at_ns)?
-        {
-            return Ok(());
-        }
-        Err(ContainmentError::ClaimLost(action.action_id))
     }
 }
 
