@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -5,14 +6,15 @@ use std::thread;
 use std::time::Duration;
 
 use agentsight_enforcement_protocol::{
-    ApplyCredentialPolicy, EventIdentity, FileAction, SecurityEvent, SecurityEventKind,
+    EventIdentity, FileAction, ReplacePolicy, ReplacementPolicy, SecurityEvent, SecurityEventKind,
 };
 
 use super::enforcer::{ContainmentReadinessLease, StampedBinding, StampedBindings};
 use super::*;
 use crate::enforcement::{
     ApplyPolicy, Binding, BindingState, EnforcementClient, EnforcementCoordinator,
-    EnforcementStore, read_process_start_time,
+    EnforcementStore, PolicyTransition, TransitionDirection, TransitionKey,
+    read_process_start_time,
 };
 use crate::ingestion_readiness::{GenerationReadiness, ReadinessLease, ReadinessStamp};
 use crate::security::{ContainmentLifecycle, RiskCase, RiskSeverity};
@@ -89,11 +91,19 @@ impl PausingProductionEnforcer {
 }
 
 impl ContainmentEnforcer for PausingProductionEnforcer {
-    fn apply_credential_policy(
+    fn begin_transition(
         &self,
-        request: ApplyCredentialPolicy,
+        key: TransitionKey,
+        request: ReplacePolicy,
     ) -> Result<StampedBinding, ContainmentEnforcerError> {
-        ContainmentEnforcer::apply_credential_policy(self.coordinator.as_ref(), request)
+        ContainmentEnforcer::begin_transition(self.coordinator.as_ref(), key, request)
+    }
+
+    fn resume_transition(
+        &self,
+        key: &TransitionKey,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        ContainmentEnforcer::resume_transition(self.coordinator.as_ref(), key)
     }
 
     fn detach(&self, _: Uuid) -> Result<(), String> {
@@ -136,25 +146,40 @@ fn exact_binding_from_generation_a_cannot_activate_under_generation_b() {
 
     let source_binding_id = Uuid::new_v4();
     let action_binding_id = Uuid::new_v4();
+    let source = binding(
+        source_binding_id,
+        999_999,
+        42,
+        audit_policy("/root/secret.txt"),
+    );
+    let target = binding(
+        action_binding_id,
+        999_999,
+        42,
+        enforce_policy("/root/secret.txt"),
+    );
     enforcement_store
-        .upsert_binding(&binding(
-            source_binding_id,
-            999_999,
-            42,
-            audit_policy("/root/secret.txt"),
-        ))
+        .upsert_binding(&source)
         .expect("source binding should persist");
-    enforcement_store
-        .upsert_binding(&binding(
-            action_binding_id,
-            999_999,
-            42,
-            enforce_policy("/root/secret.txt"),
-        ))
-        .expect("containment binding should persist");
 
     let (security_store, case_id, action) =
         security_fixture(source_binding_id, action_binding_id, 999_999, 42);
+    let transition = PolicyTransition::pending(
+        TransitionKey {
+            action_id: action.action_id,
+            direction: TransitionDirection::Forward,
+        },
+        ReplacePolicy {
+            expected: source,
+            replacement: ReplacementPolicy::Generic(target.request.clone()),
+        },
+    );
+    enforcement_store
+        .begin_transition(&transition)
+        .expect("transition should persist");
+    enforcement_store
+        .complete_transition(&transition.key, &target)
+        .expect("transition should complete");
     let enforcer = Arc::new(PausingProductionEnforcer::new(Arc::clone(&enforcement)));
     let pause = enforcer.pause_next_lease();
     let enforcer_trait: Arc<dyn ContainmentEnforcer> = enforcer.clone();
@@ -194,6 +219,7 @@ fn exact_binding_from_generation_a_cannot_activate_under_generation_b() {
 struct ApplyingGenerationEnforcer {
     readiness: GenerationReadiness,
     bindings: Mutex<Vec<Binding>>,
+    transitions: Mutex<HashMap<TransitionKey, Binding>>,
     lease_pause: Mutex<Option<LeasePause>>,
     apply_calls: AtomicUsize,
     detach_calls: AtomicUsize,
@@ -210,6 +236,7 @@ impl ApplyingGenerationEnforcer {
         Self {
             readiness,
             bindings: Mutex::new(vec![source]),
+            transitions: Mutex::new(HashMap::new()),
             lease_pause: Mutex::new(None),
             apply_calls: AtomicUsize::new(0),
             detach_calls: AtomicUsize::new(0),
@@ -228,23 +255,51 @@ impl ApplyingGenerationEnforcer {
 }
 
 impl ContainmentEnforcer for ApplyingGenerationEnforcer {
-    fn apply_credential_policy(
+    fn begin_transition(
         &self,
-        request: ApplyCredentialPolicy,
+        key: TransitionKey,
+        transition: ReplacePolicy,
     ) -> Result<StampedBinding, ContainmentEnforcerError> {
         let stamp = self.stamp()?;
         self.apply_calls.fetch_add(1, Ordering::AcqRel);
+        let ReplacementPolicy::Credential(request) = transition.replacement else {
+            return Err(ContainmentEnforcerError::Rejected(
+                "fixture accepts only credential transitions".into(),
+            ));
+        };
         let binding = binding(
             request.binding_id,
             request.root_pid,
             request.process_start_time,
             enforce_policy(&request.policy.source_patterns[0]),
         );
-        self.bindings
+        let mut bindings = self.bindings.lock().expect("bindings should lock");
+        for existing in bindings.iter_mut() {
+            if existing.request.binding_id == transition.expected.request.binding_id {
+                existing.state = BindingState::Detached;
+                existing.domain_id = None;
+            }
+        }
+        bindings.push(binding.clone());
+        self.transitions
             .lock()
-            .expect("bindings should lock")
-            .push(binding.clone());
+            .expect("transitions should lock")
+            .insert(key, binding.clone());
         Ok(StampedBinding::new(binding, stamp))
+    }
+
+    fn resume_transition(
+        &self,
+        key: &TransitionKey,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        let stamp = self.stamp()?;
+        self.transitions
+            .lock()
+            .expect("transitions should lock")
+            .get(key)
+            .cloned()
+            .map(|binding| StampedBinding::new(binding, stamp))
+            .ok_or(ContainmentEnforcerError::MissingTransition(key.action_id))
     }
 
     fn detach(&self, _: Uuid) -> Result<(), String> {
@@ -356,7 +411,13 @@ fn security_fixture(
     store
         .upsert_case(&risk_case(case_id), &[event.event_id])
         .expect("case should persist");
-    let action = pending_action(case_id, action_binding_id, pid, process_start_time);
+    let action = pending_action(
+        case_id,
+        source_binding_id,
+        action_binding_id,
+        pid,
+        process_start_time,
+    );
     store
         .insert_containment_action(&action)
         .expect("action should persist");
@@ -476,6 +537,7 @@ fn risk_case(case_id: Uuid) -> RiskCase {
 
 fn pending_action(
     case_id: Uuid,
+    source_binding_id: Uuid,
     binding_id: Uuid,
     root_pid: i32,
     process_start_time: u64,
@@ -484,6 +546,7 @@ fn pending_action(
         action_id: Uuid::new_v4(),
         case_id,
         binding_id,
+        source_binding_id: Some(source_binding_id),
         agent_id: "hermes-test".into(),
         root_pid,
         process_start_time,

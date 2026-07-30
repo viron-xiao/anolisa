@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use agentsight::ReadinessStamp;
-use agentsight::enforcement::{ApplyPolicy, Binding, BindingState};
+use agentsight::enforcement::{ApplyPolicy, Binding, BindingState, TransitionKey};
 use agentsight::security::{
     ContainmentAction, ContainmentCandidate, ContainmentCoordinator, ContainmentEnforcer,
     ContainmentEnforcerError, ContainmentError, ContainmentFailureStage, ContainmentLifecycle,
@@ -11,7 +12,8 @@ use agentsight::security::{
     SecurityStore, StampedBinding, StampedBindings, stable_readiness_lease,
 };
 use agentsight_enforcement_protocol::{
-    ApplyCredentialPolicy, EventIdentity, FileAction, PolicyMode, SecurityEvent, SecurityEventKind,
+    ApplyCredentialPolicy, EventIdentity, FileAction, PolicyMode, ReplacePolicy, ReplacementPolicy,
+    SecurityEvent, SecurityEventKind,
 };
 use uuid::Uuid;
 
@@ -32,6 +34,7 @@ struct ApplyPause {
 #[derive(Default)]
 struct FakeEnforcer {
     bindings: Mutex<Vec<Binding>>,
+    transitions: Mutex<HashMap<TransitionKey, Binding>>,
     applied: Mutex<Vec<ApplyCredentialPolicy>>,
     failure: Mutex<Option<ContainmentEnforcerError>>,
     detach_failure: Mutex<Option<String>>,
@@ -114,17 +117,45 @@ impl FakeEnforcer {
     fn detach_calls(&self) -> usize {
         self.detached.lock().expect("detached should lock").len()
     }
+
+    fn binding_state(&self, binding_id: Uuid) -> Option<BindingState> {
+        self.bindings
+            .lock()
+            .expect("bindings should lock")
+            .iter()
+            .find(|binding| binding.request.binding_id == binding_id)
+            .map(|binding| binding.state)
+    }
+
+    fn seed_completed_forward(&self, action: &ContainmentAction, binding: Binding) {
+        self.transitions
+            .lock()
+            .expect("transitions should lock")
+            .insert(
+                TransitionKey {
+                    action_id: action.action_id,
+                    direction: agentsight::enforcement::TransitionDirection::Forward,
+                },
+                binding,
+            );
+    }
 }
 
 impl ContainmentEnforcer for FakeEnforcer {
-    fn apply_credential_policy(
+    fn begin_transition(
         &self,
-        request: ApplyCredentialPolicy,
+        key: TransitionKey,
+        transition: ReplacePolicy,
     ) -> Result<StampedBinding, ContainmentEnforcerError> {
         self.apply_calls.fetch_add(1, Ordering::AcqRel);
         if let Some(error) = self.failure.lock().expect("failure should lock").take() {
             return Err(error);
         }
+        let ReplacementPolicy::Credential(request) = transition.replacement else {
+            return Err(ContainmentEnforcerError::Rejected(
+                "fixture accepts only credential transitions".into(),
+            ));
+        };
         self.applied
             .lock()
             .expect("applied should lock")
@@ -156,7 +187,8 @@ impl ContainmentEnforcer for FakeEnforcer {
         } else {
             "block"
         };
-        Ok(StampedBinding::stable(Binding {
+        let policy_dsl = compiled_policy(action, source, trusted);
+        let binding = Binding {
             request: ApplyPolicy {
                 binding_id: request.binding_id,
                 agent_id: request.agent_id,
@@ -165,12 +197,38 @@ impl ContainmentEnforcer for FakeEnforcer {
                 process_start_time: request.process_start_time,
                 policy_id: request.policy.policy_id,
                 policy_revision: request.policy.revision.to_string(),
-                policy_dsl: compiled_policy(action, source, trusted),
+                policy_dsl,
             },
             state,
             message: None,
             domain_id: Some(7),
-        }))
+        };
+        let mut bindings = self.bindings.lock().expect("bindings should lock");
+        for existing in bindings.iter_mut() {
+            if existing.request.binding_id == transition.expected.request.binding_id {
+                existing.state = BindingState::Detached;
+                existing.domain_id = None;
+            }
+        }
+        bindings.push(binding.clone());
+        self.transitions
+            .lock()
+            .expect("transitions should lock")
+            .insert(key, binding.clone());
+        Ok(StampedBinding::stable(binding))
+    }
+
+    fn resume_transition(
+        &self,
+        key: &TransitionKey,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        self.transitions
+            .lock()
+            .expect("transitions should lock")
+            .get(key)
+            .cloned()
+            .map(StampedBinding::stable)
+            .ok_or(ContainmentEnforcerError::MissingTransition(key.action_id))
     }
 
     fn detach(&self, binding_id: Uuid) -> Result<(), String> {
@@ -393,11 +451,31 @@ impl Fixture {
         attempt_count: u32,
         next_retry_at_ns: Option<u64>,
     ) -> ContainmentAction {
+        self.insert_action_with_source(
+            self.binding_id,
+            lifecycle_state,
+            duration_secs,
+            expires_at_ns,
+            attempt_count,
+            next_retry_at_ns,
+        )
+    }
+
+    fn insert_action_with_source(
+        &self,
+        source_binding_id: Uuid,
+        lifecycle_state: ContainmentLifecycle,
+        duration_secs: Option<u64>,
+        expires_at_ns: Option<u64>,
+        attempt_count: u32,
+        next_retry_at_ns: Option<u64>,
+    ) -> ContainmentAction {
         let candidate = self.candidate();
         let action = ContainmentAction {
             action_id: Uuid::new_v4(),
             case_id: self.case_id,
             binding_id: Uuid::new_v4(),
+            source_binding_id: Some(source_binding_id),
             agent_id: "hermes-test".into(),
             root_pid: candidate.root_pid,
             process_start_time: candidate.process_start_time,
@@ -571,10 +649,12 @@ fn pending_restart_activates_an_existing_exact_binding_without_reapply() {
         0,
         Some(1_000),
     );
-    fixture.enforcer.set_bindings(vec![
-        binding(fixture.binding_id, 999_999, 42, &policy("/root/secret.txt")),
-        containment_binding(&action),
-    ]);
+    let mut source = binding(fixture.binding_id, 999_999, 42, &policy("/root/secret.txt"));
+    source.state = BindingState::Detached;
+    source.domain_id = None;
+    let target = containment_binding(&action);
+    fixture.enforcer.set_bindings(vec![source, target.clone()]);
+    fixture.enforcer.seed_completed_forward(&action, target);
 
     fixture
         .reconstructed_coordinator()
@@ -593,10 +673,12 @@ fn pending_restart_activates_an_existing_exact_binding_without_reapply() {
 fn persistent_pending_restart_is_immediately_recoverable() {
     let fixture = Fixture::new(Some(&policy("/root/secret.txt")), 999_999, 42);
     let action = fixture.insert_action(ContainmentLifecycle::Pending, None, None, 0, Some(10));
-    fixture.enforcer.set_bindings(vec![
-        binding(fixture.binding_id, 999_999, 42, &policy("/root/secret.txt")),
-        containment_binding(&action),
-    ]);
+    let mut source = binding(fixture.binding_id, 999_999, 42, &policy("/root/secret.txt"));
+    source.state = BindingState::Detached;
+    source.domain_id = None;
+    let target = containment_binding(&action);
+    fixture.enforcer.set_bindings(vec![source, target.clone()]);
+    fixture.enforcer.seed_completed_forward(&action, target);
 
     fixture
         .reconstructed_coordinator()
@@ -680,6 +762,34 @@ fn pending_restart_fails_safely_without_original_binding_provenance() {
             .failure_reason
             .as_deref()
             .is_some_and(|reason| !reason.chars().any(char::is_control))
+    );
+    assert_eq!(fixture.enforcer.apply_calls(), 0);
+}
+
+#[test]
+fn pending_restart_rejects_mismatched_source_binding_provenance() {
+    let fixture = Fixture::new(Some(&policy("/root/secret.txt")), 999_999, 42);
+    let action = fixture.insert_action_with_source(
+        Uuid::new_v4(),
+        ContainmentLifecycle::Pending,
+        Some(60),
+        Some(2_000),
+        0,
+        Some(1_000),
+    );
+
+    let error = fixture
+        .reconstructed_coordinator()
+        .reconcile_once(1_000)
+        .expect_err("mismatched source provenance must fail safely");
+
+    assert!(matches!(
+        error,
+        ContainmentError::RecoveryFailed { action_id, .. } if action_id == action.action_id
+    ));
+    assert_eq!(
+        fixture.latest_action().lifecycle_state,
+        ContainmentLifecycle::Failed
     );
     assert_eq!(fixture.enforcer.apply_calls(), 0);
 }
@@ -1117,6 +1227,14 @@ mod linux {
         assert_eq!(applied[0].root_pid, action.root_pid);
         assert_eq!(applied[0].process_start_time, action.process_start_time);
         assert_eq!(applied[0].policy.source_patterns, [action.source_path]);
+        assert_eq!(
+            fixture.enforcer.binding_state(fixture.binding_id),
+            Some(BindingState::Detached)
+        );
+        assert_eq!(
+            fixture.enforcer.binding_state(action.binding_id),
+            Some(BindingState::Enforced)
+        );
     }
 
     #[test]
@@ -1217,6 +1335,7 @@ mod linux {
             .expect("containment should apply");
 
         assert_eq!(action.source_path, "/root/secret.txt");
+        assert_eq!(action.source_binding_id, Some(fixture.binding_id));
         assert_eq!(action.lifecycle_state, ContainmentLifecycle::Active);
         assert_eq!(action.requested_by, "principal:test-operator");
         assert_eq!(fixture.status(), RiskCaseStatus::Confirmed);
@@ -1227,6 +1346,14 @@ mod linux {
         assert_eq!(applied[0].policy.source_patterns, ["/root/secret.txt"]);
         assert_eq!(applied[0].policy.trusted_endpoints, ["trusted.example:443"]);
         assert_eq!(applied[0].policy.taint_label, "CREDENTIAL");
+        assert_eq!(
+            fixture.enforcer.binding_state(fixture.binding_id),
+            Some(BindingState::Detached)
+        );
+        assert_eq!(
+            fixture.enforcer.binding_state(action.binding_id),
+            Some(BindingState::Enforced)
+        );
     }
 
     #[test]
@@ -1313,7 +1440,7 @@ mod linux {
     }
 
     #[test]
-    fn acknowledgement_must_match_exact_enforce_semantics() {
+    fn invalid_atomic_acknowledgement_keeps_the_action_pending_without_detach() {
         for mutation in [
             AckMutation::State(BindingState::Pending),
             AckMutation::Session,
@@ -1328,13 +1455,15 @@ mod linux {
                 Err(ContainmentError::Enforcer(_))
             ));
             let action = fixture.latest_action();
-            assert_eq!(action.lifecycle_state, ContainmentLifecycle::Failed);
-            assert_eq!(fixture.enforcer.detached(), [action.binding_id]);
+            assert_eq!(action.lifecycle_state, ContainmentLifecycle::Pending);
+            assert_eq!(action.attempt_count, 1);
+            assert!(action.next_retry_at_ns.is_some());
+            assert_eq!(fixture.enforcer.detach_calls(), 0);
         }
     }
 
     #[test]
-    fn detach_failure_keeps_the_claim_actionable() {
+    fn invalid_atomic_acknowledgement_never_uses_standalone_detach() {
         let (_process, fixture) = live_fixture();
         fixture
             .enforcer
@@ -1345,31 +1474,20 @@ mod linux {
 
         let error = fixture
             .contain(Some(900))
-            .expect_err("invalid acknowledgement must be detached");
-        assert!(matches!(
-            &error,
-            ContainmentError::CleanupRequired { reason, .. }
-                if reason.contains("detach adapter unavailable")
-        ));
+            .expect_err("invalid acknowledgement must remain retryable");
+        assert!(matches!(error, ContainmentError::Enforcer(_)));
         let action = fixture.latest_action();
-        assert!(matches!(
-            error,
-            ContainmentError::CleanupRequired { action_id, binding_id, .. }
-                if action_id == action.action_id && binding_id == action.binding_id
-        ));
-        assert_eq!(action.lifecycle_state, ContainmentLifecycle::Expiring);
-        assert_eq!(action.failure_stage, Some(ContainmentFailureStage::Detach));
+        assert_eq!(action.lifecycle_state, ContainmentLifecycle::Pending);
+        assert_eq!(
+            action.failure_stage,
+            Some(ContainmentFailureStage::Reconcile)
+        );
         assert_eq!(action.attempt_count, 1);
         assert!(action.next_retry_at_ns.is_some());
-        assert!(
-            action
-                .failure_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("detach adapter unavailable"))
-        );
+        assert_eq!(fixture.enforcer.detach_calls(), 0);
         assert!(matches!(
             fixture.contain(Some(900)),
-            Err(ContainmentError::ContainmentExpiring(id)) if id == action.action_id
+            Err(ContainmentError::ContainmentInProgress(id)) if id == action.action_id
         ));
         assert_eq!(fixture.enforcer.apply_calls(), 1);
     }

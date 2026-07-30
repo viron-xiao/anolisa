@@ -7,25 +7,25 @@ mod reconciler;
 mod worker;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentsight_enforcement_protocol::{ReplacePolicy, ReplacementPolicy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use self::enforcer::{ContainmentEnforcer, ContainmentEnforcerError};
-use self::pending::{record_attach_failed, record_direct_pending_unavailable};
+use self::pending::{now_ns, record_attach_failed, record_direct_pending_unavailable};
 use self::policy::{
-    ResolvedPolicy, acknowledgement_matches, enforce_request, existing_action, live_candidates,
-    live_lifecycle, resolve_policy, sanitize_failure, select_candidate, validate_duration,
-    validate_process_identity, validate_requested_by,
+    ResolvedPolicy, acknowledgement_matches, enforce_request, exact_binding, existing_action,
+    live_candidates, live_lifecycle, resolve_policy, resolve_transition_policy, sanitize_failure,
+    select_candidate, validate_duration, validate_process_identity, validate_requested_by,
 };
 use super::{
     ContainmentAction, ContainmentActivationResult, ContainmentClaimResult,
     ContainmentFailureStage, ContainmentLifecycle, RiskCaseDetail, RiskCaseStatus, SecurityStore,
     SecurityStoreError,
 };
-use crate::enforcement::read_process_start_time;
+use crate::enforcement::{TransitionDirection, TransitionKey, read_process_start_time};
 
 const DEFAULT_DURATION_SECS: u64 = 900;
 const MIN_DURATION_SECS: u64 = 60;
@@ -268,6 +268,7 @@ impl ContainmentCoordinator {
             action_id: Uuid::new_v4(),
             case_id,
             binding_id,
+            source_binding_id: Some(context.binding.request.binding_id),
             agent_id: context.detail.case.agent_id.clone(),
             root_pid: request.root_pid,
             process_start_time,
@@ -294,8 +295,26 @@ impl ContainmentCoordinator {
             }
         }
 
-        let stamped = match self.enforcer.apply_credential_policy(apply.clone()) {
+        let transition_key = TransitionKey {
+            action_id: action.action_id,
+            direction: TransitionDirection::Forward,
+        };
+        let stamped = match self.enforcer.begin_transition(
+            transition_key,
+            ReplacePolicy {
+                expected: context.binding.clone(),
+                replacement: ReplacementPolicy::Credential(apply.clone()),
+            },
+        ) {
             Ok(stamped) => stamped,
+            Err(ContainmentEnforcerError::MissingTransition(_)) => {
+                return record_direct_pending_unavailable(
+                    &self.store,
+                    action,
+                    now_ns(),
+                    "persisted policy transition disappeared",
+                );
+            }
             Err(ContainmentEnforcerError::Unavailable(message)) => {
                 return record_direct_pending_unavailable(&self.store, action, now_ns(), &message);
             }
@@ -306,8 +325,7 @@ impl ContainmentCoordinator {
         let (acknowledgement, readiness_stamp) = stamped.into_parts();
         if !acknowledgement_matches(&acknowledgement, &apply) {
             let message = "enforcer returned an invalid binding acknowledgement";
-            self.detach_and_fail(&mut action, ContainmentFailureStage::Attach, message)?;
-            return Err(ContainmentError::Enforcer(message.into()));
+            return record_direct_pending_unavailable(&self.store, action, now_ns(), message);
         }
 
         let claimed_at_ns = action.updated_at_ns;
@@ -467,14 +485,6 @@ impl ContainmentCoordinator {
         }
         Err(ContainmentError::ClaimLost(action.action_id))
     }
-}
-
-fn now_ns() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

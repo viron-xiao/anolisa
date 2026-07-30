@@ -1,16 +1,15 @@
 //! Bounded restart recovery and expiry handling for containment actions.
 
-use agentsight_enforcement_protocol::Binding;
-
-use crate::security::store::DueContainmentAction;
-
 use super::pending::{record_pending_unavailable, retry_delay_ns};
 use super::{
     ContainmentAction, ContainmentActivationResult, ContainmentCoordinator, ContainmentEnforcer,
     ContainmentEnforcerError, ContainmentError, ContainmentFailureStage, ContainmentLifecycle,
     RiskCaseStatus, SecurityStore, SecurityStoreError, acknowledgement_matches, enforce_request,
-    resolve_policy, sanitize_failure, validate_process_identity,
+    exact_binding, resolve_transition_policy, sanitize_failure, validate_process_identity,
 };
+use crate::enforcement::{TransitionDirection, TransitionKey};
+use crate::security::store::DueContainmentAction;
+use agentsight_enforcement_protocol::{BindingState, ReplacePolicy, ReplacementPolicy};
 
 const DUE_BATCH_LIMIT: usize = 100;
 const DETACH_MAX_RETRIES: u32 = 5;
@@ -20,8 +19,7 @@ impl ContainmentCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns the first typed store, enforcer, or recovery failure after
-    /// continuing to process the rest of the fetched batch.
+    /// Returns the first failure after processing the rest of the fetched batch.
     pub fn reconcile_once(&self, current_time_ns: u64) -> Result<(), ContainmentError> {
         reconcile_batch(&self.store, self.enforcer.as_ref(), current_time_ns)
     }
@@ -125,8 +123,17 @@ impl Reconciler<'_> {
             Err(ContainmentEnforcerError::Rejected(message)) => {
                 return self.fail_pending(action, claimed_at_ns, &message, false, current_time_ns);
             }
+            Err(ContainmentEnforcerError::MissingTransition(_)) => {
+                return self.fail_pending(
+                    action,
+                    claimed_at_ns,
+                    "enforcement binding snapshot unexpectedly reported a missing transition",
+                    false,
+                    current_time_ns,
+                );
+            }
         };
-        let (bindings, snapshot_stamp) = snapshot.into_parts();
+        let (bindings, _) = snapshot.into_parts();
         let exact = exact_binding(&bindings, action.binding_id);
         if exact.is_err() {
             return self.fail_pending(
@@ -151,6 +158,15 @@ impl Reconciler<'_> {
             action.next_retry_at_ns = None;
             return self.finish_claimed(&action, ContainmentLifecycle::Pending, claimed_at_ns);
         }
+        let Some(source_binding_id) = action.source_binding_id else {
+            return self.fail_pending(
+                action,
+                claimed_at_ns,
+                "legacy containment action lacks exact source audit binding provenance",
+                exact.is_some(),
+                current_time_ns,
+            );
+        };
         let detail = self.store.case_detail(action.case_id)?;
         if !matches!(
             detail.case.status,
@@ -164,7 +180,7 @@ impl Reconciler<'_> {
                 current_time_ns,
             );
         }
-        let Some(context) = resolve_policy(detail, bindings) else {
+        let Some(context) = resolve_transition_policy(detail, bindings, source_binding_id) else {
             return self.fail_pending(
                 action,
                 claimed_at_ns,
@@ -199,20 +215,22 @@ impl Reconciler<'_> {
             );
         };
 
-        let (acknowledgement, activation_stamp) = match exact {
-            Some(binding) if acknowledgement_matches(&binding, &request) => {
-                (binding, snapshot_stamp)
-            }
-            Some(_) => {
-                return self.fail_pending(
-                    action,
-                    claimed_at_ns,
-                    "existing containment binding does not match durable intent",
-                    true,
-                    current_time_ns,
-                );
-            }
-            None => {
+        let key = TransitionKey {
+            action_id: action.action_id,
+            direction: TransitionDirection::Forward,
+        };
+        let stamped = match self.enforcer.resume_transition(&key) {
+            Ok(stamped) => Ok(stamped),
+            Err(ContainmentEnforcerError::MissingTransition(_)) => {
+                if context.binding.state != BindingState::Enforced {
+                    return self.fail_pending(
+                        action,
+                        claimed_at_ns,
+                        "missing transition cannot be rebuilt from a detached audit binding",
+                        exact.is_some(),
+                        current_time_ns,
+                    );
+                }
                 if validate_process_identity(action.root_pid, action.process_start_time).is_err() {
                     return self.fail_pending(
                         action,
@@ -222,34 +240,45 @@ impl Reconciler<'_> {
                         current_time_ns,
                     );
                 }
-                match self.enforcer.apply_credential_policy(request.clone()) {
-                    Ok(stamped) => stamped.into_parts(),
-                    Err(ContainmentEnforcerError::Unavailable(message)) => {
-                        return self.record_pending_unavailable(
-                            &mut action,
-                            claimed_at_ns,
-                            current_time_ns,
-                            message,
-                        );
-                    }
-                    Err(ContainmentEnforcerError::Rejected(message)) => {
-                        let reason = sanitize_failure(&message);
-                        action.lifecycle_state = ContainmentLifecycle::Failed;
-                        action.failure_stage = Some(ContainmentFailureStage::Reconcile);
-                        action.failure_reason = Some(reason.clone());
-                        action.next_retry_at_ns = None;
-                        self.finish_claimed(&action, ContainmentLifecycle::Pending, claimed_at_ns)?;
-                        return Err(ContainmentError::Enforcer(reason));
-                    }
-                }
+                self.enforcer.begin_transition(
+                    key,
+                    ReplacePolicy {
+                        expected: context.binding.clone(),
+                        replacement: ReplacementPolicy::Credential(request.clone()),
+                    },
+                )
+            }
+            Err(error) => Err(error),
+        };
+        let stamped = match stamped {
+            Ok(stamped) => stamped,
+            Err(ContainmentEnforcerError::Unavailable(message)) => {
+                return self.record_pending_unavailable(
+                    &mut action,
+                    claimed_at_ns,
+                    current_time_ns,
+                    message,
+                );
+            }
+            Err(ContainmentEnforcerError::Rejected(message)) => {
+                return self.fail_pending(action, claimed_at_ns, &message, false, current_time_ns);
+            }
+            Err(ContainmentEnforcerError::MissingTransition(_)) => {
+                return self.record_pending_unavailable(
+                    &mut action,
+                    claimed_at_ns,
+                    current_time_ns,
+                    "persisted policy transition disappeared".into(),
+                );
             }
         };
+        let (acknowledgement, activation_stamp) = stamped.into_parts();
         if !acknowledgement_matches(&acknowledgement, &request) {
             return self.fail_pending(
                 action,
                 claimed_at_ns,
                 "enforcer returned an invalid recovery acknowledgement",
-                true,
+                false,
                 current_time_ns,
             );
         }
@@ -467,15 +496,4 @@ impl Reconciler<'_> {
         }
         Err(ContainmentError::ClaimLost(action.action_id))
     }
-}
-
-fn exact_binding(bindings: &[Binding], binding_id: uuid::Uuid) -> Result<Option<Binding>, ()> {
-    let mut matching = bindings
-        .iter()
-        .filter(|binding| binding.request.binding_id == binding_id);
-    let first = matching.next().cloned();
-    if matching.next().is_some() {
-        return Err(());
-    }
-    Ok(first)
 }
