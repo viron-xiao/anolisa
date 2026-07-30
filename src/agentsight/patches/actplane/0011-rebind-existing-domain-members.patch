@@ -1,0 +1,32 @@
+diff --git a/bpf/src/lib.rs b/bpf/src/lib.rs
+index b03b276..19ab693 100644
+--- a/bpf/src/lib.rs
++++ b/bpf/src/lib.rs
+@@ -679,0 +680,27 @@ impl DomainHandle {
++
++    /// Rebinds a process to an existing domain without replacing its taint state.
++    ///
++    /// This is intended for control planes that reload policy maps while keeping
++    /// the process-domain state map intact. Both the domain and the process state
++    /// must already exist, so the method cannot create an uninitialized binding.
++    pub fn rebind_pid_to_domain(&self, pid: i32, domain_id: u32) -> io::Result<()> {
++        if pid <= 0 || domain_id == 0 {
++            return Err(err("pid and domain id must both be set"));
++        }
++        let states: HashMap<_, u32, CapState> = hash_map_from_fd(&self.cap_state_fd)?;
++        if map_get_optional(&states, &domain_id, "lookup rebind domain")?.is_none() {
++            return Err(err(format!("runtime domain {domain_id} does not exist")));
++        }
++        let proc: HashMap<_, PidDomainKey, ProcState> = hash_map_from_fd(&self.ts_proc_domains_fd)?;
++        let key = PidDomainKey { pid, domain_id };
++        if map_get_optional(&proc, &key, "lookup rebind process state")?.is_none() {
++            return Err(err(format!(
++                "process {pid} has no state in runtime domain {domain_id}"
++            )));
++        }
++        let mut tasks: HashMap<_, i32, u32> = hash_map_from_fd(&self.cap_task_fd)?;
++        tasks
++            .insert(pid, domain_id, BPF_ANY)
++            .map_err(|e| err(format!("rebind cap_task: {e}")))?;
++        Ok(())
++    }

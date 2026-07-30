@@ -22,7 +22,9 @@ use ebpf_ifc_engine::capability::{
     AUTH_ADD_LABEL, AUTH_BIND_RULE, AUTH_DECLASSIFY, AUTH_DELEGATE, AUTH_NARROW_SCOPE,
     AUTH_REQUIRE_GATE, CapState, TARGET_CHILD, TARGET_SELF,
 };
-use ebpf_ifc_engine::{GLOBAL_ACTIVE_DOMAIN_ID, PinnedEngine, ReloadHandle, Violation};
+use ebpf_ifc_engine::{
+    DomainHandle, GLOBAL_ACTIVE_DOMAIN_ID, PinnedEngine, ReloadHandle, Violation,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -43,6 +45,12 @@ struct ActiveBinding {
 struct PreparedBinding {
     request: ApplyPolicy,
     compiled: Compiled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DomainMember {
+    pid: i32,
+    process_start_time: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +94,7 @@ impl RuntimeState {
 pub struct ActPlaneBackend {
     engine: Arc<PinnedEngine>,
     reload: Arc<ReloadHandle>,
+    domains: Arc<DomainHandle>,
     _runtime_lock: fs::File,
     state: Arc<RuntimeState>,
     stop: Arc<AtomicBool>,
@@ -114,6 +123,11 @@ impl ActPlaneBackend {
                 .reload_handle()
                 .map_err(|error| kernel_error("open reload handle", error))?,
         );
+        let domains = Arc::new(
+            engine
+                .domain_handle()
+                .map_err(|error| kernel_error("open domain handle", error))?,
+        );
         engine
             .protect_pid(std::process::id() as i32)
             .map_err(|error| kernel_error("protect enforcer pid", error))?;
@@ -136,6 +150,7 @@ impl ActPlaneBackend {
         Ok(Self {
             engine,
             reload,
+            domains,
             _runtime_lock: runtime_lock,
             state,
             stop,
@@ -190,6 +205,7 @@ impl ActPlaneBackend {
         &self,
         bindings: &mut HashMap<u32, ActiveBinding>,
         prepared: PreparedBinding,
+        runtime_domain: Option<u32>,
     ) -> Result<Binding, BackendError> {
         let PreparedBinding { request, compiled } = prepared;
         let label = compiled
@@ -202,7 +218,7 @@ impl ActPlaneBackend {
                     "policy must declare a COMMAND or AGENT source label".into(),
                 )
             })?;
-        let id = domain_id(request.binding_id);
+        let id = runtime_domain.unwrap_or_else(|| domain_id(request.binding_id));
         self.engine
             .seed_label_in_domain(request.root_pid, id, label)
             .map_err(|error| kernel_error("seed target process domain", error))?;
@@ -272,6 +288,38 @@ impl ActPlaneBackend {
         Ok(binding)
     }
 
+    fn capture_domain_members(&self, domain_id: u32) -> Result<Vec<DomainMember>, BackendError> {
+        let entries = fs::read_dir("/proc")
+            .map_err(|error| BackendError::KernelFailure(format!("read /proc: {error}")))?;
+        let mut members = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                BackendError::KernelFailure(format!("read /proc entry: {error}"))
+            })?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            let member_domain = self
+                .reload
+                .domain_for_pid(pid)
+                .map_err(|error| kernel_error("lookup process domain", error))?;
+            if member_domain == Some(domain_id)
+                && let Some(process_start_time) = read_process_start_time_optional(pid)?
+            {
+                members.push(DomainMember {
+                    pid,
+                    process_start_time,
+                });
+            }
+        }
+        members.sort_by_key(|member| member.pid);
+        Ok(members)
+    }
+
     fn detach_binding_locked(
         &self,
         bindings: &mut HashMap<u32, ActiveBinding>,
@@ -322,7 +370,7 @@ impl EnforcementBackend for ActPlaneBackend {
         }
 
         let prepared = self.prepare_binding(request)?;
-        self.install_prepared_locked(&mut bindings, prepared)
+        self.install_prepared_locked(&mut bindings, prepared, None)
     }
 
     fn apply_credential_policy(
@@ -403,6 +451,12 @@ impl EnforcementBackend for ActPlaneBackend {
             }
         };
         let source_present = actual.is_some();
+        let runtime_domain = replacement_runtime_domain(&request.expected);
+        let domain_members = if source_present {
+            self.capture_domain_members(runtime_domain)?
+        } else {
+            Vec::new()
+        };
         let mut source_prepared = Some(source_prepared);
         let mut target_prepared = Some(target_prepared);
         let outcome = replace_prepared_runtime(&request.expected, |step| match step {
@@ -416,15 +470,40 @@ impl EnforcementBackend for ActPlaneBackend {
                 let prepared = target_prepared.take().ok_or_else(|| {
                     BackendError::KernelFailure("prepared target policy is unavailable".into())
                 })?;
-                self.install_prepared_locked(&mut bindings, prepared)
-                    .map(Some)
+                let binding =
+                    self.install_prepared_locked(&mut bindings, prepared, Some(runtime_domain))?;
+                let rebind = rebind_live_domain_members(
+                    &domain_members,
+                    read_process_start_time_optional,
+                    |pid| {
+                        self.domains
+                            .rebind_pid_to_domain(pid, runtime_domain)
+                            .map_err(|error| kernel_error("rebind process domain", error))
+                    },
+                );
+                if let Err(error) = rebind {
+                    let cleanup = self.cleanup_binding(&binding.request, runtime_domain);
+                    bindings.remove(&runtime_domain);
+                    return Err(backend_error_with_cleanup(error, cleanup));
+                }
+                Ok(Some(binding))
             }
             RuntimeReplaceStep::RestoreSource => {
                 let prepared = source_prepared.take().ok_or_else(|| {
                     BackendError::KernelFailure("prepared source policy is unavailable".into())
                 })?;
-                self.install_prepared_locked(&mut bindings, prepared)
-                    .map(Some)
+                let binding =
+                    self.install_prepared_locked(&mut bindings, prepared, Some(runtime_domain))?;
+                rebind_live_domain_members(
+                    &domain_members,
+                    read_process_start_time_optional,
+                    |pid| {
+                        self.domains
+                            .rebind_pid_to_domain(pid, runtime_domain)
+                            .map_err(|error| kernel_error("rebind process domain", error))
+                    },
+                )?;
+                Ok(Some(binding))
             }
         });
         match outcome {
@@ -545,6 +624,25 @@ fn domain_id(binding_id: Uuid) -> u32 {
     }
 }
 
+fn replacement_runtime_domain(source: &Binding) -> u32 {
+    source
+        .domain_id
+        .unwrap_or_else(|| domain_id(source.request.binding_id))
+}
+
+fn rebind_live_domain_members(
+    members: &[DomainMember],
+    mut current_start_time: impl FnMut(i32) -> Result<Option<u64>, BackendError>,
+    mut rebind: impl FnMut(i32) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    for member in members {
+        if current_start_time(member.pid)? == Some(member.process_start_time) {
+            rebind(member.pid)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 enum ProcessStatError {
     #[error("process stat is missing the command terminator")]
@@ -571,6 +669,21 @@ fn read_process_start_time(pid: i32) -> Result<u64, BackendError> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|error| BackendError::KernelFailure(format!("read /proc/{pid}/stat: {error}")))?;
     parse_process_start_time(&stat)
+        .map_err(|error| BackendError::KernelFailure(format!("parse /proc/{pid}/stat: {error}")))
+}
+
+fn read_process_start_time_optional(pid: i32) -> Result<Option<u64>, BackendError> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BackendError::KernelFailure(format!(
+                "read /proc/{pid}/stat: {error}"
+            )));
+        }
+    };
+    parse_process_start_time(&stat)
+        .map(Some)
         .map_err(|error| BackendError::KernelFailure(format!("parse /proc/{pid}/stat: {error}")))
 }
 
@@ -1050,6 +1163,13 @@ fn kernel_error_with_cleanup(
     BackendError::KernelFailure(message)
 }
 
+fn backend_error_with_cleanup(error: BackendError, cleanup: Vec<String>) -> BackendError {
+    if cleanup.is_empty() {
+        return error;
+    }
+    BackendError::KernelFailure(format!("{error}; cleanup failed: {}", cleanup.join("; ")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -1171,6 +1291,40 @@ mod tests {
                 code: ReplaceFailureCode::KernelFailure,
             }
         );
+    }
+
+    #[test]
+    fn replacement_keeps_the_source_runtime_domain() {
+        let source = active_binding().binding;
+
+        assert_eq!(replacement_runtime_domain(&source), 7);
+    }
+
+    #[test]
+    fn replacement_rebinds_only_live_original_domain_members() {
+        let members = [
+            DomainMember {
+                pid: 42,
+                process_start_time: 101,
+            },
+            DomainMember {
+                pid: 43,
+                process_start_time: 102,
+            },
+        ];
+        let mut rebound = Vec::new();
+
+        rebind_live_domain_members(
+            &members,
+            |pid| Ok(Some(if pid == 42 { 101 } else { 999 })),
+            |pid| {
+                rebound.push(pid);
+                Ok(())
+            },
+        )
+        .expect("live members should rebind");
+
+        assert_eq!(rebound, [42]);
     }
 
     #[test]
