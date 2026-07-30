@@ -10,8 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use agentsight_enforcement_protocol::{
-    ApplyPolicy, BindingState, Command, Effect, Request, Response, ResponseBody, ViolationEvent,
-    read_frame, write_frame,
+    ApplyPolicy, BindingState, Command, Effect, ReplaceOutcome, ReplacePolicy, ReplacementPolicy,
+    Request, Response, ResponseBody, ViolationEvent, read_frame, write_frame,
 };
 use agentsight_enforcer::{BackendError, EnforcementBackend, EnforcerService, MockBackend};
 use uuid::Uuid;
@@ -214,5 +214,30 @@ fn security_subscription_is_acknowledged_when_backend_support_exists() {
 
     let response = fixture.call(Command::SubscribeSecurityEvents);
 
-    assert!(matches!(response.result, Ok(ResponseBody::Subscribed)));
+    assert!(
+        matches!(response.result, Ok(ResponseBody::Subscribed)),
+        "unexpected subscribe response: {:?}",
+        response.result
+    );
+}
+
+#[test]
+fn uds_service_replaces_the_expected_binding_with_a_correlated_response() {
+    let fixture = ServiceFixture::start();
+    let source_request = fixture_apply_policy();
+    let applied = fixture.call(Command::ApplyPolicy(source_request));
+    let Ok(ResponseBody::Applied(source)) = applied.result else {
+        panic!("source must apply: {:?}", applied.result);
+    };
+    let target = fixture_apply_policy();
+
+    let response = fixture.call(Command::ReplacePolicy(ReplacePolicy {
+        expected: source,
+        replacement: ReplacementPolicy::Generic(target.clone()),
+    }));
+
+    let Ok(ResponseBody::Replaced(ReplaceOutcome::Applied(binding))) = response.result else {
+        panic!("replace must return the target acknowledgement");
+    };
+    assert_eq!(binding.request, target);
 }

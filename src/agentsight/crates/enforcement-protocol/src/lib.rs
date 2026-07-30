@@ -13,7 +13,7 @@ pub use replacement::*;
 pub use security::*;
 
 /// Wire protocol version implemented by this crate.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum JSON payload size accepted for one NDJSON frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -40,7 +40,7 @@ impl Request {
     }
 }
 
-/// Operations supported by protocol version 1.
+/// Operations supported by protocol version 2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "params", rename_all = "snake_case")]
 pub enum Command {
@@ -50,6 +50,8 @@ pub enum Command {
     ApplyPolicy(ApplyPolicy),
     /// Compiles a product-level credential policy inside the privileged adapter.
     ApplyCredentialPolicy(ApplyCredentialPolicy),
+    /// Replaces one exact active binding without exposing an interleaving window.
+    ReplacePolicy(ReplacePolicy),
     /// Detaches a binding by its stable identifier.
     DetachAgent {
         /// Binding to detach.
@@ -209,7 +211,7 @@ pub struct Response {
     pub result: Result<ResponseBody, RemoteError>,
 }
 
-/// Successful response payloads supported by protocol version 1.
+/// Successful response payloads supported by protocol version 2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "response", content = "data", rename_all = "snake_case")]
 pub enum ResponseBody {
@@ -217,6 +219,8 @@ pub enum ResponseBody {
     Health(HealthStatus),
     /// Binding returned after apply.
     Applied(Binding),
+    /// Typed result of an atomic policy-ownership handoff.
+    Replaced(ReplaceOutcome),
     /// Successful detach acknowledgement.
     Detached,
     /// Current backend bindings.
@@ -405,6 +409,25 @@ mod tests {
             .expect("fixture should decode")
             .expect("frame should exist");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn protocol_v1_request_is_rejected_after_replacement_upgrade() {
+        let mut request = Request::new(Command::Health);
+        request.protocol_version = 1;
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).expect("fixture should encode");
+
+        let error = read_frame::<_, Request>(&mut BufReader::new(Cursor::new(bytes)))
+            .expect_err("protocol v1 must be rejected");
+
+        assert!(matches!(
+            error,
+            ProtocolError::UnsupportedVersion {
+                expected: PROTOCOL_VERSION,
+                actual: 1,
+            }
+        ));
     }
 
     #[test]

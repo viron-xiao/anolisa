@@ -8,7 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentsight_enforcement_protocol::{
     ApplyCredentialPolicy, ApplyPolicy, Binding, BindingState, DestinationClass, Effect,
     EventIdentity, FileAction, HealthStatus, NetworkAction, NetworkDirection, PolicyDecision,
-    PolicyMode, SecurityEvent, SecurityEventKind, TaintTransition, TaintTransitionKind,
+    PolicyMode, ReplaceFailureCode, ReplaceOutcome, ReplacePolicy, ReplaceValidationError,
+    ReplacementPolicy, SecurityEvent, SecurityEventKind, TaintTransition, TaintTransitionKind,
     ViolationEvent,
 };
 use uuid::Uuid;
@@ -210,36 +211,53 @@ impl EnforcementBackend for MockBackend {
         &self,
         request: ApplyCredentialPolicy,
     ) -> Result<Binding, BackendError> {
-        request
-            .policy
-            .validate()
-            .map_err(|error| BackendError::CompileFailure(error.to_string()))?;
-        let action = if request.policy.mode == PolicyMode::Enforce {
-            "block"
-        } else {
-            "notify"
-        };
-        let mut policy_dsl = String::from("source AGENT = exec \"**\"\n");
-        for source in &request.policy.source_patterns {
-            policy_dsl.push_str(&format!(
-                "source {} = file \"{}\"\n",
-                request.policy.taint_label, source
-            ));
+        self.apply(mock_credential_apply(request)?)
+    }
+
+    fn replace(&self, request: ReplacePolicy) -> Result<ReplaceOutcome, BackendError> {
+        let mut bindings = self.bindings();
+        let actual = bindings.values().next().cloned();
+        if let Err(error) = request.validate() {
+            let exact_source = actual.as_ref() == Some(&request.expected);
+            return Ok(match error {
+                ReplaceValidationError::CredentialPolicy(_) if exact_source => {
+                    ReplaceOutcome::SourceRetained {
+                        binding: request.expected,
+                        code: ReplaceFailureCode::CompileFailure,
+                    }
+                }
+                ReplaceValidationError::CredentialPolicy(_)
+                | ReplaceValidationError::SameBindingId
+                | ReplaceValidationError::SourceNotEnforced => ReplaceOutcome::Conflict {
+                    code: ReplaceFailureCode::BindingConflict,
+                },
+            });
         }
-        policy_dsl.push_str(&format!(
-            "rule agentsight-credential-exfiltration:\n  {action} connect endpoint \"*\" if {}\n",
-            request.policy.taint_label,
-        ));
-        self.apply(ApplyPolicy {
-            binding_id: request.binding_id,
-            agent_id: request.agent_id,
-            session_id: request.session_id,
-            root_pid: request.root_pid,
-            process_start_time: request.process_start_time,
-            policy_id: request.policy.policy_id,
-            policy_revision: request.policy.revision.to_string(),
-            policy_dsl,
-        })
+        let target_request = match request.replacement {
+            ReplacementPolicy::Generic(target) => target,
+            ReplacementPolicy::Credential(target) => mock_credential_apply(target)?,
+        };
+        let target = Binding {
+            request: target_request,
+            state: BindingState::Enforced,
+            message: Some("mock acknowledgement; no kernel policy attached".into()),
+            domain_id: Some(1),
+        };
+        match actual {
+            Some(actual) if actual == target => Ok(ReplaceOutcome::Applied(actual)),
+            Some(actual) if actual == request.expected => {
+                bindings.clear();
+                bindings.insert(target.request.binding_id, target.clone());
+                Ok(ReplaceOutcome::Applied(target))
+            }
+            None => {
+                bindings.insert(target.request.binding_id, target.clone());
+                Ok(ReplaceOutcome::Applied(target))
+            }
+            Some(_) => Ok(ReplaceOutcome::Conflict {
+                code: ReplaceFailureCode::BindingConflict,
+            }),
+        }
     }
 
     fn detach(&self, binding_id: Uuid) -> Result<(), BackendError> {
@@ -263,6 +281,39 @@ impl EnforcementBackend for MockBackend {
     fn subscribe_security_events(&self) -> Receiver<SecurityEvent> {
         self.security_events.subscribe()
     }
+}
+
+fn mock_credential_apply(request: ApplyCredentialPolicy) -> Result<ApplyPolicy, BackendError> {
+    request
+        .policy
+        .validate()
+        .map_err(|error| BackendError::CompileFailure(error.to_string()))?;
+    let action = if request.policy.mode == PolicyMode::Enforce {
+        "block"
+    } else {
+        "notify"
+    };
+    let mut policy_dsl = String::from("source AGENT = exec \"**\"\n");
+    for source in &request.policy.source_patterns {
+        policy_dsl.push_str(&format!(
+            "source {} = file \"{}\"\n",
+            request.policy.taint_label, source
+        ));
+    }
+    policy_dsl.push_str(&format!(
+        "rule agentsight-credential-exfiltration:\n  {action} connect endpoint \"*\" if {}\n",
+        request.policy.taint_label,
+    ));
+    Ok(ApplyPolicy {
+        binding_id: request.binding_id,
+        agent_id: request.agent_id,
+        session_id: request.session_id,
+        root_pid: request.root_pid,
+        process_start_time: request.process_start_time,
+        policy_id: request.policy.policy_id,
+        policy_revision: request.policy.revision.to_string(),
+        policy_dsl,
+    })
 }
 
 fn event_identity(binding: &Binding) -> EventIdentity {
@@ -316,7 +367,9 @@ fn unix_epoch_ns() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use agentsight_enforcement_protocol::Effect;
+    use agentsight_enforcement_protocol::{
+        Effect, ReplaceFailureCode, ReplaceOutcome, ReplacePolicy, ReplacementPolicy,
+    };
 
     use super::*;
 
@@ -355,6 +408,81 @@ mod tests {
             observed_at_ns: 101,
             actplane_revision: "mock".into(),
         }
+    }
+
+    fn replacement(expected: Binding, target: ApplyPolicy) -> ReplacePolicy {
+        ReplacePolicy {
+            expected,
+            replacement: ReplacementPolicy::Generic(target),
+        }
+    }
+
+    #[test]
+    fn replace_moves_runtime_ownership_from_expected_source_to_target() {
+        let backend = MockBackend::new();
+        let source = backend.apply(request()).expect("source should apply");
+        let target = request();
+
+        let outcome = backend
+            .replace(replacement(source.clone(), target.clone()))
+            .expect("replace should complete");
+
+        let ReplaceOutcome::Applied(applied) = outcome else {
+            panic!("target should own the runtime");
+        };
+        assert_eq!(applied.request, target);
+        assert_eq!(
+            EnforcementBackend::bindings(&backend).expect("bindings"),
+            vec![applied]
+        );
+        assert_ne!(source.request.binding_id, target.binding_id);
+    }
+
+    #[test]
+    fn replace_is_idempotent_when_target_already_owns_the_runtime() {
+        let backend = MockBackend::new();
+        let source_request = request();
+        let source = Binding {
+            request: source_request,
+            state: BindingState::Enforced,
+            message: Some("source snapshot".into()),
+            domain_id: Some(7),
+        };
+        let target = request();
+        let target_binding = backend.apply(target.clone()).expect("target should apply");
+
+        let outcome = backend
+            .replace(replacement(source, target))
+            .expect("repeat replace should complete");
+
+        assert_eq!(outcome, ReplaceOutcome::Applied(target_binding));
+    }
+
+    #[test]
+    fn replace_never_detaches_a_third_party_binding() {
+        let backend = MockBackend::new();
+        let third_party = backend.apply(request()).expect("third party should apply");
+        let expected = Binding {
+            request: request(),
+            state: BindingState::Enforced,
+            message: None,
+            domain_id: None,
+        };
+
+        let outcome = backend
+            .replace(replacement(expected, request()))
+            .expect("conflict should be an outcome");
+
+        assert_eq!(
+            outcome,
+            ReplaceOutcome::Conflict {
+                code: ReplaceFailureCode::BindingConflict,
+            }
+        );
+        assert_eq!(
+            EnforcementBackend::bindings(&backend).expect("bindings"),
+            vec![third_party]
+        );
     }
 
     #[test]
