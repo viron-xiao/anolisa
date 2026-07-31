@@ -10,18 +10,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use actplane_ifc_compiler::compile_str;
+use actplane_ifc_compiler::{Compiled, compile_str};
 use agentsight_enforcement_protocol::{
     ApplyCredentialPolicy, ApplyPolicy, Binding, BindingState, CredentialExfiltrationPolicy,
     DestinationClass, Effect, EventIdentity, FileAction, HealthStatus, NetworkAction,
-    NetworkDirection, PROTOCOL_VERSION, PolicyDecision, PolicyMode, SecurityEvent,
+    NetworkDirection, PROTOCOL_VERSION, PolicyDecision, PolicyMode, ReplaceFailureCode,
+    ReplaceOutcome, ReplacePolicy, ReplaceValidationError, ReplacementPolicy, SecurityEvent,
     SecurityEventKind, TaintTransition, TaintTransitionKind, ViolationEvent,
 };
 use ebpf_ifc_engine::capability::{
     AUTH_ADD_LABEL, AUTH_BIND_RULE, AUTH_DECLASSIFY, AUTH_DELEGATE, AUTH_NARROW_SCOPE,
     AUTH_REQUIRE_GATE, CapState, TARGET_CHILD, TARGET_SELF,
 };
-use ebpf_ifc_engine::{GLOBAL_ACTIVE_DOMAIN_ID, PinnedEngine, ReloadHandle, Violation};
+use ebpf_ifc_engine::{
+    DomainHandle, GLOBAL_ACTIVE_DOMAIN_ID, PinnedEngine, ReloadHandle, Violation,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -37,6 +40,24 @@ struct ActiveBinding {
     reasons: Vec<String>,
     rule_names: Vec<String>,
     label_names: HashMap<u64, String>,
+}
+
+struct PreparedBinding {
+    request: ApplyPolicy,
+    compiled: Compiled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DomainMember {
+    pid: i32,
+    process_start_time: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeReplaceStep {
+    DetachSource,
+    InstallTarget,
+    RestoreSource,
 }
 
 struct RuntimeState {
@@ -73,6 +94,7 @@ impl RuntimeState {
 pub struct ActPlaneBackend {
     engine: Arc<PinnedEngine>,
     reload: Arc<ReloadHandle>,
+    domains: Arc<DomainHandle>,
     _runtime_lock: fs::File,
     state: Arc<RuntimeState>,
     stop: Arc<AtomicBool>,
@@ -101,6 +123,11 @@ impl ActPlaneBackend {
                 .reload_handle()
                 .map_err(|error| kernel_error("open reload handle", error))?,
         );
+        let domains = Arc::new(
+            engine
+                .domain_handle()
+                .map_err(|error| kernel_error("open domain handle", error))?,
+        );
         engine
             .protect_pid(std::process::id() as i32)
             .map_err(|error| kernel_error("protect enforcer pid", error))?;
@@ -123,6 +150,7 @@ impl ActPlaneBackend {
         Ok(Self {
             engine,
             reload,
+            domains,
             _runtime_lock: runtime_lock,
             state,
             stop,
@@ -151,36 +179,8 @@ impl ActPlaneBackend {
         }
         errors
     }
-}
 
-impl EnforcementBackend for ActPlaneBackend {
-    fn health(&self) -> Result<HealthStatus, BackendError> {
-        let runtime_error = self.state.runtime_error().clone();
-        let health = self.state.events.reflect_delivery_loss(HealthStatus {
-            ready: runtime_error.is_none(),
-            backend: "actplane".into(),
-            message: runtime_error,
-        });
-        Ok(self.state.security_events.reflect_delivery_loss(health))
-    }
-
-    fn apply(&self, request: ApplyPolicy) -> Result<Binding, BackendError> {
-        let _lifecycle = self.lifecycle();
-        let mut bindings = self.state.bindings();
-        if let Some(existing) = bindings
-            .values()
-            .find(|active| active.binding.request.binding_id == request.binding_id)
-        {
-            return if existing.binding.request == request {
-                Ok(existing.binding.clone())
-            } else {
-                Err(BackendError::BindingConflict(request.binding_id))
-            };
-        }
-        if !bindings.is_empty() {
-            return Err(BackendError::BindingConflict(request.binding_id));
-        }
-
+    fn prepare_binding(&self, request: ApplyPolicy) -> Result<PreparedBinding, BackendError> {
         let actual_start = read_process_start_time(request.root_pid)?;
         if actual_start != request.process_start_time {
             return Err(BackendError::StaleProcess {
@@ -188,6 +188,26 @@ impl EnforcementBackend for ActPlaneBackend {
             });
         }
         let compiled = compile_str(&request.policy_dsl).map_err(BackendError::CompileFailure)?;
+        if compiled
+            .labels
+            .get("COMMAND")
+            .or_else(|| compiled.labels.get("AGENT"))
+            .is_none()
+        {
+            return Err(BackendError::CompileFailure(
+                "policy must declare a COMMAND or AGENT source label".into(),
+            ));
+        }
+        Ok(PreparedBinding { request, compiled })
+    }
+
+    fn install_prepared_locked(
+        &self,
+        bindings: &mut HashMap<u32, ActiveBinding>,
+        prepared: PreparedBinding,
+        runtime_domain: Option<u32>,
+    ) -> Result<Binding, BackendError> {
+        let PreparedBinding { request, compiled } = prepared;
         let label = compiled
             .labels
             .get("COMMAND")
@@ -198,7 +218,7 @@ impl EnforcementBackend for ActPlaneBackend {
                     "policy must declare a COMMAND or AGENT source label".into(),
                 )
             })?;
-        let id = domain_id(request.binding_id);
+        let id = runtime_domain.unwrap_or_else(|| domain_id(request.binding_id));
         self.engine
             .seed_label_in_domain(request.root_pid, id, label)
             .map_err(|error| kernel_error("seed target process domain", error))?;
@@ -268,26 +288,43 @@ impl EnforcementBackend for ActPlaneBackend {
         Ok(binding)
     }
 
-    fn apply_credential_policy(
-        &self,
-        request: ApplyCredentialPolicy,
-    ) -> Result<Binding, BackendError> {
-        let policy_dsl = compile_credential_exfiltration_policy(&request.policy)?;
-        self.apply(ApplyPolicy {
-            binding_id: request.binding_id,
-            agent_id: request.agent_id,
-            session_id: request.session_id,
-            root_pid: request.root_pid,
-            process_start_time: request.process_start_time,
-            policy_id: request.policy.policy_id,
-            policy_revision: request.policy.revision.to_string(),
-            policy_dsl,
-        })
+    fn capture_domain_members(&self, domain_id: u32) -> Result<Vec<DomainMember>, BackendError> {
+        let entries = fs::read_dir("/proc")
+            .map_err(|error| BackendError::KernelFailure(format!("read /proc: {error}")))?;
+        let mut members = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                BackendError::KernelFailure(format!("read /proc entry: {error}"))
+            })?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            let member_domain = self
+                .reload
+                .domain_for_pid(pid)
+                .map_err(|error| kernel_error("lookup process domain", error))?;
+            if member_domain == Some(domain_id)
+                && let Some(process_start_time) = read_process_start_time_optional(pid)?
+            {
+                members.push(DomainMember {
+                    pid,
+                    process_start_time,
+                });
+            }
+        }
+        members.sort_by_key(|member| member.pid);
+        Ok(members)
     }
 
-    fn detach(&self, binding_id: Uuid) -> Result<(), BackendError> {
-        let _lifecycle = self.lifecycle();
-        let mut bindings = self.state.bindings();
+    fn detach_binding_locked(
+        &self,
+        bindings: &mut HashMap<u32, ActiveBinding>,
+        binding_id: Uuid,
+    ) -> Result<(), BackendError> {
         let Some((id, active)) = bindings
             .iter()
             .find(|(_, active)| active.binding.request.binding_id == binding_id)
@@ -301,6 +338,191 @@ impl EnforcementBackend for ActPlaneBackend {
         }
         bindings.remove(&id);
         Ok(())
+    }
+}
+
+impl EnforcementBackend for ActPlaneBackend {
+    fn health(&self) -> Result<HealthStatus, BackendError> {
+        let runtime_error = self.state.runtime_error().clone();
+        let health = self.state.events.reflect_delivery_loss(HealthStatus {
+            ready: runtime_error.is_none(),
+            backend: "actplane".into(),
+            message: runtime_error,
+        });
+        Ok(self.state.security_events.reflect_delivery_loss(health))
+    }
+
+    fn apply(&self, request: ApplyPolicy) -> Result<Binding, BackendError> {
+        let _lifecycle = self.lifecycle();
+        let mut bindings = self.state.bindings();
+        if let Some(existing) = bindings
+            .values()
+            .find(|active| active.binding.request.binding_id == request.binding_id)
+        {
+            return if existing.binding.request == request {
+                Ok(existing.binding.clone())
+            } else {
+                Err(BackendError::BindingConflict(request.binding_id))
+            };
+        }
+        if !bindings.is_empty() {
+            return Err(BackendError::BindingConflict(request.binding_id));
+        }
+
+        let prepared = self.prepare_binding(request)?;
+        self.install_prepared_locked(&mut bindings, prepared, None)
+    }
+
+    fn apply_credential_policy(
+        &self,
+        request: ApplyCredentialPolicy,
+    ) -> Result<Binding, BackendError> {
+        self.apply(credential_apply_request(request)?)
+    }
+
+    fn replace(&self, request: ReplacePolicy) -> Result<ReplaceOutcome, BackendError> {
+        let _lifecycle = self.lifecycle();
+        let mut bindings = self.state.bindings();
+        let actual = bindings.values().next().cloned();
+
+        if let Err(error) = request.validate() {
+            let exact_source = actual
+                .as_ref()
+                .is_some_and(|active| active.binding == request.expected);
+            return Ok(match error {
+                ReplaceValidationError::CredentialPolicy(_) if exact_source => {
+                    ReplaceOutcome::SourceRetained {
+                        binding: request.expected,
+                        code: ReplaceFailureCode::CompileFailure,
+                    }
+                }
+                ReplaceValidationError::CredentialPolicy(_)
+                | ReplaceValidationError::SameBindingId
+                | ReplaceValidationError::SourceNotEnforced => ReplaceOutcome::Conflict {
+                    code: ReplaceFailureCode::BindingConflict,
+                },
+            });
+        }
+
+        let target_request = match request.replacement {
+            ReplacementPolicy::Generic(target) => target,
+            ReplacementPolicy::Credential(target) => match credential_apply_request(target) {
+                Ok(target) => target,
+                Err(error) => {
+                    return Ok(preparation_failure(
+                        actual.as_ref(),
+                        &request.expected,
+                        &error,
+                    ));
+                }
+            },
+        };
+        if let Some(active) = actual.as_ref()
+            && active.binding.request == target_request
+        {
+            return Ok(ReplaceOutcome::Applied(active.binding.clone()));
+        }
+        if let Some(active) = actual.as_ref()
+            && active.binding != request.expected
+        {
+            return Ok(ReplaceOutcome::Conflict {
+                code: ReplaceFailureCode::BindingConflict,
+            });
+        }
+
+        let source_prepared = match self.prepare_binding(request.expected.request.clone()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(preparation_failure(
+                    actual.as_ref(),
+                    &request.expected,
+                    &error,
+                ));
+            }
+        };
+        let target_prepared = match self.prepare_binding(target_request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(preparation_failure(
+                    actual.as_ref(),
+                    &request.expected,
+                    &error,
+                ));
+            }
+        };
+        let source_present = actual.is_some();
+        let runtime_domain = replacement_runtime_domain(&request.expected);
+        let domain_members = if source_present {
+            self.capture_domain_members(runtime_domain)?
+        } else {
+            Vec::new()
+        };
+        let mut source_prepared = Some(source_prepared);
+        let mut target_prepared = Some(target_prepared);
+        let outcome = replace_prepared_runtime(&request.expected, |step| match step {
+            RuntimeReplaceStep::DetachSource => {
+                if source_present {
+                    self.detach_binding_locked(&mut bindings, request.expected.request.binding_id)?;
+                }
+                Ok(None)
+            }
+            RuntimeReplaceStep::InstallTarget => {
+                let prepared = target_prepared.take().ok_or_else(|| {
+                    BackendError::KernelFailure("prepared target policy is unavailable".into())
+                })?;
+                let binding =
+                    self.install_prepared_locked(&mut bindings, prepared, Some(runtime_domain))?;
+                let rebind = rebind_live_domain_members(
+                    &domain_members,
+                    read_process_start_time_optional,
+                    |pid| {
+                        self.domains
+                            .rebind_pid_to_domain(pid, runtime_domain)
+                            .map_err(|error| kernel_error("rebind process domain", error))
+                    },
+                );
+                if let Err(error) = rebind {
+                    let cleanup = self.cleanup_binding(&binding.request, runtime_domain);
+                    bindings.remove(&runtime_domain);
+                    return Err(backend_error_with_cleanup(error, cleanup));
+                }
+                Ok(Some(binding))
+            }
+            RuntimeReplaceStep::RestoreSource => {
+                let prepared = source_prepared.take().ok_or_else(|| {
+                    BackendError::KernelFailure("prepared source policy is unavailable".into())
+                })?;
+                let binding =
+                    self.install_prepared_locked(&mut bindings, prepared, Some(runtime_domain))?;
+                rebind_live_domain_members(
+                    &domain_members,
+                    read_process_start_time_optional,
+                    |pid| {
+                        self.domains
+                            .rebind_pid_to_domain(pid, runtime_domain)
+                            .map_err(|error| kernel_error("rebind process domain", error))
+                    },
+                )?;
+                Ok(Some(binding))
+            }
+        });
+        match outcome {
+            ReplaceOutcome::Applied(_) | ReplaceOutcome::SourceRestored { .. } => {
+                *self.state.runtime_error() = None;
+            }
+            ReplaceOutcome::Indeterminate { .. } => {
+                *self.state.runtime_error() =
+                    Some("policy replacement runtime state is indeterminate".into());
+            }
+            ReplaceOutcome::SourceRetained { .. } | ReplaceOutcome::Conflict { .. } => {}
+        }
+        Ok(outcome)
+    }
+
+    fn detach(&self, binding_id: Uuid) -> Result<(), BackendError> {
+        let _lifecycle = self.lifecycle();
+        let mut bindings = self.state.bindings();
+        self.detach_binding_locked(&mut bindings, binding_id)
     }
 
     fn bindings(&self) -> Result<Vec<Binding>, BackendError> {
@@ -402,6 +624,25 @@ fn domain_id(binding_id: Uuid) -> u32 {
     }
 }
 
+fn replacement_runtime_domain(source: &Binding) -> u32 {
+    source
+        .domain_id
+        .unwrap_or_else(|| domain_id(source.request.binding_id))
+}
+
+fn rebind_live_domain_members(
+    members: &[DomainMember],
+    mut current_start_time: impl FnMut(i32) -> Result<Option<u64>, BackendError>,
+    mut rebind: impl FnMut(i32) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    for member in members {
+        if current_start_time(member.pid)? == Some(member.process_start_time) {
+            rebind(member.pid)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 enum ProcessStatError {
     #[error("process stat is missing the command terminator")]
@@ -429,6 +670,91 @@ fn read_process_start_time(pid: i32) -> Result<u64, BackendError> {
         .map_err(|error| BackendError::KernelFailure(format!("read /proc/{pid}/stat: {error}")))?;
     parse_process_start_time(&stat)
         .map_err(|error| BackendError::KernelFailure(format!("parse /proc/{pid}/stat: {error}")))
+}
+
+fn read_process_start_time_optional(pid: i32) -> Result<Option<u64>, BackendError> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BackendError::KernelFailure(format!(
+                "read /proc/{pid}/stat: {error}"
+            )));
+        }
+    };
+    parse_process_start_time(&stat)
+        .map(Some)
+        .map_err(|error| BackendError::KernelFailure(format!("parse /proc/{pid}/stat: {error}")))
+}
+
+fn credential_apply_request(request: ApplyCredentialPolicy) -> Result<ApplyPolicy, BackendError> {
+    let policy_dsl = compile_credential_exfiltration_policy(&request.policy)?;
+    Ok(ApplyPolicy {
+        binding_id: request.binding_id,
+        agent_id: request.agent_id,
+        session_id: request.session_id,
+        root_pid: request.root_pid,
+        process_start_time: request.process_start_time,
+        policy_id: request.policy.policy_id,
+        policy_revision: request.policy.revision.to_string(),
+        policy_dsl,
+    })
+}
+
+fn replacement_failure_code(error: &BackendError) -> ReplaceFailureCode {
+    match error {
+        BackendError::BindingConflict(_) | BackendError::MissingBinding(_) => {
+            ReplaceFailureCode::BindingConflict
+        }
+        BackendError::StaleProcess { .. } => ReplaceFailureCode::StaleProcess,
+        BackendError::CompileFailure(_) => ReplaceFailureCode::CompileFailure,
+        BackendError::KernelFailure(_) => ReplaceFailureCode::KernelFailure,
+    }
+}
+
+fn preparation_failure(
+    actual: Option<&ActiveBinding>,
+    expected: &Binding,
+    error: &BackendError,
+) -> ReplaceOutcome {
+    let code = replacement_failure_code(error);
+    if actual.is_some_and(|active| active.binding == *expected) {
+        ReplaceOutcome::SourceRetained {
+            binding: expected.clone(),
+            code,
+        }
+    } else {
+        ReplaceOutcome::Indeterminate { code }
+    }
+}
+
+fn replace_prepared_runtime(
+    source: &Binding,
+    mut operation: impl FnMut(RuntimeReplaceStep) -> Result<Option<Binding>, BackendError>,
+) -> ReplaceOutcome {
+    if let Err(error) = operation(RuntimeReplaceStep::DetachSource) {
+        return ReplaceOutcome::Indeterminate {
+            code: replacement_failure_code(&error),
+        };
+    }
+    match operation(RuntimeReplaceStep::InstallTarget) {
+        Ok(Some(target)) => ReplaceOutcome::Applied(target),
+        Ok(None) => ReplaceOutcome::Indeterminate {
+            code: ReplaceFailureCode::KernelFailure,
+        },
+        Err(target_error) => {
+            let code = replacement_failure_code(&target_error);
+            match operation(RuntimeReplaceStep::RestoreSource) {
+                Ok(Some(restored)) if restored.request == source.request => {
+                    ReplaceOutcome::SourceRestored {
+                        binding: restored,
+                        code,
+                    }
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => ReplaceOutcome::Indeterminate { code },
+            }
+        }
+    }
 }
 
 /// Translates the stable credential-exfiltration model into pinned ActPlane DSL.
@@ -837,13 +1163,20 @@ fn kernel_error_with_cleanup(
     BackendError::KernelFailure(message)
 }
 
+fn backend_error_with_cleanup(error: BackendError, cleanup: Vec<String>) -> BackendError {
+    if cleanup.is_empty() {
+        return error;
+    }
+    BackendError::KernelFailure(format!("{error}; cleanup failed: {}", cleanup.join("; ")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
 
     use agentsight_enforcement_protocol::{
         ApplyPolicy, Binding, BindingState, CredentialExfiltrationPolicy, Effect, PolicyMode,
-        SecurityEventKind, ViolationEvent,
+        ReplaceFailureCode, ReplaceOutcome, SecurityEventKind, ViolationEvent,
     };
     use ebpf_ifc_engine::{Provenance, Violation};
     use uuid::Uuid;
@@ -906,6 +1239,92 @@ mod tests {
             taint_ttl_secs: 900,
             mode: PolicyMode::Enforce,
         }
+    }
+
+    #[test]
+    fn replace_runtime_restores_source_when_target_install_fails() {
+        let source = active_binding().binding;
+        let mut steps = Vec::new();
+
+        let outcome = replace_prepared_runtime(&source, |step| {
+            steps.push(step);
+            match step {
+                RuntimeReplaceStep::DetachSource => Ok(None),
+                RuntimeReplaceStep::InstallTarget => {
+                    Err(BackendError::KernelFailure("target failed".into()))
+                }
+                RuntimeReplaceStep::RestoreSource => Ok(Some(source.clone())),
+            }
+        });
+
+        assert_eq!(
+            outcome,
+            ReplaceOutcome::SourceRestored {
+                binding: source,
+                code: ReplaceFailureCode::KernelFailure,
+            }
+        );
+        assert_eq!(
+            steps,
+            [
+                RuntimeReplaceStep::DetachSource,
+                RuntimeReplaceStep::InstallTarget,
+                RuntimeReplaceStep::RestoreSource,
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_runtime_is_indeterminate_when_target_and_restore_fail() {
+        let source = active_binding().binding;
+
+        let outcome = replace_prepared_runtime(&source, |step| match step {
+            RuntimeReplaceStep::DetachSource => Ok(None),
+            RuntimeReplaceStep::InstallTarget | RuntimeReplaceStep::RestoreSource => {
+                Err(BackendError::KernelFailure("scripted failure".into()))
+            }
+        });
+
+        assert_eq!(
+            outcome,
+            ReplaceOutcome::Indeterminate {
+                code: ReplaceFailureCode::KernelFailure,
+            }
+        );
+    }
+
+    #[test]
+    fn replacement_keeps_the_source_runtime_domain() {
+        let source = active_binding().binding;
+
+        assert_eq!(replacement_runtime_domain(&source), 7);
+    }
+
+    #[test]
+    fn replacement_rebinds_only_live_original_domain_members() {
+        let members = [
+            DomainMember {
+                pid: 42,
+                process_start_time: 101,
+            },
+            DomainMember {
+                pid: 43,
+                process_start_time: 102,
+            },
+        ];
+        let mut rebound = Vec::new();
+
+        rebind_live_domain_members(
+            &members,
+            |pid| Ok(Some(if pid == 42 { 101 } else { 999 })),
+            |pid| {
+                rebound.push(pid);
+                Ok(())
+            },
+        )
+        .expect("live members should rebind");
+
+        assert_eq!(rebound, [42]);
     }
 
     #[test]

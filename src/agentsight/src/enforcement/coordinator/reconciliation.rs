@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use agentsight_enforcement_protocol::{ApplyPolicy, Binding, BindingState};
 use uuid::Uuid;
 
+use super::transition::{ReplacementClient, execute_transition};
 use super::{EnforcementClient, EnforcementCoordinatorError, EnforcementError, EnforcementStore};
 
 const MAX_OPERATOR_MESSAGE_CHARS: usize = 512;
 const REJECTION_FALLBACK: &str = "enforcer rejected desired binding without operator-safe detail";
 
 /// Operations used to reconcile one persisted desired-state generation.
-pub(super) trait DesiredStateClient {
+pub(super) trait DesiredStateClient: ReplacementClient {
     /// Lists bindings currently acknowledged by the enforcer.
     fn bindings(&self) -> Result<Vec<Binding>, EnforcementError>;
 
@@ -48,6 +49,9 @@ pub(super) fn reconcile_desired_state<C: DesiredStateClient + ?Sized>(
     client: &C,
     store: &EnforcementStore,
 ) -> Result<(), EnforcementCoordinatorError> {
+    for transition in store.pending_transitions()? {
+        execute_transition(client, store, transition)?;
+    }
     let desired = store.bindings()?;
     let actual = client.bindings()?;
     let desired_by_id: HashMap<_, _> = desired

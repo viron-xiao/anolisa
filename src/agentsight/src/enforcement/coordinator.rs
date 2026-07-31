@@ -16,6 +16,7 @@ use crate::IngestionReadinessError;
 use crate::ingestion_readiness::{GenerationReadiness, GenerationToken};
 
 mod reconciliation;
+mod transition;
 
 use reconciliation::{reconcile_desired_state, remote_failure_binding};
 
@@ -31,6 +32,9 @@ pub enum EnforcementCoordinatorError {
     /// A violation subscriber has not completed its acknowledgement handshake.
     #[error("{INGESTION_UNAVAILABLE_MESSAGE}")]
     IngestionUnavailable,
+    /// Runtime policy ownership could not be proved and requires reconciliation.
+    #[error("policy replacement ownership is indeterminate; reconciliation is required")]
+    TransitionUnavailable,
     /// The privileged service call failed.
     #[error(transparent)]
     Client(#[from] EnforcementError),
@@ -277,10 +281,19 @@ impl EnforcementCoordinator {
     pub fn health(
         &self,
     ) -> Result<agentsight_enforcement_protocol::HealthStatus, EnforcementCoordinatorError> {
-        Ok(combine_health(
-            self.client.health()?,
-            &self.ingestion_readiness,
-        ))
+        let mut health = combine_health(self.client.health()?, &self.ingestion_readiness);
+        if self
+            .store
+            .pending_transitions()?
+            .iter()
+            .any(|transition| transition.phase == super::TransitionPhase::Indeterminate)
+        {
+            health.ready = false;
+            health.message = Some(
+                "policy replacement ownership is indeterminate; reconciliation is required".into(),
+            );
+        }
+        Ok(health)
     }
 
     fn lifecycle(&self) -> MutexGuard<'_, ()> {

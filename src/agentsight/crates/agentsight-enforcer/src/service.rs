@@ -198,6 +198,7 @@ fn dispatch<B: EnforcementBackend>(
         Command::ApplyCredentialPolicy(request) => backend
             .apply_credential_policy(request)
             .map(ResponseBody::Applied),
+        Command::ReplacePolicy(request) => backend.replace(request).map(ResponseBody::Replaced),
         Command::DetachAgent { binding_id } => {
             backend.detach(binding_id)?;
             Ok(ResponseBody::Detached)

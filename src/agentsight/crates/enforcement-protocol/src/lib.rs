@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod replacement;
 pub mod security;
+pub use replacement::*;
 pub use security::*;
 
 /// Wire protocol version implemented by this crate.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum JSON payload size accepted for one NDJSON frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -38,7 +40,7 @@ impl Request {
     }
 }
 
-/// Operations supported by protocol version 1.
+/// Operations supported by protocol version 2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "params", rename_all = "snake_case")]
 pub enum Command {
@@ -48,6 +50,8 @@ pub enum Command {
     ApplyPolicy(ApplyPolicy),
     /// Compiles a product-level credential policy inside the privileged adapter.
     ApplyCredentialPolicy(ApplyCredentialPolicy),
+    /// Replaces one exact active binding without exposing an interleaving window.
+    ReplacePolicy(ReplacePolicy),
     /// Detaches a binding by its stable identifier.
     DetachAgent {
         /// Binding to detach.
@@ -207,7 +211,7 @@ pub struct Response {
     pub result: Result<ResponseBody, RemoteError>,
 }
 
-/// Successful response payloads supported by protocol version 1.
+/// Successful response payloads supported by protocol version 2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "response", content = "data", rename_all = "snake_case")]
 pub enum ResponseBody {
@@ -215,6 +219,8 @@ pub enum ResponseBody {
     Health(HealthStatus),
     /// Binding returned after apply.
     Applied(Binding),
+    /// Typed result of an atomic policy-ownership handoff.
+    Replaced(ReplaceOutcome),
     /// Successful detach acknowledgement.
     Detached,
     /// Current backend bindings.
@@ -353,6 +359,47 @@ mod tests {
 
     use super::*;
 
+    fn protocol_fixture_apply(binding_id: Uuid) -> ApplyPolicy {
+        ApplyPolicy {
+            binding_id,
+            agent_id: "agent-1".into(),
+            session_id: Some("session-1".into()),
+            root_pid: 42,
+            process_start_time: 101,
+            policy_id: "credential-exfiltration".into(),
+            policy_revision: "1".into(),
+            policy_dsl: "label AGENT".into(),
+        }
+    }
+
+    fn protocol_fixture_credential(binding_id: Uuid) -> ApplyCredentialPolicy {
+        ApplyCredentialPolicy {
+            binding_id,
+            agent_id: "agent-1".into(),
+            session_id: Some("session-1".into()),
+            root_pid: 42,
+            process_start_time: 101,
+            policy: CredentialExfiltrationPolicy {
+                policy_id: "credential-exfiltration".into(),
+                revision: 1,
+                source_patterns: vec!["/tmp/credential".into()],
+                trusted_endpoints: Vec::new(),
+                taint_label: "CREDENTIAL".into(),
+                taint_ttl_secs: 900,
+                mode: PolicyMode::Audit,
+            },
+        }
+    }
+
+    fn protocol_fixture_binding(state: BindingState) -> Binding {
+        Binding {
+            request: protocol_fixture_apply(Uuid::new_v4()),
+            state,
+            message: None,
+            domain_id: None,
+        }
+    }
+
     #[test]
     fn request_round_trips_as_one_frame() {
         let request = Request::new(Command::Health);
@@ -362,6 +409,25 @@ mod tests {
             .expect("fixture should decode")
             .expect("frame should exist");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn protocol_v1_request_is_rejected_after_replacement_upgrade() {
+        let mut request = Request::new(Command::Health);
+        request.protocol_version = 1;
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).expect("fixture should encode");
+
+        let error = read_frame::<_, Request>(&mut BufReader::new(Cursor::new(bytes)))
+            .expect_err("protocol v1 must be rejected");
+
+        assert!(matches!(
+            error,
+            ProtocolError::UnsupportedVersion {
+                expected: PROTOCOL_VERSION,
+                actual: 1,
+            }
+        ));
     }
 
     #[test]
@@ -452,5 +518,77 @@ mod tests {
             .expect("fixture should decode")
             .expect("frame should exist");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn replacement_outcomes_have_only_stable_failure_codes() {
+        let outcome = ReplaceOutcome::SourceRestored {
+            binding: protocol_fixture_binding(BindingState::Enforced),
+            code: ReplaceFailureCode::KernelFailure,
+        };
+        let json = serde_json::to_string(&outcome).expect("serialize replacement outcome");
+        assert!(!json.contains("/root/"));
+        let decoded = serde_json::from_str::<ReplaceOutcome>(&json).expect("deserialize outcome");
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn replacement_policy_round_trips_generic_and_credential_targets() {
+        for replacement in [
+            ReplacementPolicy::Generic(protocol_fixture_apply(Uuid::new_v4())),
+            ReplacementPolicy::Credential(protocol_fixture_credential(Uuid::new_v4())),
+        ] {
+            let request = ReplacePolicy {
+                expected: protocol_fixture_binding(BindingState::Enforced),
+                replacement,
+            };
+            let json = serde_json::to_vec(&request).expect("serialize replace request");
+            let decoded =
+                serde_json::from_slice::<ReplacePolicy>(&json).expect("deserialize request");
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_equal_source_and_target_binding_ids() {
+        let expected = protocol_fixture_binding(BindingState::Enforced);
+        let request = ReplacePolicy {
+            replacement: ReplacementPolicy::Generic(protocol_fixture_apply(
+                expected.request.binding_id,
+            )),
+            expected,
+        };
+        assert_eq!(
+            request.validate(),
+            Err(ReplaceValidationError::SameBindingId)
+        );
+    }
+
+    #[test]
+    fn replacement_requires_an_enforced_source_snapshot() {
+        let request = ReplacePolicy {
+            expected: protocol_fixture_binding(BindingState::Detached),
+            replacement: ReplacementPolicy::Generic(protocol_fixture_apply(Uuid::new_v4())),
+        };
+        assert_eq!(
+            request.validate(),
+            Err(ReplaceValidationError::SourceNotEnforced)
+        );
+    }
+
+    #[test]
+    fn replacement_rejects_an_invalid_credential_target() {
+        let mut replacement = protocol_fixture_credential(Uuid::new_v4());
+        replacement.policy.source_patterns.clear();
+        let request = ReplacePolicy {
+            expected: protocol_fixture_binding(BindingState::Enforced),
+            replacement: ReplacementPolicy::Credential(replacement),
+        };
+        assert_eq!(
+            request.validate(),
+            Err(ReplaceValidationError::CredentialPolicy(
+                PolicyValidationError::EmptySources
+            ))
+        );
     }
 }

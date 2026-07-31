@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,8 +9,8 @@ use actix_web::http::StatusCode;
 use actix_web::test as awtest;
 use actix_web::{App, web};
 use agentsight_enforcement_protocol::{
-    ApplyCredentialPolicy, Binding, BindingState, EventIdentity, FileAction, SecurityEvent,
-    SecurityEventKind,
+    Binding, BindingState, EventIdentity, FileAction, ReplacePolicy, ReplacementPolicy,
+    SecurityEvent, SecurityEventKind,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -21,7 +22,7 @@ use super::{
 };
 use crate::ReadinessStamp;
 use crate::config::ServerAuthConfig;
-use crate::enforcement::ApplyPolicy;
+use crate::enforcement::{ApplyPolicy, TransitionKey};
 use crate::grader::EvaluationStore;
 use crate::health::store::AgentRole;
 use crate::health::{AgentHealthState, AgentHealthStatus, HealthStore};
@@ -35,22 +36,29 @@ use crate::security::{
 #[derive(Default)]
 struct FakeEnforcer {
     bindings: Mutex<Vec<Binding>>,
+    transitions: Mutex<HashMap<TransitionKey, Binding>>,
     apply_count: AtomicUsize,
 }
 
 impl ContainmentEnforcer for FakeEnforcer {
-    fn apply_credential_policy(
+    fn begin_transition(
         &self,
-        request: ApplyCredentialPolicy,
+        key: TransitionKey,
+        transition: ReplacePolicy,
     ) -> Result<StampedBinding, ContainmentEnforcerError> {
         self.apply_count.fetch_add(1, Ordering::AcqRel);
+        let ReplacementPolicy::Credential(request) = transition.replacement else {
+            return Err(ContainmentEnforcerError::Rejected(
+                "fixture accepts only credential transitions".into(),
+            ));
+        };
         let source = request
             .policy
             .source_patterns
             .first()
             .cloned()
             .unwrap_or_default();
-        Ok(StampedBinding::stable(Binding {
+        let binding = Binding {
             request: ApplyPolicy {
                 binding_id: request.binding_id,
                 agent_id: request.agent_id,
@@ -64,7 +72,43 @@ impl ContainmentEnforcer for FakeEnforcer {
             state: BindingState::Enforced,
             message: None,
             domain_id: Some(1),
-        }))
+        };
+        let mut bindings = self
+            .bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for existing in bindings.iter_mut() {
+            if existing.request.binding_id == transition.expected.request.binding_id {
+                existing.state = BindingState::Detached;
+                existing.domain_id = None;
+            }
+        }
+        bindings.push(binding.clone());
+        self.transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, binding.clone());
+        Ok(StampedBinding::stable(binding))
+    }
+
+    fn resume_transition(
+        &self,
+        key: &TransitionKey,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        self.transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+            .map(StampedBinding::stable)
+            .ok_or(ContainmentEnforcerError::MissingTransition(key.action_id))
+    }
+
+    fn begin_reverse_transition(
+        &self,
+        action_id: Uuid,
+    ) -> Result<StampedBinding, ContainmentEnforcerError> {
+        Err(ContainmentEnforcerError::MissingTransition(action_id))
     }
 
     fn detach(&self, _: Uuid) -> Result<(), String> {
@@ -454,6 +498,7 @@ fn action_with_failure(
         action_id: Uuid::new_v4(),
         case_id: Uuid::nil(),
         binding_id: Uuid::new_v4(),
+        source_binding_id: Some(Uuid::new_v4()),
         agent_id: "hermes-test".into(),
         root_pid: 42,
         process_start_time: 7,

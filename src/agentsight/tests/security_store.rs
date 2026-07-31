@@ -16,6 +16,7 @@ fn containment_action(lifecycle_state: ContainmentLifecycle) -> ContainmentActio
         action_id: Uuid::new_v4(),
         case_id: Uuid::new_v4(),
         binding_id: Uuid::new_v4(),
+        source_binding_id: Some(Uuid::new_v4()),
         agent_id: "hermes-test".into(),
         root_pid: 4242,
         process_start_time: 99,
@@ -361,6 +362,115 @@ fn containment_claim_rejects_an_ineligible_case_without_inserting() {
             .expect("action query should work"),
         None
     );
+}
+
+#[test]
+fn containment_claim_requires_exact_source_binding_identity() {
+    let store = SecurityStore::open_in_memory().expect("fixture store should open");
+    let mut action = containment_action(ContainmentLifecycle::Pending);
+    action.source_binding_id = None;
+    store
+        .upsert_case(&fixture_case(action.case_id, RiskCaseStatus::Open), &[])
+        .expect("case should persist");
+
+    let error = store
+        .claim_containment_action(&action)
+        .expect_err("new claims without source provenance must fail");
+
+    assert!(
+        matches!(error, SecurityStoreError::InvalidData(message) if message.contains("exact source binding"))
+    );
+    assert_eq!(
+        store
+            .containment_action(action.action_id)
+            .expect("action query should work"),
+        None
+    );
+}
+
+#[test]
+fn legacy_containment_schema_adds_nullable_source_binding_identity() {
+    let path = security_db_path("legacy-containment-source-binding");
+    let action = containment_action(ContainmentLifecycle::Failed);
+    {
+        let connection = rusqlite::Connection::open(&path).expect("legacy database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE containment_actions (
+                    action_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    binding_id TEXT NOT NULL UNIQUE,
+                    agent_id TEXT NOT NULL,
+                    root_pid INTEGER NOT NULL,
+                    process_start_time INTEGER NOT NULL,
+                    source_path TEXT NOT NULL,
+                    duration_secs INTEGER,
+                    expires_at_ns INTEGER,
+                    lifecycle_state TEXT NOT NULL,
+                    blocked_at_ns INTEGER,
+                    requested_by TEXT NOT NULL,
+                    failure_stage TEXT,
+                    failure_reason TEXT,
+                    attempt_count INTEGER NOT NULL,
+                    next_retry_at_ns INTEGER,
+                    created_at_ns INTEGER NOT NULL,
+                    updated_at_ns INTEGER NOT NULL
+                );",
+            )
+            .expect("legacy schema should be created");
+        connection
+            .execute(
+                "INSERT INTO containment_actions (
+                    action_id, case_id, binding_id, agent_id, root_pid, process_start_time,
+                    source_path, duration_secs, expires_at_ns, lifecycle_state, blocked_at_ns,
+                    requested_by, failure_stage, failure_reason, attempt_count, next_retry_at_ns,
+                    created_at_ns, updated_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17, ?18)",
+                rusqlite::params![
+                    action.action_id.to_string(),
+                    action.case_id.to_string(),
+                    action.binding_id.to_string(),
+                    action.agent_id,
+                    action.root_pid,
+                    action.process_start_time,
+                    action.source_path,
+                    action.duration_secs,
+                    action.expires_at_ns,
+                    "failed",
+                    action.blocked_at_ns,
+                    action.requested_by,
+                    Option::<String>::None,
+                    action.failure_reason,
+                    action.attempt_count,
+                    action.next_retry_at_ns,
+                    action.created_at_ns,
+                    action.updated_at_ns,
+                ],
+            )
+            .expect("legacy action should insert");
+    }
+
+    let store = SecurityStore::open(&path).expect("legacy store should migrate");
+    let migrated = store
+        .containment_action(action.action_id)
+        .expect("migrated action should load")
+        .expect("legacy action should remain");
+
+    assert_eq!(migrated.source_binding_id, None);
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).expect("migrated database should open");
+    let source_column_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('containment_actions')
+             WHERE name = 'source_binding_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("migrated schema should be queryable");
+    assert_eq!(source_column_count, 1);
+    drop(connection);
+    fs::remove_file(path).expect("fixture database should be removed");
 }
 
 #[test]

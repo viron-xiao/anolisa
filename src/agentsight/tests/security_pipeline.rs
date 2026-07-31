@@ -56,6 +56,7 @@ fn insert_containment_action(store: &SecurityStore, case_id: Uuid, binding_id: U
             action_id: Uuid::new_v4(),
             case_id,
             binding_id,
+            source_binding_id: Some(Uuid::new_v4()),
             agent_id: "hermes-test".into(),
             root_pid: 4242,
             process_start_time: 99,

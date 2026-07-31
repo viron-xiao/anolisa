@@ -3,7 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agentsight_enforcement_protocol::ProtocolError;
+use agentsight_enforcement_protocol::{
+    ProtocolError, ReplaceOutcome, ReplacePolicy, ReplacementPolicy,
+};
 use rusqlite::{Connection, params};
 
 use super::*;
@@ -34,17 +36,31 @@ impl Drop for TestDatabase {
 }
 
 struct ScriptedClient {
-    actual: Vec<Binding>,
+    actual: Mutex<Vec<Binding>>,
     apply_results: Mutex<VecDeque<Result<Binding, EnforcementError>>>,
+    replace_results: Mutex<VecDeque<Result<ReplaceOutcome, EnforcementError>>>,
     applied: Mutex<Vec<uuid::Uuid>>,
+    replaced: Mutex<Vec<uuid::Uuid>>,
 }
 
 impl ScriptedClient {
     fn new(apply_results: Vec<Result<Binding, EnforcementError>>) -> Self {
         Self {
-            actual: Vec::new(),
+            actual: Mutex::new(Vec::new()),
             apply_results: Mutex::new(apply_results.into()),
+            replace_results: Mutex::new(VecDeque::new()),
             applied: Mutex::new(Vec::new()),
+            replaced: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_replace_results(results: Vec<Result<ReplaceOutcome, EnforcementError>>) -> Self {
+        Self {
+            actual: Mutex::new(Vec::new()),
+            apply_results: Mutex::new(VecDeque::new()),
+            replace_results: Mutex::new(results.into()),
+            applied: Mutex::new(Vec::new()),
+            replaced: Mutex::new(Vec::new()),
         }
     }
 
@@ -54,11 +70,50 @@ impl ScriptedClient {
             .expect("applied record should not be poisoned")
             .clone()
     }
+
+    fn replaced(&self) -> Vec<uuid::Uuid> {
+        self.replaced
+            .lock()
+            .expect("replaced record should not be poisoned")
+            .clone()
+    }
+}
+
+impl ReplacementClient for ScriptedClient {
+    fn replace(&self, request: ReplacePolicy) -> Result<ReplaceOutcome, EnforcementError> {
+        self.replaced
+            .lock()
+            .expect("replaced record should not be poisoned")
+            .push(request.replacement.binding_id());
+        let outcome = self
+            .replace_results
+            .lock()
+            .expect("replace results should not be poisoned")
+            .pop_front()
+            .expect("scripted replace result should exist")?;
+        let actual = match &outcome {
+            ReplaceOutcome::Applied(binding)
+            | ReplaceOutcome::SourceRetained { binding, .. }
+            | ReplaceOutcome::SourceRestored { binding, .. } => Some(binding.clone()),
+            ReplaceOutcome::Conflict { .. } | ReplaceOutcome::Indeterminate { .. } => None,
+        };
+        if let Some(actual) = actual {
+            *self
+                .actual
+                .lock()
+                .expect("actual bindings should not be poisoned") = vec![actual];
+        }
+        Ok(outcome)
+    }
 }
 
 impl DesiredStateClient for ScriptedClient {
     fn bindings(&self) -> Result<Vec<Binding>, EnforcementError> {
-        Ok(self.actual.clone())
+        Ok(self
+            .actual
+            .lock()
+            .expect("actual bindings should not be poisoned")
+            .clone())
     }
 
     fn apply(&self, request: ApplyPolicy) -> Result<Binding, EnforcementError> {
@@ -76,6 +131,85 @@ impl DesiredStateClient for ScriptedClient {
     fn detach(&self, _binding_id: uuid::Uuid) -> Result<(), EnforcementError> {
         Ok(())
     }
+}
+
+#[test]
+fn reconnect_resumes_transition_before_ordinary_binding_replay() {
+    let store = EnforcementStore::open(":memory:").expect("test store should open");
+    let source_request = request("00000000-0000-0000-0000-000000000031");
+    let target_request = request("00000000-0000-0000-0000-000000000032");
+    let source = enforced(source_request, 7);
+    let target = enforced(target_request.clone(), 9);
+    let transition = crate::enforcement::PolicyTransition::pending(
+        crate::enforcement::TransitionKey {
+            action_id: uuid::Uuid::new_v4(),
+            direction: crate::enforcement::TransitionDirection::Forward,
+        },
+        ReplacePolicy {
+            expected: source.clone(),
+            replacement: ReplacementPolicy::Generic(target_request),
+        },
+    );
+    store.upsert_binding(&source).expect("source should seed");
+    store
+        .begin_transition(&transition)
+        .expect("transition should seed");
+    let client =
+        ScriptedClient::with_replace_results(vec![Ok(ReplaceOutcome::Applied(target.clone()))]);
+
+    reconcile_desired_state(&client, &store).expect("transition should reconcile first");
+
+    assert_eq!(client.replaced(), vec![target.request.binding_id]);
+    assert!(client.applied().is_empty());
+    assert_eq!(
+        store
+            .transition(&transition.key)
+            .expect("transition should load")
+            .expect("transition should exist")
+            .phase,
+        crate::enforcement::TransitionPhase::Completed
+    );
+}
+
+#[test]
+fn indeterminate_transition_stops_ordinary_binding_replay() {
+    let store = EnforcementStore::open(":memory:").expect("test store should open");
+    let source = enforced(request("00000000-0000-0000-0000-000000000041"), 7);
+    let target = request("00000000-0000-0000-0000-000000000042");
+    let transition = crate::enforcement::PolicyTransition::pending(
+        crate::enforcement::TransitionKey {
+            action_id: uuid::Uuid::new_v4(),
+            direction: crate::enforcement::TransitionDirection::Forward,
+        },
+        ReplacePolicy {
+            expected: source.clone(),
+            replacement: ReplacementPolicy::Generic(target),
+        },
+    );
+    store.upsert_binding(&source).expect("source should seed");
+    store
+        .begin_transition(&transition)
+        .expect("transition should seed");
+    let client = ScriptedClient::with_replace_results(vec![Ok(ReplaceOutcome::Indeterminate {
+        code: agentsight_enforcement_protocol::ReplaceFailureCode::KernelFailure,
+    })]);
+
+    let error = reconcile_desired_state(&client, &store)
+        .expect_err("unknown ownership must stop ordinary replay");
+
+    assert!(matches!(
+        error,
+        EnforcementCoordinatorError::TransitionUnavailable
+    ));
+    assert!(client.applied().is_empty());
+    assert_eq!(
+        store
+            .transition(&transition.key)
+            .expect("transition should load")
+            .expect("transition should exist")
+            .phase,
+        crate::enforcement::TransitionPhase::Indeterminate
+    );
 }
 
 fn request(id: &str) -> ApplyPolicy {

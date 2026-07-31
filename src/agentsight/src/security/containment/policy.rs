@@ -40,21 +40,54 @@ pub(super) struct ResolvedPolicy {
     pub(super) trusted_endpoints: Vec<String>,
 }
 
+pub(super) fn exact_binding(bindings: &[Binding], binding_id: Uuid) -> Result<Option<Binding>, ()> {
+    let mut matching = bindings
+        .iter()
+        .filter(|binding| binding.request.binding_id == binding_id);
+    let first = matching.next().cloned();
+    if matching.next().is_some() {
+        return Err(());
+    }
+    Ok(first)
+}
+
 pub(super) fn resolve_policy(
     detail: RiskCaseDetail,
     bindings: Vec<Binding>,
 ) -> Option<ResolvedPolicy> {
+    let source_binding_id = detail.evidence.first()?.identity.binding_id;
+    resolve_policy_binding(detail, bindings, source_binding_id, false)
+}
+
+pub(super) fn resolve_transition_policy(
+    detail: RiskCaseDetail,
+    bindings: Vec<Binding>,
+    source_binding_id: Uuid,
+) -> Option<ResolvedPolicy> {
+    resolve_policy_binding(detail, bindings, source_binding_id, true)
+}
+
+fn resolve_policy_binding(
+    detail: RiskCaseDetail,
+    bindings: Vec<Binding>,
+    source_binding_id: Uuid,
+    allow_detached: bool,
+) -> Option<ResolvedPolicy> {
     let evidence = detail.evidence.first()?;
+    if evidence.identity.binding_id != source_binding_id {
+        return None;
+    }
     let file_action = match &evidence.kind {
         SecurityEventKind::FileAction(action) => action,
         _ => return None,
     };
     let mut matching = bindings
         .into_iter()
-        .filter(|binding| binding.request.binding_id == evidence.identity.binding_id);
+        .filter(|binding| binding.request.binding_id == source_binding_id);
     let binding = matching.next().filter(|_| matching.next().is_none())?;
     let request = &binding.request;
-    if binding.state != BindingState::Enforced
+    if !(binding.state == BindingState::Enforced
+        || (allow_detached && binding.state == BindingState::Detached))
         || request.agent_id != detail.case.agent_id
         || request.agent_id != evidence.identity.agent_id
         || request.session_id != detail.case.session_id
