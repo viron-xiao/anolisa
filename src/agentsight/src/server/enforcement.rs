@@ -154,10 +154,27 @@ pub(super) async fn detach_binding(
     data: web::Data<AppState>,
     binding_id: web::Path<Uuid>,
 ) -> HttpResponse {
+    let binding_id = binding_id.into_inner();
+    if let Some(containment) = data.containment.clone() {
+        match web::block(move || containment.remove_binding(binding_id)).await {
+            Ok(Ok(true)) => return HttpResponse::NoContent().finish(),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                log::error!("containment binding restoration failed: {error}");
+                return error_response(
+                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "containment_restore_failed",
+                    "containment policy restoration failed",
+                    true,
+                );
+            }
+            Err(error) => return blocking_error(error),
+        }
+    }
     let Some(coordinator) = data.enforcement.clone() else {
         return unavailable();
     };
-    match web::block(move || coordinator.detach(binding_id.into_inner())).await {
+    match web::block(move || coordinator.detach(binding_id)).await {
         Ok(Ok(())) => HttpResponse::NoContent().finish(),
         Ok(Err(error)) => coordinator_error(error),
         Err(error) => blocking_error(error),
