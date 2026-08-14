@@ -236,13 +236,12 @@ export const RiskEnforcementPage: React.FC = () => {
         </button>
       </header>
 
-      <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <SummaryCard
           label="执行器状态"
           value={health?.ready ? '就绪' : healthUnavailable ? '不可用' : '检测中'}
           error={healthError || health?.message || undefined}
         />
-        <SummaryCard label="执行后端" value={health?.backend || '—'} />
         <SummaryCard label="生效策略" value={activeBindings.length} />
         <SummaryCard label={allowsCredentialEnforcement ? '拦截违规' : '审计违规'} value={displayedViolations} />
       </section>
@@ -400,7 +399,7 @@ export const RiskEnforcementPage: React.FC = () => {
           )}
           {bindingLimitReached && (
             <p className="mt-2 text-xs text-amber-700">
-              当前 ActPlane 后端最多支持 {maxActiveBindings} 条生效策略；请先解除现有策略后再下发。
+              当前策略执行能力最多支持 {maxActiveBindings} 条生效策略；请先解除现有策略后再下发。
             </p>
           )}
           <p aria-live="polite" className="mt-3 min-h-5 text-sm text-gray-700">{operationResult}</p>
@@ -459,9 +458,6 @@ export const RiskEnforcementPage: React.FC = () => {
                   </td>
                   <td className="px-4 py-3 text-gray-600">
                     <div>{event.reason || '—'}</div>
-                    <div className="mt-1 font-mono text-[11px] text-gray-400">
-                      ActPlane {event.actplane_revision}
-                    </div>
                   </td>
                 </tr>
               ))}

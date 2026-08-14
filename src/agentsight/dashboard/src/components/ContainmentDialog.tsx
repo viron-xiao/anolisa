@@ -304,7 +304,7 @@ export const ContainmentDialog: React.FC<ContainmentDialogProps> = ({
                 </div>
                 <div>
                   <dt className="text-xs font-medium text-gray-500">执行效果</dt>
-                  <dd className="mt-1 text-sm font-medium text-gray-900">ActPlane 内核拒绝（deny）</dd>
+                  <dd className="mt-1 text-sm font-medium text-gray-900">AgentSight 内核拒绝（deny）</dd>
                 </div>
                 <div>
                   <dt className="text-xs font-medium text-gray-500">原始 Agent</dt>

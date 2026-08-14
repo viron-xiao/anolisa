@@ -288,7 +288,7 @@ export const SystemAuditPage: React.FC = () => {
             </span>
           </div>
           <p className="mt-1 text-sm text-gray-500">
-            从 Agent 会话出发，关联工具调用、进程、文件、网络和 ActPlane 决策，形成可追溯证据链。
+            从 Agent 会话出发，关联工具调用、进程、文件、网络和策略判定，形成可追溯证据链。
           </p>
         </div>
         <div className="flex gap-2">
