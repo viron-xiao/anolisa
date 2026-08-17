@@ -4,6 +4,7 @@
 //! and probes them via HTTP to determine health status.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,6 +53,12 @@ fn infer_agent_role(
         }
     }
     AgentRole::Gateway
+}
+
+fn read_workspace_path(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
 }
 
 /// Background health checker that periodically probes discovered agents
@@ -158,6 +165,7 @@ impl HealthChecker {
             .collect();
 
         for agent in &agents {
+            let workspace_path = read_workspace_path(agent.pid);
             let ports = ports_by_pid.get(&agent.pid).cloned().unwrap_or_default();
             // Cosh has no daemon process and does not support keepalive/restart.
             // Build restart_cmd only for agents that support it.
@@ -178,6 +186,7 @@ impl HealthChecker {
                     agent_name: agent.agent_info.name.clone(),
                     category: agent.agent_info.category.clone(),
                     exe_path: agent.exe_path.clone(),
+                    workspace_path,
                     ports: vec![],
                     status: AgentHealthState::NoPort,
                     last_check_time: now_ms(),
@@ -406,6 +415,7 @@ impl HealthChecker {
         parent_pid: Option<u32>,
     ) -> AgentHealthStatus {
         let mut last_error = String::new();
+        let workspace_path = read_workspace_path(agent.pid);
         // 标记是否遇到了超时错误（区分 hung vs unreachable）
         let mut timed_out = false;
 
@@ -429,6 +439,7 @@ impl HealthChecker {
                         agent_name: agent.agent_info.name.clone(),
                         category: agent.agent_info.category.clone(),
                         exe_path: agent.exe_path.clone(),
+                        workspace_path: workspace_path.clone(),
                         ports: ports.to_vec(),
                         status: AgentHealthState::Healthy,
                         last_check_time: now_ms(),
@@ -448,6 +459,7 @@ impl HealthChecker {
                         agent_name: agent.agent_info.name.clone(),
                         category: agent.agent_info.category.clone(),
                         exe_path: agent.exe_path.clone(),
+                        workspace_path: workspace_path.clone(),
                         ports: ports.to_vec(),
                         status: AgentHealthState::Healthy,
                         last_check_time: now_ms(),
@@ -492,6 +504,7 @@ impl HealthChecker {
             agent_name: agent.agent_info.name.clone(),
             category: agent.agent_info.category.clone(),
             exe_path: agent.exe_path.clone(),
+            workspace_path,
             ports: ports.to_vec(),
             status,
             last_check_time: now_ms(),
@@ -686,6 +699,7 @@ mod tests {
             agent_name: "cosh-core".to_string(),
             category: "cli".to_string(),
             exe_path: "/usr/bin/cosh-core".to_string(),
+            workspace_path: None,
             ports: vec![],
             status: AgentHealthState::Offline,
             last_check_time: now_ms(),
@@ -697,6 +711,18 @@ mod tests {
             parent_pid: None,
             has_crash: false,
         }
+    }
+
+    #[test]
+    fn reports_current_process_workspace() {
+        let expected = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory");
+        assert_eq!(
+            read_workspace_path(std::process::id()).as_deref(),
+            expected.to_str()
+        );
     }
 
     fn list_crash_events(

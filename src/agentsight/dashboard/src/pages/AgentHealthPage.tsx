@@ -6,6 +6,9 @@ import {
   fetchInterruptions,
   resolveInterruption,
   INTERRUPTION_TYPE_CN,
+  createCredentialBinding,
+  fetchAgentProtectionPreview,
+  fetchEnforcementBindings,
 } from '../utils/apiClient';
 import type { InterruptionRecord, InterruptionSeverity } from '../utils/apiClient';
 import type { AgentHealthStatus } from '../types';
@@ -63,8 +66,64 @@ const AgentCard: React.FC<{
   onDelete: (pid: number) => void;
   onRestart: (pid: number) => void;
   restarting: boolean;
-}> = ({ agent, related, onDelete, onRestart, restarting }) => {
+  protectedByPolicy: boolean;
+  onProtected: (pid: number) => void;
+  addToast: (message: string) => void;
+}> = ({ agent, related, onDelete, onRestart, restarting, protectedByPolicy, onProtected, addToast }) => {
   const [showRelated, setShowRelated] = useState(false);
+  const [showProtection, setShowProtection] = useState(false);
+  const [protecting, setProtecting] = useState(false);
+  const [directory, setDirectory] = useState(agent.workspace_path ?? '');
+  const [sources, setSources] = useState<string[]>([]);
+  const [trustedTarget, setTrustedTarget] = useState('');
+
+  const loadProtectionDefaults = async (customDirectory?: string) => {
+    const preview = await fetchAgentProtectionPreview(agent.pid, customDirectory);
+    setDirectory(preview.workspace_path);
+    setSources(preview.source_paths);
+    return preview;
+  };
+
+  const applyProtection = async (sourcePaths?: string[]) => {
+    const selected = sourcePaths ?? sources;
+    if (selected.length === 0) {
+      setShowProtection(true);
+      addToast('未发现敏感文件，请在设置中选择包含 .env 或凭据文件的目录');
+      return;
+    }
+    setProtecting(true);
+    try {
+      await createCredentialBinding({
+        agent_id: agent.agent_name,
+        root_pid: agent.pid,
+        source_paths: selected,
+        trusted_endpoints: trustedTarget.trim() ? [trustedTarget.trim()] : [],
+        revision: Date.now(),
+        mode: 'audit',
+        taint_ttl_secs: 900,
+        destination_scope: 'public_ipv4',
+      });
+      onProtected(agent.pid);
+      setShowProtection(false);
+      addToast('✅ 已开启审计保护：发现风险时记录证据，不阻断 Agent');
+    } catch (error: any) {
+      addToast(`开启失败: ${error.message ?? '请稍后重试'}`);
+    } finally {
+      setProtecting(false);
+    }
+  };
+
+  const enableProtection = async () => {
+    setProtecting(true);
+    try {
+      const preview = await loadProtectionDefaults();
+      await applyProtection(preview.source_paths);
+    } catch (error: any) {
+      addToast(`无法生成默认策略: ${error.message ?? '请检查 Agent 工作目录'}`);
+    } finally {
+      setProtecting(false);
+    }
+  };
 
   // 区分：真 Gateway = 本身在监听端口的服务进程（如 OpenClaw Gateway）
   //       升格 Gateway = 被升格为主卡的单进程 agent（如 Hermes Python CLI）—
@@ -168,6 +227,30 @@ const AgentCard: React.FC<{
           </div>
         )}
       </div>
+      {!isOffline && (
+        <div className="mt-3 pt-2 border-t border-gray-100 flex items-center justify-between gap-2">
+          <div>
+            <div className="text-xs font-medium text-gray-700">安全保护</div>
+            <div className="text-[11px] text-gray-400">
+              {protectedByPolicy
+                ? (sources.length > 0 ? `审计保护中 · ${sources.length} 个敏感源` : '审计保护中')
+                : '默认保护工作目录中的凭据文件'}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {protectedByPolicy ? (
+              <button onClick={() => { setShowProtection(true); void loadProtectionDefaults().catch(() => undefined); }} className="text-xs text-blue-600 hover:text-blue-700">设置</button>
+            ) : (
+              <>
+                <button onClick={() => { setShowProtection(true); void loadProtectionDefaults().catch(() => undefined); }} className="text-xs text-gray-500 hover:text-gray-700">设置</button>
+                <button onClick={() => void enableProtection()} disabled={protecting} className="text-xs px-2.5 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">
+                  {protecting ? '开启中…' : '一键开启'}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
       {(isOffline || canRestart) && (
         <div className="mt-2 flex items-center gap-3">
           {isOffline && (
@@ -213,6 +296,23 @@ const AgentCard: React.FC<{
           )}
         </div>
       )}
+      {showProtection && (
+        <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4" onClick={() => setShowProtection(false)}>
+          <div className="w-full max-w-lg rounded-xl bg-white shadow-xl border border-gray-200 p-5" onClick={event => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-4">
+              <div><h3 className="text-base font-semibold text-gray-900">Agent 安全保护</h3><p className="mt-1 text-xs text-gray-500">默认使用审计模式，不阻断任务；不会读取文件内容。Agent 重启后需重新开启。</p></div>
+              <button onClick={() => setShowProtection(false)} className="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <label className="block mt-4 text-xs font-medium text-gray-700">保护目录</label>
+            <div className="mt-1 flex gap-2"><input value={directory} onChange={event => setDirectory(event.target.value)} className="min-w-0 flex-1 rounded border border-gray-300 px-3 py-2 text-sm" placeholder="Agent workspace" /><button onClick={() => void loadProtectionDefaults(directory).catch((error: any) => addToast(`目录扫描失败: ${error.message}`))} className="rounded border border-gray-300 px-3 text-xs hover:bg-gray-50">扫描</button></div>
+            <label className="block mt-4 text-xs font-medium text-gray-700">敏感文件（每行一个）</label>
+            <textarea value={sources.join('\n')} onChange={event => setSources(event.target.value.split('\n').map(value => value.trim()).filter(Boolean))} rows={4} className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-xs font-mono" placeholder="扫描后自动填充 .env、credential、私钥等文件" />
+            <label className="block mt-4 text-xs font-medium text-gray-700">可信网络目标（可选）</label>
+            <input value={trustedTarget} onChange={event => setTrustedTarget(event.target.value)} className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm" placeholder="例如 10.0.0.8:443；当前运行时最多 1 个" />
+            <div className="mt-5 flex justify-end gap-2"><button onClick={() => setShowProtection(false)} className="rounded border border-gray-300 px-4 py-2 text-sm">取消</button><button onClick={() => void applyProtection()} disabled={protecting || sources.length === 0} className="rounded bg-blue-600 px-4 py-2 text-sm text-white disabled:opacity-50">开启审计保护</button></div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -225,6 +325,7 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [restartingPids, setRestartingPids] = useState<Set<number>>(new Set());
+  const [protectedPids, setProtectedPids] = useState<Set<number>>(new Set());
   const hasDataRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -235,6 +336,9 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
       setAgents(agentRows.filter(a => a.role === 'gateway'));
       setClientAgents(agentRows.filter(a => a.role !== 'gateway'));
       setLastScan(data.last_scan_time ?? 0);
+      void fetchEnforcementBindings().then(({ bindings }) => {
+        setProtectedPids(new Set(bindings.filter(binding => binding.state === 'enforced').map(binding => binding.request.root_pid)));
+      }).catch(() => undefined);
       setError(null);
       hasDataRef.current = true;
     } catch (e: any) {
@@ -357,6 +461,9 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
               onDelete={handleDelete}
               onRestart={handleRestart}
               restarting={restartingPids.has(agent.pid)}
+              protectedByPolicy={protectedPids.has(agent.pid)}
+              onProtected={pid => setProtectedPids(previous => new Set(previous).add(pid))}
+              addToast={addToast}
             />
           ))}
         </div>
