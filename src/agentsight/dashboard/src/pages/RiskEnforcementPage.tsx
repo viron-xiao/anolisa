@@ -43,6 +43,13 @@ const modeLabels: Record<EnforcementPolicyMode, string> = {
   enforce: '拦截',
 };
 
+// 模式徐章配色：观察/审计为低风险灰/琥珀，拦截为高风险红
+const modeBadgeClass: Record<EnforcementPolicyMode, string> = {
+  observe: 'bg-gray-100 text-gray-600',
+  audit: 'bg-amber-100 text-amber-700',
+  enforce: 'bg-red-100 text-red-700',
+};
+
 function formatTimestamp(timestampNs: number): string {
   return timestampFormatter.format(timestampNs / 1_000_000);
 }
@@ -54,6 +61,16 @@ const bindingStateLabels: Record<EnforcementBinding['state'], string> = {
   degraded: '降级',
   detaching: '解除中',
   detached: '已解除',
+};
+
+// binding 状态徐章配色：区分生效/异常/已退出
+const bindingStateBadgeClass: Record<EnforcementBinding['state'], string> = {
+  pending: 'bg-amber-100 text-amber-700',
+  enforced: 'bg-green-100 text-green-700',
+  failed: 'bg-red-100 text-red-700',
+  degraded: 'bg-orange-100 text-orange-700',
+  detaching: 'bg-gray-100 text-gray-600',
+  detached: 'bg-gray-100 text-gray-500',
 };
 
 const effectLabels: Record<EnforcementViolation['effect'], string> = {
@@ -185,7 +202,7 @@ export const RiskEnforcementPage: React.FC = () => {
   };
 
   const handleDetach = async (bindingId: string) => {
-    if (!window.confirm('确认解除这条风险拦截策略？')) return;
+    if (!window.confirm('解除后该策略将立即失效，敏感数据外发不再拦截或记录。\n\n确认解除这条风险拦截策略？')) return;
     setDetachingId(bindingId);
     setOperationResult('');
     try {
@@ -285,11 +302,20 @@ export const RiskEnforcementPage: React.FC = () => {
                       {policyFilePath(binding.request.policy_dsl)}
                     </td>
                     <td className="px-4 py-3 text-gray-700">
-                      <div>{modeLabels[binding.request.policy_mode ?? legacyBindingMode(binding.request.policy_dsl)]}</div>
-                      <div className="text-xs text-gray-500">修订 #{binding.request.policy_revision}</div>
+                      {(() => {
+                        const bindingMode = binding.request.policy_mode ?? legacyBindingMode(binding.request.policy_dsl);
+                        return (
+                          <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-semibold ${modeBadgeClass[bindingMode]}`}>
+                            {modeLabels[bindingMode]}
+                          </span>
+                        );
+                      })()}
+                      <div className="mt-1 text-xs text-gray-500">修订 #{binding.request.policy_revision}</div>
                     </td>
                     <td className="px-4 py-3 text-gray-700">
-                      <div>{bindingStateLabels[binding.state]}</div>
+                      <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-semibold ${bindingStateBadgeClass[binding.state]}`}>
+                        {bindingStateLabels[binding.state]}
+                      </span>
                       {binding.message && (
                         <div className="mt-1 max-w-xs break-words text-xs text-gray-500">
                           {binding.message}
@@ -447,11 +473,18 @@ export const RiskEnforcementPage: React.FC = () => {
                   <td className="px-4 py-3 font-mono text-xs text-gray-700">{event.operation}</td>
                   <td className="max-w-sm break-all px-4 py-3 font-mono text-xs text-gray-700">{event.target}</td>
                   <td className="px-4 py-3">
-                    <span className={`rounded-full px-2 py-1 text-xs font-semibold ${
-                      event.blocked ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'
-                    }`}>
-                      {event.blocked ? '已拦截' : event.killed ? '已终止' : '已记录'}
-                    </span>
+                    {(() => {
+                      // observe/audit 仅记录（琥珀）；enforce 已阻断/已终止（红）
+                      const enforced = event.blocked || event.killed;
+                      const resultLabel = event.blocked ? '已阻断' : event.killed ? '已终止' : '仅记录';
+                      return (
+                        <span className={`rounded-full px-2 py-1 text-xs font-semibold ${
+                          enforced ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'
+                        }`}>
+                          {resultLabel}
+                        </span>
+                      );
+                    })()}
                     <div className="mt-2 font-mono text-[11px] text-gray-400">
                       effect {event.effect} ({effectLabels[event.effect]})
                     </div>

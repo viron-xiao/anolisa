@@ -13,6 +13,7 @@ import {
   type SecurityEvidenceEvent,
   type SecurityRiskCase,
   type SecurityRiskCaseDetail,
+  type SecurityReviewStatus,
   type SecuritySessionSummary,
   type SecuritySummary,
 } from '../utils/apiClient';
@@ -44,6 +45,14 @@ const statusLabel: Record<SecurityRiskCase['status'], string> = {
   resolved: '已处置',
 };
 
+// 处置动作二次确认文案
+const reviewConfirmText: Record<'confirmed' | 'false_positive' | 'accepted_risk' | 'resolved', string> = {
+  confirmed: '确认该案件为真实风险？确认后状态将标记为「已确认」。',
+  false_positive: '确认将该案件标记为「误报」？',
+  accepted_risk: '确认「接受风险」？接受后将不再提示处置。',
+  resolved: '确认将该案件标记为「已处置」？',
+};
+
 const eventLabel: Record<string, string> = {
   file_action: '文件读取',
   taint_transition: '标签传递',
@@ -51,6 +60,123 @@ const eventLabel: Record<string, string> = {
   policy_decision: '策略判定',
   enforcement_state: '执行状态',
 };
+
+// Risk conclusions come from the policy DSL `because` clause, which is authored
+// in English on the backend. Translate the known rule reasons to Chinese for
+// display; unknown reasons fall back to the original text unchanged.
+const ruleReasonZh: Record<string, string> = {
+  'credential-derived data reached an untrusted network target': '凭据衍生数据访问了不可信网络目标',
+  'credential reached an untrusted target': '凭据数据访问了不可信目标',
+  'credential taint reached unknown public endpoint': '凭据污点数据到达未知公网目标',
+  'agentsight sensitive file policy': 'AgentSight 敏感文件策略',
+};
+
+function translateRuleReason(reason: string): string {
+  if (!reason) return reason;
+  const key = reason.trim().toLowerCase();
+  return ruleReasonZh[key] ?? reason;
+}
+
+interface ProcessTreeNode {
+  pid: number;
+  ppid: number | null;
+  labels: string[];
+  children: ProcessTreeNode[];
+  hasEvents: boolean;
+}
+
+// Reconstructs the pid -> ppid hierarchy for one case from its evidence events.
+//
+// Primary parent source: `identity.ppid`, captured by the enforcer on the real
+// ActPlane path. Fallback: when a real ppid is unavailable (e.g. mock/dev data
+// or the source event whose ppid is intentionally omitted), parent edges are
+// derived from taint *inheritance* events, where a child process inherits a
+// label from its parent (source_pid -> target_pid). A process referenced only
+// as a parent (no evidence of its own, or whose ppid is outside the set) becomes
+// the tree entry (root).
+function buildProcessTree(evidence: SecurityEvidenceEvent[]): {
+  roots: ProcessTreeNode[];
+  count: number;
+} {
+  const nodes = new Map<number, ProcessTreeNode>();
+  const ensure = (pid: number): ProcessTreeNode => {
+    let node = nodes.get(pid);
+    if (!node) {
+      node = { pid, ppid: null, labels: [], children: [], hasEvents: false };
+      nodes.set(pid, node);
+    }
+    return node;
+  };
+  const labelSets = new Map<number, Set<string>>();
+  const addLabel = (pid: number, label: string) => {
+    const set = labelSets.get(pid) ?? new Set<string>();
+    set.add(label.toUpperCase());
+    labelSets.set(pid, set);
+  };
+
+  for (const item of evidence) {
+    const pid = Number(item.identity.pid);
+    if (!Number.isFinite(pid) || pid <= 0) continue;
+    const node = ensure(pid);
+    node.hasEvents = true;
+    const rawPpid = item.identity.ppid;
+    if (typeof rawPpid === 'number' && rawPpid > 0 && rawPpid !== pid && node.ppid === null) {
+      node.ppid = rawPpid;
+    }
+    if (item.event_type === 'taint_transition') {
+      const label = item.event.label;
+      if (typeof label === 'string' && label.trim()) addLabel(pid, label.trim());
+    }
+  }
+
+  // Fallback parent edges from taint inheritance when no real ppid was captured.
+  for (const item of evidence) {
+    if (item.event_type !== 'taint_transition') continue;
+    if (String(item.event.transition ?? '') !== 'inherit') continue;
+    const sourcePid = Number(item.event.source_pid);
+    const targetPid = Number(item.event.target_pid);
+    if (!Number.isFinite(sourcePid) || !Number.isFinite(targetPid)) continue;
+    if (sourcePid <= 0 || targetPid <= 0 || sourcePid === targetPid) continue;
+    const child = ensure(targetPid);
+    if (child.ppid === null) child.ppid = sourcePid;
+  }
+
+  // Materialize referenced parents so the entry process appears even without
+  // any evidence of its own.
+  for (const node of Array.from(nodes.values())) {
+    if (node.ppid !== null) ensure(node.ppid);
+  }
+  for (const [pid, set] of labelSets) {
+    const node = nodes.get(pid);
+    if (node) node.labels = Array.from(set);
+  }
+
+  const roots: ProcessTreeNode[] = [];
+  for (const node of nodes.values()) {
+    if (node.ppid !== null && nodes.has(node.ppid) && node.ppid !== node.pid) {
+      nodes.get(node.ppid)!.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  const sortNodes = (list: ProcessTreeNode[]) => {
+    list.sort((left, right) => left.pid - right.pid);
+    list.forEach((node) => sortNodes(node.children));
+  };
+  sortNodes(roots);
+  return { roots, count: nodes.size };
+}
+
+function flattenProcessTree(
+  nodes: ProcessTreeNode[],
+  depth: number,
+  out: Array<{ node: ProcessTreeNode; depth: number }>,
+): void {
+  for (const node of nodes) {
+    out.push({ node, depth });
+    flattenProcessTree(node.children, depth + 1, out);
+  }
+}
 
 function formatTime(timestampNs: number): string {
   if (!timestampNs) return '—';
@@ -99,17 +225,35 @@ function containmentEligible(riskCase: SecurityRiskCase): boolean {
     && riskCase.status !== 'resolved';
 }
 
-const StatCard: React.FC<{ label: string; value: React.ReactNode; hint: string }> = ({
-  label,
-  value,
-  hint,
-}) => (
-  <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
-    <p className="text-sm text-gray-500">{label}</p>
-    <p className="mt-2 text-2xl font-semibold text-gray-900">{value}</p>
-    <p className="mt-1 text-xs text-gray-400">{hint}</p>
-  </div>
-);
+const StatCard: React.FC<{
+  label: string;
+  value: React.ReactNode;
+  hint: string;
+  onClick?: () => void;
+  active?: boolean;
+}> = ({ label, value, hint, onClick, active }) => {
+  const interactive = typeof onClick === 'function';
+  return (
+    <div
+      onClick={onClick}
+      role={interactive ? 'button' : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      onKeyDown={interactive ? (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick!();
+        }
+      } : undefined}
+      className={`rounded-xl border bg-white p-4 shadow-sm ${
+        interactive ? 'cursor-pointer transition hover:border-blue-300 hover:shadow-md' : ''
+      } ${active ? 'border-blue-400 ring-1 ring-blue-200' : 'border-gray-200'}`}
+    >
+      <p className="text-sm text-gray-500">{label}</p>
+      <p className="mt-2 text-2xl font-semibold text-gray-900">{value}</p>
+      <p className="mt-1 text-xs text-gray-400">{hint}</p>
+    </div>
+  );
+};
 
 const Pagination: React.FC<{
   offset: number;
@@ -165,6 +309,9 @@ export const SystemAuditPage: React.FC = () => {
   const [error, setError] = useState('');
   const [reviewing, setReviewing] = useState(false);
   const [containmentDialogOpen, setContainmentDialogOpen] = useState(false);
+  const [caseStatusFilter, setCaseStatusFilter] = useState<'all' | SecurityReviewStatus>('all');
+  const [caseBlockedOnly, setCaseBlockedOnly] = useState(false);
+  const [caseSort, setCaseSort] = useState<'time' | 'risk'>('time');
   const caseRequestVersion = useRef(0);
   const reviewRequestVersion = useRef(0);
   const loadRequestVersion = useRef(0);
@@ -240,6 +387,7 @@ export const SystemAuditPage: React.FC = () => {
     status: 'confirmed' | 'false_positive' | 'accepted_risk' | 'resolved',
   ) => {
     if (!selectedCase) return;
+    if (!window.confirm(reviewConfirmText[status])) return;
     reviewRequestVersion.current += 1;
     const reviewVersion = reviewRequestVersion.current;
     const caseVersion = caseRequestVersion.current;
@@ -276,6 +424,21 @@ export const SystemAuditPage: React.FC = () => {
       left.occurred_at_ns - right.occurred_at_ns
     )) : []
   ), [selectedCase]);
+  const processTree = useMemo(() => buildProcessTree(sortedEvidence), [sortedEvidence]);
+  const displayedCases = useMemo(() => {
+    let list = cases;
+    if (caseStatusFilter !== 'all') list = list.filter((item) => item.status === caseStatusFilter);
+    if (caseBlockedOnly) list = list.filter((item) => item.blocked);
+    const sorted = [...list];
+    if (caseSort === 'risk') sorted.sort((left, right) => right.risk_score - left.risk_score);
+    else sorted.sort((left, right) => right.updated_at_ns - left.updated_at_ns);
+    return sorted;
+  }, [cases, caseStatusFilter, caseBlockedOnly, caseSort]);
+  const flatProcessTree = useMemo(() => {
+    const out: Array<{ node: ProcessTreeNode; depth: number }> = [];
+    flattenProcessTree(processTree.roots, 0, out);
+    return out;
+  }, [processTree]);
 
   return (
     <div className="mx-auto w-full max-w-screen-2xl space-y-5 p-6">
@@ -320,8 +483,20 @@ export const SystemAuditPage: React.FC = () => {
         <StatCard label="审计事件" value={summary?.total ?? 0} hint="文件 / 标签 / 网络 / 判定" />
         <StatCard label="关联会话" value={summary?.affected_sessions ?? sessions.length} hint="具备系统行为证据" />
         <StatCard label="风险案件" value={totalCases} hint="规则关联后形成案件" />
-        <StatCard label="待研判" value={openCases} hint="等待安全人员确认" />
-        <StatCard label="确认拦截" value={blockedCases} hint="内核已返回拒绝结果" />
+        <StatCard
+          label="待研判"
+          value={openCases}
+          hint="点击筛选待研判案件"
+          onClick={() => { setActiveTab('cases'); setCaseBlockedOnly(false); setCaseStatusFilter('open'); }}
+          active={activeTab === 'cases' && caseStatusFilter === 'open' && !caseBlockedOnly}
+        />
+        <StatCard
+          label="确认拦截"
+          value={blockedCases}
+          hint="点击筛选已拦截案件"
+          onClick={() => { setActiveTab('cases'); setCaseStatusFilter('all'); setCaseBlockedOnly(true); }}
+          active={activeTab === 'cases' && caseBlockedOnly}
+        />
       </section>
 
       <div className="flex gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
@@ -345,11 +520,48 @@ export const SystemAuditPage: React.FC = () => {
             <div className="border-b border-gray-200 px-5 py-4">
               <h2 className="font-semibold text-gray-900">风险案件</h2>
               <p className="mt-1 text-xs text-gray-500">选择案件查看完整、按时序排列的原始证据。</p>
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                <select
+                  value={caseStatusFilter}
+                  onChange={(event) => setCaseStatusFilter(event.target.value as 'all' | SecurityReviewStatus)}
+                  className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700"
+                >
+                  <option value="all">全部状态</option>
+                  <option value="open">待研判</option>
+                  <option value="confirmed">已确认</option>
+                  <option value="false_positive">误报</option>
+                  <option value="accepted_risk">已接受</option>
+                  <option value="resolved">已处置</option>
+                </select>
+                <select
+                  value={caseSort}
+                  onChange={(event) => setCaseSort(event.target.value as 'time' | 'risk')}
+                  className="rounded border border-gray-300 bg-white px-2 py-1 text-gray-700"
+                >
+                  <option value="time">按时间</option>
+                  <option value="risk">按风险分</option>
+                </select>
+                <label className="flex items-center gap-1 text-gray-600">
+                  <input type="checkbox" checked={caseBlockedOnly} onChange={(event) => setCaseBlockedOnly(event.target.checked)} />
+                  仅已拦截
+                </label>
+                {(caseStatusFilter !== 'all' || caseBlockedOnly) && (
+                  <button
+                    type="button"
+                    onClick={() => { setCaseStatusFilter('all'); setCaseBlockedOnly(false); }}
+                    className="text-blue-600"
+                  >
+                    清除筛选
+                  </button>
+                )}
+              </div>
             </div>
             <div className="divide-y divide-gray-100">
-              {cases.length === 0 ? (
-                <p className="px-5 py-12 text-center text-sm text-gray-400">暂无风险案件</p>
-              ) : cases.map((item) => (
+              {displayedCases.length === 0 ? (
+                <p className="px-5 py-12 text-center text-sm text-gray-400">
+                  {cases.length === 0 ? '暂无风险案件' : '当前筛选条件下暂无案件'}
+                </p>
+              ) : displayedCases.map((item) => (
                 <button
                   key={item.case_id}
                   type="button"
@@ -360,7 +572,7 @@ export const SystemAuditPage: React.FC = () => {
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <p className="font-medium text-gray-900">{item.summary}</p>
+                      <p className="font-medium text-gray-900">{translateRuleReason(item.summary)}</p>
                       <p className="mt-1 text-xs text-gray-500">
                         {item.agent_id} · {item.session_id || '无会话'} · {formatTime(item.updated_at_ns)}
                       </p>
@@ -415,7 +627,7 @@ export const SystemAuditPage: React.FC = () => {
                   <div className="flex flex-wrap items-start justify-between gap-4">
                     <div>
                       <p className="text-xs font-medium text-gray-500">风险结论</p>
-                      <h2 className="mt-1 text-xl font-semibold text-gray-900">{selectedCase.summary}</h2>
+                      <h2 className="mt-1 text-xl font-semibold text-gray-900">{translateRuleReason(selectedCase.summary)}</h2>
                       <p className="mt-2 text-sm text-gray-600">
                         {decisionText(selectedCase)} · 风险分 {selectedCase.risk_score} · 策略修订 #{selectedCase.policy_revision}
                       </p>
@@ -449,6 +661,58 @@ export const SystemAuditPage: React.FC = () => {
                     />
                   )}
                 </div>
+                {flatProcessTree.length > 0 && (
+                  <div className="border-b border-gray-200 p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <h3 className="font-semibold text-gray-900">进程树</h3>
+                      <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-500">
+                        {processTree.count} 个进程
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-gray-500">
+                      根据 PID、PPID 与标签继承事件还原本次风险链路。
+                    </p>
+                    <div className="mt-4 space-y-3">
+                      {flatProcessTree.map(({ node, depth }) => (
+                        <div
+                          key={node.pid}
+                          className="flex items-start gap-2"
+                          style={{ marginLeft: depth * 28 }}
+                        >
+                          {depth > 0 && (
+                            <span className="mt-3 select-none font-mono text-base text-gray-300" aria-hidden="true">
+                              ↳
+                            </span>
+                          )}
+                          <div
+                            className={`flex-1 rounded-lg border px-4 py-3 ${
+                              depth === 0 ? 'border-gray-200 bg-white' : 'border-gray-200 bg-gray-50'
+                            }`}
+                          >
+                            <p className="font-semibold text-gray-900">
+                              {depth === 0 ? `PID ${node.pid}` : `子进程 · PID ${node.pid}`}
+                            </p>
+                            <p className="mt-0.5 text-xs text-gray-500">
+                              {depth === 0 ? '进程树入口' : `父进程 PID ${node.ppid ?? '—'}`}
+                            </p>
+                            {node.labels.length > 0 && (
+                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                {node.labels.map((label) => (
+                                  <span
+                                    key={label}
+                                    className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800"
+                                  >
+                                    {label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="p-5">
                   <h3 className="font-semibold text-gray-900">完整证据链</h3>
                   <div className="mt-4 space-y-1">

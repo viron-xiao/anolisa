@@ -9,6 +9,7 @@ import {
   createCredentialBinding,
   fetchAgentProtectionPreview,
   fetchEnforcementBindings,
+  detachEnforcementBinding,
 } from '../utils/apiClient';
 import type { InterruptionRecord, InterruptionSeverity } from '../utils/apiClient';
 import type { AgentHealthStatus } from '../types';
@@ -60,6 +61,18 @@ interface Toast {
   message: string;
 }
 
+/**
+ * 归一化「保护目录」默认值：仅接受绝对路径且非文件系统根 `/`。
+ * 拿不到有效工作目录（空、相对路径或根 `/`）时返回空串，交给 placeholder
+ * 提示用户手动填写/扫描——绝不 fallback 到 `/`，否则会被后端按
+ * "protection directory cannot be the filesystem root" 拒绝。
+ */
+function defaultProtectionDir(path?: string | null): string {
+  const trimmed = (path ?? '').trim();
+  if (!trimmed || trimmed === '/' || !trimmed.startsWith('/')) return '';
+  return trimmed;
+}
+
 const AgentCard: React.FC<{
   agent: AgentHealthStatus;
   related: AgentHealthStatus[];
@@ -67,21 +80,46 @@ const AgentCard: React.FC<{
   onRestart: (pid: number) => void;
   restarting: boolean;
   protectedByPolicy: boolean;
-  onProtected: (pid: number) => void;
+  bindingId?: string;
+  onProtected: (pid: number, bindingId: string) => void;
+  onDetachProtection: (pid: number, bindingId: string) => Promise<void> | void;
   addToast: (message: string) => void;
-}> = ({ agent, related, onDelete, onRestart, restarting, protectedByPolicy, onProtected, addToast }) => {
+}> = ({ agent, related, onDelete, onRestart, restarting, protectedByPolicy, bindingId, onProtected, onDetachProtection, addToast }) => {
   const [showRelated, setShowRelated] = useState(false);
   const [showProtection, setShowProtection] = useState(false);
   const [protecting, setProtecting] = useState(false);
-  const [directory, setDirectory] = useState(agent.workspace_path ?? '');
+  const [detaching, setDetaching] = useState(false);
+  const [directory, setDirectory] = useState(() => defaultProtectionDir(agent.workspace_path));
   const [sources, setSources] = useState<string[]>([]);
   const [trustedTarget, setTrustedTarget] = useState('');
 
   const loadProtectionDefaults = async (customDirectory?: string) => {
     const preview = await fetchAgentProtectionPreview(agent.pid, customDirectory);
-    setDirectory(preview.workspace_path);
+    // 后端保证 workspace_path 非根，但仍归一化兜底：无效时回退到 agent 真实工作目录，绝不落到 `/`。
+    setDirectory(defaultProtectionDir(preview.workspace_path) || defaultProtectionDir(agent.workspace_path));
     setSources(preview.source_paths);
     return preview;
+  };
+
+  // 「扫描」按钮：先做客户端校验，directory 经归一无效（空/根/相对）时不发后端请求，
+  // 也不 fallback 到 workspace_path（那正是 `/` 的来源），直接给友好中文提示。
+  const handleScan = () => {
+    if (!defaultProtectionDir(directory)) {
+      addToast('请先填写要保护的绝对路径目录');
+      return;
+    }
+    void loadProtectionDefaults(directory).catch((error: any) => addToast(`目录扫描失败: ${error.message}`));
+  };
+
+  // 统一的弹窗打开入口：每次打开都按 agent 真实工作目录重新播种「保护目录」，
+  // 避免停用保护后重开时沿用脏值或退化为 `/`（与首次开启行为一致）。
+  const openProtectionDialog = () => {
+    const seeded = defaultProtectionDir(agent.workspace_path);
+    setDirectory(seeded);
+    setShowProtection(true);
+    // workspace_path 无效（空/根/相对）时不请求后端默认策略，避免后端用 `/`
+    // 触发 400；直接打开弹窗让用户手填/扫描。
+    if (seeded) void loadProtectionDefaults().catch(() => undefined);
   };
 
   const applyProtection = async (sourcePaths?: string[]) => {
@@ -93,7 +131,7 @@ const AgentCard: React.FC<{
     }
     setProtecting(true);
     try {
-      await createCredentialBinding({
+      const created = await createCredentialBinding({
         agent_id: agent.agent_name,
         root_pid: agent.pid,
         source_paths: selected,
@@ -103,7 +141,7 @@ const AgentCard: React.FC<{
         taint_ttl_secs: 900,
         destination_scope: 'public_ipv4',
       });
-      onProtected(agent.pid);
+      onProtected(agent.pid, created.request.binding_id);
       setShowProtection(false);
       addToast('✅ 已开启审计保护：发现风险时记录证据，不阻断 Agent');
     } catch (error: any) {
@@ -114,7 +152,16 @@ const AgentCard: React.FC<{
   };
 
   const enableProtection = async () => {
+    // workspace_path 无效（空/根/相对）时与「设置」一致：不调用自动生成默认策略
+    // 的后端 API（否则后端用 `/` 当保护目录直接 400，弹窗都打不开），改为直接
+    // 打开同一弹窗、目录留空 + placeholder，交用户手填/扫描。
+    if (!defaultProtectionDir(agent.workspace_path)) {
+      openProtectionDialog();
+      return;
+    }
     setProtecting(true);
+    // 重开时先按 agent 真实工作目录重新播种，避免 preview 异常时沿用上一次脏值/根目录。
+    setDirectory(defaultProtectionDir(agent.workspace_path));
     try {
       const preview = await loadProtectionDefaults();
       await applyProtection(preview.source_paths);
@@ -122,6 +169,20 @@ const AgentCard: React.FC<{
       addToast(`无法生成默认策略: ${error.message ?? '请检查 Agent 工作目录'}`);
     } finally {
       setProtecting(false);
+    }
+  };
+
+  const handleDetachProtection = async () => {
+    if (!bindingId) return;
+    const confirmed = window.confirm(
+      '停用后将解除该 Agent 的敏感数据外发保护，发现风险时不再记录证据。\n\n确认停用保护吗？'
+    );
+    if (!confirmed) return;
+    setDetaching(true);
+    try {
+      await onDetachProtection(agent.pid, bindingId);
+    } finally {
+      setDetaching(false);
     }
   };
 
@@ -239,10 +300,17 @@ const AgentCard: React.FC<{
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             {protectedByPolicy ? (
-              <button onClick={() => { setShowProtection(true); void loadProtectionDefaults().catch(() => undefined); }} className="text-xs text-blue-600 hover:text-blue-700">设置</button>
+              <>
+                <button onClick={openProtectionDialog} className="text-xs text-blue-600 hover:text-blue-700">设置</button>
+                {bindingId && (
+                  <button onClick={() => void handleDetachProtection()} disabled={detaching} className="text-xs px-2.5 py-1.5 rounded border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50">
+                    {detaching ? '停用中…' : '停用保护'}
+                  </button>
+                )}
+              </>
             ) : (
               <>
-                <button onClick={() => { setShowProtection(true); void loadProtectionDefaults().catch(() => undefined); }} className="text-xs text-gray-500 hover:text-gray-700">设置</button>
+                <button onClick={openProtectionDialog} className="text-xs text-gray-500 hover:text-gray-700">设置</button>
                 <button onClick={() => void enableProtection()} disabled={protecting} className="text-xs px-2.5 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">
                   {protecting ? '开启中…' : '一键开启'}
                 </button>
@@ -304,7 +372,7 @@ const AgentCard: React.FC<{
               <button onClick={() => setShowProtection(false)} className="text-gray-400 hover:text-gray-600">✕</button>
             </div>
             <label className="block mt-4 text-xs font-medium text-gray-700">保护目录</label>
-            <div className="mt-1 flex gap-2"><input value={directory} onChange={event => setDirectory(event.target.value)} className="min-w-0 flex-1 rounded border border-gray-300 px-3 py-2 text-sm" placeholder="Agent workspace" /><button onClick={() => void loadProtectionDefaults(directory).catch((error: any) => addToast(`目录扫描失败: ${error.message}`))} className="rounded border border-gray-300 px-3 text-xs hover:bg-gray-50">扫描</button></div>
+            <div className="mt-1 flex gap-2"><input value={directory} onChange={event => setDirectory(event.target.value)} className="min-w-0 flex-1 rounded border border-gray-300 px-3 py-2 text-sm" placeholder="未获取到工作目录，请手动填写绝对路径后点扫描" /><button onClick={handleScan} className="rounded border border-gray-300 px-3 text-xs hover:bg-gray-50">扫描</button></div>
             <label className="block mt-4 text-xs font-medium text-gray-700">敏感文件（每行一个）</label>
             <textarea value={sources.join('\n')} onChange={event => setSources(event.target.value.split('\n').map(value => value.trim()).filter(Boolean))} rows={4} className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-xs font-mono" placeholder="扫描后自动填充 .env、credential、私钥等文件" />
             <label className="block mt-4 text-xs font-medium text-gray-700">可信网络目标（可选）</label>
@@ -325,7 +393,7 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [restartingPids, setRestartingPids] = useState<Set<number>>(new Set());
-  const [protectedPids, setProtectedPids] = useState<Set<number>>(new Set());
+  const [protectionBindings, setProtectionBindings] = useState<Map<number, string>>(new Map());
   const hasDataRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -337,7 +405,17 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
       setClientAgents(agentRows.filter(a => a.role !== 'gateway'));
       setLastScan(data.last_scan_time ?? 0);
       void fetchEnforcementBindings().then(({ bindings }) => {
-        setProtectedPids(new Set(bindings.filter(binding => binding.state === 'enforced').map(binding => binding.request.root_pid)));
+        // 活跃 binding = pending/enforced/degraded；建立 root_pid → binding_id 映射用于停用保护
+        const nextBindings = new Map<number, string>();
+        for (const binding of bindings) {
+          if (binding.state !== 'pending' && binding.state !== 'enforced' && binding.state !== 'degraded') continue;
+          const pid = binding.request.root_pid;
+          // enforced 优先于 pending/degraded，避免同 pid 多 binding 时取错
+          if (!nextBindings.has(pid) || binding.state === 'enforced') {
+            nextBindings.set(pid, binding.request.binding_id);
+          }
+        }
+        setProtectionBindings(nextBindings);
       }).catch(() => undefined);
       setError(null);
       hasDataRef.current = true;
@@ -376,6 +454,21 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
       });
     }
   };
+
+  const handleDetachProtection = useCallback(async (pid: number, bindingId: string) => {
+    try {
+      await detachEnforcementBinding(bindingId);
+      setProtectionBindings(prev => {
+        const next = new Map(prev);
+        next.delete(pid);
+        return next;
+      });
+      addToast('✅ 已停用保护');
+      void refresh();
+    } catch (e: any) {
+      addToast(`停用失败: ${e.message ?? '请稍后重试'}`);
+    }
+  }, [addToast, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -461,8 +554,10 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
               onDelete={handleDelete}
               onRestart={handleRestart}
               restarting={restartingPids.has(agent.pid)}
-              protectedByPolicy={protectedPids.has(agent.pid)}
-              onProtected={pid => setProtectedPids(previous => new Set(previous).add(pid))}
+              protectedByPolicy={protectionBindings.has(agent.pid)}
+              bindingId={protectionBindings.get(agent.pid)}
+              onProtected={(pid, bindingId) => setProtectionBindings(previous => new Map(previous).set(pid, bindingId))}
+              onDetachProtection={handleDetachProtection}
               addToast={addToast}
             />
           ))}
