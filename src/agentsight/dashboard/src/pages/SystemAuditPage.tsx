@@ -1,14 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ContainmentDialog } from '../components/ContainmentDialog';
 import { ContainmentLifecycleCard } from '../components/ContainmentLifecycleCard';
+import { Pagination as PaginationNew } from '../components/Pagination';
 import {
   fetchSecurityCase,
   fetchSecurityCases,
   fetchAuditEvents,
   fetchAuditSessions,
   fetchAuditSummary,
+  fetchEnforcementBindings,
   reviewSecurityCase,
+  type EnforcementBinding,
   type SecurityEventRecord,
   type SecurityEvidenceEvent,
   type SecurityRiskCase,
@@ -19,7 +22,7 @@ import {
 } from '../utils/apiClient';
 
 type AuditTab = 'overview' | 'sessions' | 'cases' | 'events';
-const CASE_PAGE_SIZE = 10;
+const CASE_PAGE_SIZE = 20;
 const SESSION_PAGE_SIZE = 20;
 const EVENT_PAGE_SIZE = 50;
 
@@ -292,6 +295,7 @@ const Pagination: React.FC<{
 
 export const SystemAuditPage: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [activeTab, setActiveTab] = useState<AuditTab>('overview');
   const [summary, setSummary] = useState<SecuritySummary | null>(null);
   const [cases, setCases] = useState<SecurityRiskCase[]>([]);
@@ -304,6 +308,7 @@ export const SystemAuditPage: React.FC = () => {
   const [eventTotal, setEventTotal] = useState(0);
   const [eventOffset, setEventOffset] = useState(0);
   const [selectedCase, setSelectedCase] = useState<SecurityRiskCaseDetail | null>(null);
+  const [bindings, setBindings] = useState<EnforcementBinding[]>([]);
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState('');
@@ -312,6 +317,9 @@ export const SystemAuditPage: React.FC = () => {
   const [caseStatusFilter, setCaseStatusFilter] = useState<'all' | SecurityReviewStatus>('all');
   const [caseBlockedOnly, setCaseBlockedOnly] = useState(false);
   const [caseSort, setCaseSort] = useState<'time' | 'risk'>('time');
+  const [caseAgentFilter, setCaseAgentFilter] = useState<string | null>(() => searchParams.get('agent_id'));
+  const [eventNextOffset, setEventNextOffset] = useState<number | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const caseRequestVersion = useRef(0);
   const reviewRequestVersion = useRef(0);
   const loadRequestVersion = useRef(0);
@@ -325,6 +333,7 @@ export const SystemAuditPage: React.FC = () => {
       fetchSecurityCases({ limit: CASE_PAGE_SIZE, offset: caseOffset }),
       fetchAuditSessions({ limit: SESSION_PAGE_SIZE, offset: sessionOffset }),
       fetchAuditEvents({ limit: EVENT_PAGE_SIZE, offset: eventOffset, include_details: true }),
+      fetchEnforcementBindings(),
     ]);
     if (loadRequestVersion.current !== version) return;
     const failures = results.filter((result) => result.status === 'rejected');
@@ -340,6 +349,10 @@ export const SystemAuditPage: React.FC = () => {
     if (results[3].status === 'fulfilled') {
       setEvents(results[3].value.data.items);
       setEventTotal(results[3].value.data.total);
+      setEventNextOffset(results[3].value.data.next_offset ?? null);
+    }
+    if (results[4].status === 'fulfilled') {
+      setBindings(results[4].value.bindings);
     }
     setError(failures.length ? errorText((failures[0] as PromiseRejectedResult).reason) : '');
     setLoading(false);
@@ -417,28 +430,74 @@ export const SystemAuditPage: React.FC = () => {
   const totalCases = summary?.risk_cases_total ?? caseTotal;
   const openCases = summary?.risk_cases_open ?? 0;
   const blockedCases = summary?.risk_cases_blocked ?? 0;
-  const casePage = Math.floor(caseOffset / CASE_PAGE_SIZE) + 1;
-  const casePageCount = Math.max(1, Math.ceil(caseTotal / CASE_PAGE_SIZE));
   const sortedEvidence = useMemo(() => (
     selectedCase ? [...selectedCase.evidence].sort((left, right) => (
       left.occurred_at_ns - right.occurred_at_ns
     )) : []
   ), [selectedCase]);
   const processTree = useMemo(() => buildProcessTree(sortedEvidence), [sortedEvidence]);
+  // 当前案件对应 agent 的活跃保护状态：匹配 enforced/pending/degraded binding。
+  // mode 含 enforce → 拦截保护；含 audit/observe → 审计保护；无活跃 binding → 未保护。
+  const caseProtection = useMemo<'enforce' | 'audit' | 'none'>(() => {
+    if (!selectedCase) return 'none';
+    const active = bindings.filter((binding) => (
+      binding.request.agent_id === selectedCase.agent_id
+      && (binding.state === 'enforced' || binding.state === 'pending' || binding.state === 'degraded')
+    ));
+    if (active.length === 0) return 'none';
+    if (active.some((binding) => binding.request.policy_mode === 'enforce')) return 'enforce';
+    return 'audit';
+  }, [bindings, selectedCase]);
   const displayedCases = useMemo(() => {
     let list = cases;
+    if (caseAgentFilter) list = list.filter((item) => item.agent_id === caseAgentFilter);
     if (caseStatusFilter !== 'all') list = list.filter((item) => item.status === caseStatusFilter);
     if (caseBlockedOnly) list = list.filter((item) => item.blocked);
     const sorted = [...list];
     if (caseSort === 'risk') sorted.sort((left, right) => right.risk_score - left.risk_score);
     else sorted.sort((left, right) => right.updated_at_ns - left.updated_at_ns);
     return sorted;
-  }, [cases, caseStatusFilter, caseBlockedOnly, caseSort]);
+  }, [cases, caseAgentFilter, caseStatusFilter, caseBlockedOnly, caseSort]);
   const flatProcessTree = useMemo(() => {
     const out: Array<{ node: ProcessTreeNode; depth: number }> = [];
     flattenProcessTree(processTree.roots, 0, out);
     return out;
   }, [processTree]);
+
+  // URL 参数: case_id 自动展开
+  useEffect(() => {
+    const caseIdParam = searchParams.get('case_id');
+    if (caseIdParam && cases.length > 0) {
+      const match = cases.find((c) => c.case_id === caseIdParam);
+      if (match) {
+        setActiveTab('cases');
+        void openCase(match.case_id);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cases]);
+
+  const loadMoreEvents = async () => {
+    if (eventNextOffset === null || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const result = await fetchAuditEvents({ limit: EVENT_PAGE_SIZE, offset: eventNextOffset, include_details: true });
+      setEvents((prev) => [...prev, ...result.data.items]);
+      setEventTotal(result.data.total);
+      setEventNextOffset(result.data.next_offset ?? null);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const clearAgentFilter = () => {
+    setCaseAgentFilter(null);
+    const next = new URLSearchParams(searchParams);
+    next.delete('agent_id');
+    setSearchParams(next);
+  };
 
   return (
     <div className="mx-auto w-full max-w-screen-2xl space-y-5 p-6">
@@ -554,6 +613,12 @@ export const SystemAuditPage: React.FC = () => {
                     清除筛选
                   </button>
                 )}
+                {caseAgentFilter && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs text-blue-700">
+                    已按 Agent: {caseAgentFilter} 过滤
+                    <button type="button" onClick={clearAgentFilter} className="ml-0.5 text-blue-500 hover:text-blue-800">✕</button>
+                  </span>
+                )}
               </div>
             </div>
             <div className="divide-y divide-gray-100">
@@ -591,28 +656,12 @@ export const SystemAuditPage: React.FC = () => {
               ))}
             </div>
             {caseTotal > CASE_PAGE_SIZE && (
-              <div className="flex items-center justify-between border-t border-gray-200 px-5 py-3 text-xs text-gray-500">
-                <span>{caseOffset + 1}–{Math.min(caseOffset + cases.length, caseTotal)} / {caseTotal}</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={caseOffset === 0 || loading}
-                    onClick={() => setCaseOffset((current) => Math.max(0, current - CASE_PAGE_SIZE))}
-                    className="rounded border px-2 py-1 disabled:text-gray-300"
-                  >
-                    上一页
-                  </button>
-                  <span>{casePage}/{casePageCount}</span>
-                  <button
-                    type="button"
-                    disabled={caseOffset + CASE_PAGE_SIZE >= caseTotal || loading}
-                    onClick={() => setCaseOffset((current) => current + CASE_PAGE_SIZE)}
-                    className="rounded border px-2 py-1 disabled:text-gray-300"
-                  >
-                    下一页
-                  </button>
-                </div>
-              </div>
+              <PaginationNew
+                total={caseTotal}
+                limit={CASE_PAGE_SIZE}
+                offset={caseOffset}
+                onPageChange={setCaseOffset}
+              />
             )}
           </div>
 
@@ -627,7 +676,16 @@ export const SystemAuditPage: React.FC = () => {
                   <div className="flex flex-wrap items-start justify-between gap-4">
                     <div>
                       <p className="text-xs font-medium text-gray-500">风险结论</p>
-                      <h2 className="mt-1 text-xl font-semibold text-gray-900">{translateRuleReason(selectedCase.summary)}</h2>
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <h2 className="text-xl font-semibold text-gray-900">{translateRuleReason(selectedCase.summary)}</h2>
+                        {caseProtection === 'enforce' ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">拦截保护中</span>
+                        ) : caseProtection === 'audit' ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">审计保护中</span>
+                        ) : (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600">未保护</span>
+                        )}
+                      </div>
                       <p className="mt-2 text-sm text-gray-600">
                         {decisionText(selectedCase)} · 风险分 {selectedCase.risk_score} · 策略修订 #{selectedCase.policy_revision}
                       </p>
@@ -647,7 +705,7 @@ export const SystemAuditPage: React.FC = () => {
                     {!selectedCase.containment && (
                       <button type="button" disabled={reviewing} onClick={() => void review('resolved')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">标记已处置</button>
                     )}
-                    <button type="button" onClick={() => navigate('/enforcement')} className="rounded border border-blue-200 px-3 py-1.5 text-blue-700">查看拦截策略</button>
+                    <button type="button" onClick={() => navigate(`/enforcement?highlight_binding=${selectedCase.containment?.binding_id || ''}&policy_id=${selectedCase.policy_id || ''}`)} className="rounded border border-blue-200 px-3 py-1.5 text-blue-700">查看拦截策略</button>
                   </div>
                   {(containmentEligible(selectedCase) || selectedCase.containment) && (
                     <ContainmentLifecycleCard
@@ -790,6 +848,18 @@ export const SystemAuditPage: React.FC = () => {
               loading={loading}
               onChange={setEventOffset}
             />
+          )}
+          {eventNextOffset !== null && (
+            <div className="border-t border-gray-200 px-5 py-3 text-center">
+              <button
+                type="button"
+                disabled={loadingMore}
+                onClick={() => void loadMoreEvents()}
+                className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                {loadingMore ? '加载中...' : '加载更多'}
+              </button>
+            </div>
           )}
         </section>
       )}

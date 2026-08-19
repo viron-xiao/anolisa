@@ -10,6 +10,7 @@ import {
   fetchAgentProtectionPreview,
   fetchEnforcementBindings,
   detachEnforcementBinding,
+  fetchSecurityCases,
 } from '../utils/apiClient';
 import type { InterruptionRecord, InterruptionSeverity } from '../utils/apiClient';
 import type { AgentHealthStatus } from '../types';
@@ -81,10 +82,11 @@ const AgentCard: React.FC<{
   restarting: boolean;
   protectedByPolicy: boolean;
   bindingId?: string;
+  pendingCaseCount: number;
   onProtected: (pid: number, bindingId: string) => void;
   onDetachProtection: (pid: number, bindingId: string) => Promise<void> | void;
   addToast: (message: string) => void;
-}> = ({ agent, related, onDelete, onRestart, restarting, protectedByPolicy, bindingId, onProtected, onDetachProtection, addToast }) => {
+}> = ({ agent, related, onDelete, onRestart, restarting, protectedByPolicy, bindingId, pendingCaseCount, onProtected, onDetachProtection, addToast }) => {
   const [showRelated, setShowRelated] = useState(false);
   const [showProtection, setShowProtection] = useState(false);
   const [protecting, setProtecting] = useState(false);
@@ -297,6 +299,23 @@ const AgentCard: React.FC<{
                 ? (sources.length > 0 ? `审计保护中 · ${sources.length} 个敏感源` : '审计保护中')
                 : '默认保护工作目录中的凭据文件'}
             </div>
+            {protectedByPolicy && (
+              <>
+                {pendingCaseCount > 0 && (
+                  <a href={`#/audit?agent_id=${encodeURIComponent(agent.agent_name)}`}
+                     className="inline-flex items-center gap-1 text-xs text-red-600 hover:underline mt-1">
+                    <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                    {pendingCaseCount} 件待研判
+                  </a>
+                )}
+                <div className="flex gap-3 mt-1">
+                  <a href={`#/audit?agent_id=${encodeURIComponent(agent.agent_name)}`}
+                     className="text-xs text-blue-600 hover:underline">查看案件</a>
+                  <a href={`#/enforcement?agent_id=${encodeURIComponent(agent.agent_name)}`}
+                     className="text-xs text-blue-600 hover:underline">查看拦截</a>
+                </div>
+              </>
+            )}
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             {protectedByPolicy ? (
@@ -394,6 +413,8 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
   const [error, setError] = useState<string | null>(null);
   const [restartingPids, setRestartingPids] = useState<Set<number>>(new Set());
   const [protectionBindings, setProtectionBindings] = useState<Map<number, string>>(new Map());
+  // agent_id → 待研判（status==='open'）案件数，用于 AgentCard badge
+  const [pendingCasesByAgent, setPendingCasesByAgent] = useState<Map<string, number>>(new Map());
   const hasDataRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -416,6 +437,15 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
           }
         }
         setProtectionBindings(nextBindings);
+      }).catch(() => undefined);
+      // 同一加载流程内附带拉取风险案件，按 agent_id 分组统计待研判（open）数量
+      void fetchSecurityCases({ limit: 500 }).then((response) => {
+        const counts = new Map<string, number>();
+        for (const riskCase of response.data.items) {
+          if (riskCase.status !== 'open') continue;
+          counts.set(riskCase.agent_id, (counts.get(riskCase.agent_id) ?? 0) + 1);
+        }
+        setPendingCasesByAgent(counts);
       }).catch(() => undefined);
       setError(null);
       hasDataRef.current = true;
@@ -556,6 +586,7 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
               restarting={restartingPids.has(agent.pid)}
               protectedByPolicy={protectionBindings.has(agent.pid)}
               bindingId={protectionBindings.get(agent.pid)}
+              pendingCaseCount={pendingCasesByAgent.get(agent.agent_name) ?? 0}
               onProtected={(pid, bindingId) => setProtectionBindings(previous => new Map(previous).set(pid, bindingId))}
               onDetachProtection={handleDetachProtection}
               addToast={addToast}
