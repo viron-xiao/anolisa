@@ -116,6 +116,44 @@ env | grep '^TOKENLESS_'
 
 确认没有意外设置 `TOKENLESS_STATS_ENABLED=0`，并检查自定义数据库路径是否仍位于真实用户 home 或选定的数据目录下。
 
+## Schema 压缩没有统计记录
+
+Schema 压缩的接入方式因宿主而异：
+
+- **cosh 与 Cosh-NG**：通过 `BeforeModel` Hook 在每次模型调用前运行；本节的告警来自该 Hook。
+- **OpenCode**：通过其 `tool.definition` 插件 Hook 逐个压缩工具定义，不走 `BeforeModel`。MCP 工具不经过该 Hook，因此工具集只有 MCP 工具时不会有记录，下面的 `BeforeModel` 告警也不适用。
+- **Qwen Code**：扩展清单里带有 `BeforeModel` Hook 条目，但当前 Qwen Code 版本未实现该 Hook 事件：其 Hook 注册器会跳过未知事件名，实际只注册其余 Hook 组，Schema Hook 不会运行。Qwen Code 上没有 `compress-schema` 记录属于预期行为，本节无法用于诊断。
+
+在实际运行该 Hook 的宿主上没有 `compress-schema` 记录时，按以下顺序排查：
+
+### 1. 确认确实有可压缩内容
+
+统计只记录实际产生 Token 节省的调用，压缩结果不比原文更小就不会记录。内置工具的描述通常较短（低于 256 字符函数描述 / 160 字符参数描述的截断阈值，也没有可移除的 `title` 或 `examples`），压缩没有收益，零记录属于预期行为。用当前工具声明直接验证——请把下面的示例数组替换为你的真实工具声明（合法 JSON 数组，不要保留占位文本、尖括号或外侧引号）：
+
+```bash
+echo '[{"name":"example_tool","description":"这是一段刻意写得足够长的示例工具描述，用于演示 Schema 压缩效果，它必须超过函数描述二百五十六个字符的截断阈值，才能产生可记录的压缩收益。这是一段刻意写得足够长的示例工具描述，用于演示 Schema 压缩效果，它必须超过函数描述二百五十六个字符的截断阈值，才能产生可记录的压缩收益。这是一段刻意写得足够长的示例工具描述，用于演示 Schema 压缩效果，它必须超过函数描述二百五十六个字符的截断阈值，才能产生可记录的压缩收益。这是一段刻意写得足够长的示例工具描述，用于演示 Schema 压缩效果，它必须超过函数描述二百五十六个字符的截断阈值，才能产生可记录的压缩收益。"}]' | tokenless compress-schema --batch
+```
+
+如果 stderr 输出 `did not reduce size`，说明当前工具集没有可压缩内容；带有长描述的工具集（例如部分 MCP 工具）会正常产生记录。
+
+### 2. 确认 BeforeModel Hook 已触发
+
+在 cosh 与 Cosh-NG 上，BeforeModel 事件没有可供 Schema 压缩处理的内容时，Hook 会给出以下警告之一（每条均为每个会话最多一次）并原样放行：
+
+```text
+[tokenless] WARNING: BeforeModel payload is not a JSON object ...
+[tokenless] WARNING: BeforeModel payload carries no llm_request object ...
+[tokenless] WARNING: BeforeModel event carries no tool declarations ...
+```
+
+第一条警告表示 Hook 收到的负载不是 JSON 对象；第二条表示负载缺少 `llm_request` 对象；第三条表示宿主已发射 BeforeModel，但事件格式不带工具声明（`llm_request.config.tools` 或 `llm_request.tools`），应升级或检查宿主的 Hook 协议版本。既没有警告也没有记录时，说明 BeforeModel 根本没有触发，确认：
+
+- 扩展或插件已安装并启用（`anolisa adapter status tokenless`）。
+- 宿主配置没有禁用 Hooks。
+- 宿主版本支持 BeforeModel 事件。
+
+之后按[启用后没有产生统计记录](#启用后没有产生统计记录)的通用步骤继续排查。
+
 ## Adapter 启用失败
 
 常见原因：

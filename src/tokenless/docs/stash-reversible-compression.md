@@ -13,11 +13,11 @@ called **stash** to avoid the proprietary abbreviation.
 ## How it works
 
 1. **Compress**: `ResponseCompressor` truncates oversized arrays (default:
-   keep the first 32 items). The dropped tail is serialized to JSON and
-   `stash.stash(payload)` stores it, returning a 24-hex BLAKE3 key plus a
-   store-wide, monotonically increasing ownership token used if the write must
-   later be rolled back. Tokens are never reused after expiry, deletion, or
-   eviction.
+   keep the first 32 and the last 8 items). The dropped middle items are
+   serialized to JSON and `stash.stash(payload)` stores them, returning a
+   24-hex BLAKE3 key plus a store-wide, monotonically increasing ownership
+   token used if the write must later be rolled back. Tokens are never reused
+   after expiry, deletion, or eviction.
 2. **Mark**: the truncation marker becomes
    `<... N items truncated, retrieve with <<tokenless:KEY>>`.
 3. **Retrieve**: the LLM emits the marker (or the bare key); the agent calls
@@ -120,14 +120,14 @@ signed SQLite generation limit is exhausted.
 ```bash
 # Compress with stash on by default — dropped array items become retrievable.
 echo '[1,2,...,200]' | tokenless compress-response --truncate-arrays-at 5
-# -> [1,2,3,4,5,"<... 195 items truncated, retrieve with <<tokenless:c30c…>>"]
+# -> [1,2,3,4,5,"<... 187 items truncated, retrieve with <<tokenless:c30c…>>",193,…,200]
 
 # Retrieve the original dropped items (same stash db, separate process).
 tokenless retrieve c30ccf5ed1125e0ed871ba8e
-# -> [6,7,8,…,200]
+# -> [6,7,8,…,192]
 
 # Pass the whole truncation line; the hash is extracted automatically.
-tokenless retrieve "<... 195 items truncated, retrieve with <<tokenless:c30c…>>"
+tokenless retrieve "<... 187 items truncated, retrieve with <<tokenless:c30c…>>"
 
 # Opt out of stash (lossy truncation, the pre-stash behavior).
 echo '[...]' | tokenless compress-response --no-stash
@@ -164,8 +164,11 @@ payload" rather than an injection.
 - **Compress path**: if the stash cannot be opened (invalid data directory,
   directory cannot be created, db open fails) or `stash()` errors, compression
   proceeds without stash and the marker degrades to the plain
-  `<... N more items truncated>` form. Compression never fails because of the
-  stash.
+  `<... N more items truncated, not stashed>` form. The trailing `, not
+  stashed` clause also keeps the plain marker TOON-safe: it forces the TOON
+  encoder to quote the string, so `compress-toon`/`decompress-toon`
+  round-trip it intact (the stash marker is quoted for the same reason).
+  Compression never fails because of the stash.
 - **Retrieve path**: retrieve is user-initiated, so failures surface as
   errors (exit 1) rather than being swallowed.
 

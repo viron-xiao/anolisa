@@ -217,7 +217,7 @@ Skill workflow:
 
 ### Architecture Overview
 
-Skill Ledger is recommended in combination with SkillFS: SkillFS captures Skill changes and notifies the Skill Ledger daemon to scan and refresh `.skill-meta/activation.json`/xattr. Host hooks/capabilities can still be mounted by default with `policy = "ask"`; the user is prompted when the unified exposure summary carries a `message`, and stays silent when there is no `message` or the user has already made a decision.
+Skill Ledger is recommended in combination with SkillFS: SkillFS captures Skill changes and notifies the Skill Ledger daemon to scan and refresh `.skill-meta/activation.json`/xattr. Host hooks/capabilities remain available as compatibility paths. Hosts with native approval or notice support default to `policy = "ask"`; Hermes defaults to `policy = "observe"` because its Python plugin API exposes neither mechanism.
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -248,7 +248,7 @@ Skill Ledger is recommended in combination with SkillFS: SkillFS captures Skill 
 ```
 
 - **Recommended path — SkillFS + daemon activation**: SkillFS discovers Skill file changes; the daemon refreshes the executable activation target based on the latest signed manifest, user decisions, and the activation policy. The Agent runtime reads activation metadata instead of relying on host hook pre-checks by default.
-- **Compatibility path — host hook/capability policy**: OpenClaw, Hermes, copilot-shell, and Qwen Code call `agent-sec-cli skill-ledger show` before a Skill loads; Codex and Qoder CLI run a read-only `agent-sec-cli skill-ledger check` at their respective local Skill trigger boundaries. The default is `ask`; `observe` / `warn` / `block` can be configured explicitly, and legacy `debug` remains an alias for `observe`.
+- **Compatibility path — host hook/capability policy**: OpenClaw, Hermes, copilot-shell, and Qwen Code call `agent-sec-cli skill-ledger show` before a Skill loads; Codex and Qoder CLI run a read-only `agent-sec-cli skill-ledger check` at their respective local Skill trigger boundaries. Hermes supports `observe` / `block` and defaults to `observe`; the other hosts retain their native `observe` / `warn` / `ask` / `block` behavior and defaults.
 - **Agent-driven scanning**: `scan` runs the built-in quick scan and signs the result; the `skill-ledger` Skill drives the full four-phase security review when the user requests a deep scan, importing results via `certify --findings`. **Triggered on demand**, initiated by user request.
 
 ### Recommended Path: SkillFS + Daemon Activation
@@ -378,15 +378,19 @@ boundaries, see
 
 Host adapters use `SKILL_LEDGER_HOOK_ENABLED` as the kill switch and
 `SKILL_LEDGER_MODE` as the behavior selector. The switch defaults to `true`; the policy
-defaults to `ask` and accepts `observe`, `warn`, `ask`, or `block`. `observe` runs the check and
-audit path without a user-visible message. Legacy `debug` maps to `observe`, while legacy `deny`
-maps to `block`. An environment policy overrides Hermes or OpenClaw capability configuration.
+defaults to `ask` on hosts with native approval/notice support. Hermes defaults to `observe` and
+accepts only `observe` or `block`; its legacy `warn` / `ask` values fall back to `observe` with a
+host diagnostic. `observe` runs the check and audit path without a user-visible message. Legacy
+`debug` maps to `observe`, while legacy `deny` maps to `block`. An environment policy overrides
+Hermes or OpenClaw capability configuration.
 
 The host Agent reads these variables when it loads the plugin. Restart the Agent process that
 hosts the hook after changing them; the hook and agent-sec-core are not separate policy services.
 
-When a hook cannot request approval, `ask` falls back to `warn`. When a hook cannot enforce a
-block at its current boundary, `block` also falls back to `warn` and must not claim enforcement.
+On hosts other than Hermes, a hook that cannot request approval may fall back from `ask` to
+`warn`. Hermes never simulates either action by rewriting the assistant's final response; its
+unsupported values fall back to `observe`. When another host cannot enforce a block at its
+current boundary, it must not claim enforcement.
 Set `SKILL_LEDGER_HOOK_ENABLED=false` to skip input processing, key initialization, and CLI calls.
 
 ### Compatibility Path: Hook / Capability Policy
@@ -400,11 +404,15 @@ When the Agent loads a Skill, the OpenClaw, Hermes, copilot-shell, and Qwen Code
 | `ask` | Default. `message == null` passes silently; `message != null` requests user confirmation or uses the host approval UI. |
 | `block` | `message != null` blocks directly, using the message as the reason or alert text. |
 
+Hermes implements only the `observe` and `block` rows. Its `warn` / `ask` compatibility values
+become `observe` with a diagnostic and never enter the assistant response through
+`transform_llm_output`.
+
 The trigger rules for `message` are decided uniformly by Skill Ledger: no prompt when the user already has an `allow` / `always_allow` / `rollback` / `block` decision; no prompt when latest is `pass` or `warn` and directly exposable; a prompt when there is no user decision and latest is `deny` / `none` / `drifted` / `tampered`, explaining whether the current active version is a fallback or a safe pending-review stub. `latestStatus=unmanaged` means the daemon cannot manage this root and cannot write `.skill-meta` or record user decisions, so it is returned as diagnostics only with `message=null`, and every hook policy including `block` passes silently.
 
 Codex and Qoder CLI are low-level integrity gates that run `skill-ledger check <skill_dir>` after canonical-path and root-boundary validation. Codex resolves `$skill-name` references at `UserPromptSubmit`; because that boundary cannot request approval, `ask` falls back to `warn`. Qoder CLI registers a dedicated `PreToolUse` hook for the `Skill` tool, builds user → project directory tables from the absolute `cwd` in the event, and parses the `SKILL.md` frontmatter `name` (falling back to the directory name when frontmatter is absent). When Qoder frontmatter exists but `name` is missing, ambiguous, or uses a YAML scalar the hook cannot safely parse, the call is not downgraded to a non-local Skill — it is handled per the current policy. `pass` passes silently; `none` / `drifted` / `warn` / `deny` / `tampered` and `error` are audited silently, warned and passed, sent for confirmation where supported, or blocked per the `observe` / `warn` / `ask` / `block` policy. Qoder CLI unavailability, execution failure, timeout, or unparseable output is also handled by this four-level policy rather than a fixed fail-open; legacy `debug` is only an alias for `observe`.
 
-All six adapters enable Skill Ledger by default with policy `ask`; copilot-shell, Codex, Qoder CLI, and Qwen Code register their corresponding hook boundaries in their default manifests. OpenClaw and Hermes can also take capability configuration, while `SKILL_LEDGER_MODE` remains the deployment-level override. Apart from the explicitly documented Qoder CLI low-level gate above, the other compatibility hooks remain fail-open when the CLI infrastructure misbehaves, avoiding blocked Skill loads.
+All six adapters enable Skill Ledger by default. Hermes uses policy `observe`; the other adapters retain policy `ask`. copilot-shell, Codex, Qoder CLI, and Qwen Code register their corresponding hook boundaries in their default manifests. OpenClaw and Hermes can also take capability configuration, while `SKILL_LEDGER_MODE` remains the deployment-level override. Apart from the explicitly documented Qoder CLI low-level gate above, the other compatibility hooks remain fail-open when the CLI infrastructure misbehaves, avoiding blocked Skill loads.
 
 The copilot-shell hook currently covers three directory classes — project / user / system: `<cwd>/.copilot-shell/skills/`, `~/.copilot-shell/skills/`, and the RPM and raw-install system roots `/usr/share/anolisa/skills/` and `/usr/local/share/anolisa/skills/`. Skills from custom, extension, remote, or other paths make the hook fail open and skip the skill-ledger check; the OpenClaw plugin extracts the Skill directory from the `SKILL.md` path it reads.
 
@@ -429,9 +437,14 @@ For batch certification or post-install certification, complete directory resolu
 [capabilities.skill-ledger]
 enabled = true
 timeout = 5
-policy = "ask"
-enable_block = false
+policy = "observe"
 ```
+
+Hermes supports `observe` and native `block` only. Existing `warn` / `ask` values map to
+`observe` with a host diagnostic; `enable_block=false` also maps to `observe` for legacy config.
+In Hermes `observe` mode, a non-empty exposure summary is logged at `INFO`, while `deny` and
+`tampered` statuses or a `reasonCode=tampered` activation result are elevated to `WARNING`.
+These log levels do not block the Skill or write content into the assistant response.
 
 **Configuring copilot-shell**: the default Cosh manifest already registers the `skill-ledger` hook. The default policy is `ask`; for observe-only, warning-only, or hard denial, set `SKILL_LEDGER_MODE=observe` / `warn` / `block`. The `debug` value remains an alias for `observe`. This environment variable should be set by a trusted host or deployment environment — not by Skills, project scripts, or untrusted shell startup logic; to prevent policy downgrades via a tampered local shell profile, it should eventually move to a trusted host configuration source.
 

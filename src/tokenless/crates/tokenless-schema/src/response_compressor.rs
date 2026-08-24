@@ -25,6 +25,13 @@ pub struct ResponseCompressor {
     drop_fields: HashSet<String>,
     truncate_strings_at: usize,
     truncate_arrays_at: usize,
+    /// Number of items preserved from the tail of a truncated array. When
+    /// non-zero and the array exceeds `truncate_arrays_at`, the compressor
+    /// keeps `head + tail` items with a truncation marker in between, so
+    /// ground-truth facts near the end (error codes, final-status entries)
+    /// are not silently dropped. When zero, the compressor falls back to
+    /// pure head-only truncation.
+    array_tail_preserve: usize,
     drop_nulls: bool,
     drop_empty_fields: bool,
     max_depth: usize,
@@ -72,6 +79,13 @@ impl Default for ResponseCompressor {
             drop_fields,
             truncate_strings_at: 4096,
             truncate_arrays_at: 32,
+            // Preserve 8 items from the tail of truncated arrays so
+            // ground-truth facts near the end (error codes, final-status
+            // entries, terminal diff hunks) survive compression. At 32+8=40
+            // items the token cost is modest while covering the empirically
+            // observed pattern of key information landing in the last
+            // quarter of an array.
+            array_tail_preserve: 8,
             drop_nulls: true,
             drop_empty_fields: true,
             // Runtime responses rarely nest beyond a handful of levels in
@@ -107,6 +121,15 @@ impl ResponseCompressor {
     /// Set the maximum array length before truncation
     pub fn with_truncate_arrays_at(mut self, len: usize) -> Self {
         self.truncate_arrays_at = len;
+        self
+    }
+
+    /// Set how many items from the tail of a truncated array are preserved.
+    /// Zero disables tail preservation (pure head-only truncation). Values
+    /// large enough to cover the array together with the head limit keep
+    /// every item: truncation only drops items beyond the combined budget.
+    pub fn with_array_tail_preserve(mut self, n: usize) -> Self {
+        self.array_tail_preserve = n;
         self
     }
 
@@ -368,57 +391,83 @@ impl ResponseCompressor {
         }
     }
 
-    /// Compress an array, truncating if necessary
+    /// Compress an array, truncating if necessary.
+    ///
+    /// When `array_tail_preserve` is non-zero and the array exceeds the
+    /// head limit, items from the tail are preserved alongside the head
+    /// with a truncation marker in between. This prevents ground-truth
+    /// facts near the end of long arrays (error codes, final-status
+    /// entries, terminal diff hunks) from being silently dropped.
     fn compress_array(&self, arr: &[Value], depth: usize) -> Value {
         let mut result = Vec::new();
-        let truncate = arr.len() > self.truncate_arrays_at;
-        let limit = if truncate {
-            self.truncate_arrays_at
+        let head_limit = self.truncate_arrays_at;
+        // Truncation drops middle items only when the array exceeds both
+        // the head limit AND the combined head+tail budget. The budget uses
+        // saturating arithmetic: `array_tail_preserve` reaches the public
+        // API/CLI as an unconstrained `usize`, and a saturated budget just
+        // means head+tail covers the whole array, so no item is dropped and
+        // every index derived below stays within `arr`.
+        let head_tail_budget = head_limit.saturating_add(self.array_tail_preserve);
+        let truncate = arr.len() > head_limit && arr.len() > head_tail_budget;
+        // Tail preserves items from the end: the configured count when
+        // truncation drops middle items, or the overflow beyond head_limit
+        // when head+tail covers the array (no items lost).
+        let tail_count = if truncate {
+            self.array_tail_preserve
+        } else if arr.len() > head_limit {
+            arr.len() - head_limit
+        } else {
+            0
+        };
+        let head_end = if arr.len() > head_limit {
+            head_limit
         } else {
             arr.len()
         };
 
-        for item in arr.iter().take(limit) {
-            let compressed = self.compress_value(item, depth + 1);
-
-            // Skip null values if configured
-            if self.drop_nulls && compressed.is_null() {
-                continue;
-            }
-
-            // Skip empty values if configured
-            if self.drop_empty_fields && self.is_empty_value(&compressed) {
-                continue;
-            }
-
-            result.push(compressed);
+        // Process head items
+        for item in arr.iter().take(head_end) {
+            self.push_compressed_if_kept(&mut result, item, depth);
         }
 
-        // Add truncation marker if array was truncated
+        // Truncation marker sits between head and tail
         if truncate && self.add_truncation_marker {
-            let remaining = arr.len() - self.truncate_arrays_at;
-            // NOTE: the dropped slice is captured BEFORE compress_value runs,
-            // so stashed items preserve fields the compressor would otherwise
-            // strip (drop_fields like `debug`/`stacktrace`, nulls, depth
-            // limits). This is intentional — retrieval must yield the
-            // original content verbatim — but it means drop_fields serves no
-            // data-hygiene purpose for stashed content; if a field must not
-            // survive in the stash DB, strip it upstream of the compressor.
-            let dropped = &arr[self.truncate_arrays_at..];
+            let tail_start = arr.len() - tail_count;
+            let remaining = tail_start - head_end;
+            let dropped = &arr[head_end..tail_start];
             let marker = match self.stash_dropped(dropped) {
                 Some(key) => format!(
                     "<... {} items truncated, retrieve with {}>",
                     remaining,
                     marker_for(&key)
                 ),
-                None => format!("<... {} more items truncated>", remaining),
+                None => format!("<... {} more items truncated, not stashed>", remaining),
             };
             result.push(Value::String(marker));
         } else if truncate && self.stash_store.is_some() {
             self.mark_unrecoverable_truncation();
         }
 
+        // Process tail items
+        for item in arr.iter().skip(arr.len() - tail_count) {
+            self.push_compressed_if_kept(&mut result, item, depth);
+        }
+
         Value::Array(result)
+    }
+
+    /// Compress and conditionally push a single item, skipping nulls and
+    /// empty values when configured. Shared by both the head and tail
+    /// passes of [`Self::compress_array`].
+    fn push_compressed_if_kept(&self, result: &mut Vec<Value>, item: &Value, depth: usize) {
+        let compressed = self.compress_value(item, depth + 1);
+        if self.drop_nulls && compressed.is_null() {
+            return;
+        }
+        if self.drop_empty_fields && self.is_empty_value(&compressed) {
+            return;
+        }
+        result.push(compressed);
     }
 
     /// Stash the dropped tail of a truncated array, returning the stash key.

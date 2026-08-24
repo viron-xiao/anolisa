@@ -314,7 +314,9 @@ hermes-plugin 是面向 [Hermes Agent](https://hermes-agent.nousresearch.com/) �
 
 - **Fail-open** — 任何异常都不阻塞 agent 运行，hook 内部捕获所有异常返回 `None` 放行
 - **零运行时依赖** — 仅使用 Python 3.11 标准库（tomllib、json、subprocess、logging、dataclasses）
-- **可配置行为** — 默认 observe（仅日志），需显式 `enable_block = true` 才阻断
+- **可配置行为** — 默认 observe（仅日志）。Code Scanner 使用
+  `enable_block = true` 启用阻断；PII Checker 和 Skill Ledger 使用
+  `policy = "block"` 在 Hermes 原生支持的 hook 边界阻断
 
 **目录结构：**
 
@@ -401,7 +403,8 @@ class MyCapability(AgentSecCoreCapability):
 | `pre_tool_call` | 工具执行前 | `(tool_name, args, **kwargs)` | 返回 `{"action": "block", "message": str}` |
 | `post_tool_call` | 工具执行后 | `(tool_name, result, **kwargs)` | 无阻断 |
 | `pre_llm_call` | LLM 调用前 | `(messages, **kwargs)` | 注入 context |
-| `transform_llm_output` | 最终回复交付前 | `(response_text, session_id, **kwargs)` | 替换最终回复 |
+| `post_llm_call` | LLM turn 完成后 | `(assistant_response, **kwargs)` | 无阻断 |
+| `transform_llm_output` | 响应完成后的输出变换（本插件不注册） | `(response_text, session_id, **kwargs)` | 替换 hook 返回值 |
 
 ### 6. 配置（config.toml）
 
@@ -415,19 +418,17 @@ enable_block = false    # false=observe(仅日志), true=block(阻断)
 enabled = true
 timeout = 10
 include_low_confidence = false
-warning_ttl_seconds = 300
 policy = "observe"
 ```
 
 - `enabled = false` → 能力完全不注册
 - `code-scan.enable_block = false` → 检测到风险时仅记 WARNING 日志，不阻断工具调用
 - `code-scan.enable_block = true` → 检测到 deny/warn 时阻断工具调用
-- `pii-scan-user-input.policy` 支持 `observe`、`warn`、`ask`、`block`
-- PII scanner 覆盖本轮用户输入、tool 参数/结果和最终模型回复；不扫描 history、memory
-  或 RAG context
-- `block + deny` 在 `pre_tool_call` 返回原生 block；`ask` 以及
-  `pre_llm_call` / `post_tool_call` 的不可阻断边界 fallback 为 warn
-- 最终模型回复中的 PII 继续由 `transform_llm_output` 使用脱敏文本替换
+- Hermes 原生 policy 仅支持 `observe`、`block`；旧 `warn`、`ask` 配置降级为
+  `observe` 并写宿主诊断
+- PII scanner 覆盖本轮用户输入、tool 参数/结果和最终模型回复；模型回复只在
+  `post_llm_call` 审计，不修改或阻断；不扫描 history、memory 或 RAG context
+- `block + deny` 在 `pre_tool_call` 返回原生 block；其它不可阻断边界仅审计
 
 ### 7. 测试
 
@@ -466,7 +467,136 @@ uv run --project agent-sec-cli pytest tests/unit-test/hermes-plugin/ -v
 
 ## skills
 
-> TODO: 待补充
+### security-observability
+
+- `skills/security-observability/SKILL.md` intentionally keeps a self-contained
+  parameter and output contract for `agent-sec-cli events` and
+  `agent-sec-cli observability report`. Do not replace it with instructions that
+  require the Agent to run `--help` before each use; that adds avoidable tool
+  calls and context-reconstruction cost.
+- The duplicated parameter table is an implicit contract with the CLI help text.
+  When changing `events` or `observability report` options, defaults,
+  mutual-exclusion rules, output formats, or documented fields, update the
+  corresponding SKILL.md section and contract tests in the same change.
+- Verify the source CLI definitions before editing the skill. Treat `--summary`
+  and table/text output as human-display surfaces; structured Agent parsing must
+  keep using JSON or JSONL examples.
+- The "风险审查" section is a gate, not reference material. Security conclusions
+  must come from its aggregation commands over the per-event verdict field
+  (`details.result.verdict`). Never let the skill summarize by top-level
+  `result` or by `observability report`'s `security_verdicts`: both aggregate
+  whether the scanner *ran*, and top-level `result` is `succeeded` for
+  practically every event, so summarizing by it answers "no risk"
+  unconditionally. A regression once reported "no security events" for a
+  session holding a `prompt_scan` deny and a `code_scan` warn.
+- The aggregation scope is the four *scan* event types only: `code_scan`,
+  `prompt_scan`, `pii_scan`, `skill_ledger`. Non-scan events (`sandbox_prehook`,
+  `harden`, `verify`, `summary`) are filtered at the pipe entry via an
+  allowlist `select`, not scored. This allowlist is fail-open: a newly added
+  *scan* `event_type` is silently dropped until it is added to both `$spec`
+  (jq) and `SPEC` (python3), so update the verdict-path table, both aggregation
+  commands, and the contract tests in the same change. Verify the event_type
+  set against `security_middleware/lifecycle.py`'s `_ACTION_CATEGORY` before
+  editing.
+- Within an allowlisted type only an explicit `pass` counts as risk-free;
+  new/other verdict values (including `error`), missing fields, and non-string
+  verdicts must surface as pending (`MISSING`) items rather than silently pass.
+  This is what keeps the skill correct despite per-type enum differences, so do
+  not rewrite the aggregation into a per-type reject list.
+- The verdict enums are not uniform across scan types, and they do not all come
+  from a `Verdict` class. `code_scan`, `prompt_scan`, and `pii_scan` use their
+  own `Verdict` enums (`pass`/`warn`/`deny`/`error`), but `skill_ledger` events
+  carry a projected verdict gated by `_VERDICT_SEVERITY` in
+  `security_middleware/backends/skill_ledger.py`, which is wider: `pass`,
+  `none`, `warn`, `unmanaged`, `drifted`, `deny`, `tampered`, `error`. Read that
+  dict — not `skill_ledger/models/scan.py`'s `_SEVERITY_ORDER`, which is a
+  different four-value ordering used for aggregating a skill's own scan status
+  and ranks `none` *below* `pass` — when updating the skill's verdict table.
+- The "取值语义" table exists so a report explains a verdict instead of echoing
+  the raw token. Two entries are counter-intuitive and must keep their explicit
+  wording: `error` means the scanner itself failed (`prompt_scanner/result.py`:
+  "Scanner execution failed"), not a high-risk finding; `none` means unscanned
+  (`status.py` maps an all-`none` ledger to health `unscanned`). Reporting either
+  one as "safe" or as "high risk" is a factual error in both directions.
+  `drifted` and `tampered` sit on different axes: `drifted` is a `fileHashes`
+  mismatch against the signed snapshot (`skill_ledger/core/checker.py`), while
+  `tampered` means the ledger metadata or signature itself failed authentication.
+- Semantic wording is sourced, not invented. Take per-status phrasing from
+  `skill_ledger/cli.py`'s integrity-status help text (note it omits `unmanaged`
+  and `error`). The skill deliberately carries **no severity ranking**: it was
+  tried and removed as needless complexity, since the per-value semantics plus
+  the "no valid verdict" caveat already tell the Agent what to say. If a ranking
+  is ever reintroduced, source it from `_VERDICT_SEVERITY` in
+  `security_middleware/backends/skill_ledger.py` — the same dict that gates event
+  verdicts, and the only ordering covering all eight tokens. Never source it from
+  `skill_ledger/core/status.py`'s `_CRITICAL_STATUSES` / `_ATTENTION_STATUSES`:
+  those are `health` values of the separate `skill-ledger status` command, never
+  appear in `events` output, and omit `unmanaged`. An earlier revision imported
+  that critical/attention vocabulary and had to be reverted.
+- `skill_ledger` is the only scan type whose events can legitimately carry no
+  verdict. Eleven `skill-ledger` subcommands route through `invoke()` and emit
+  events, but `_project_event_verdict` only projects six (`init`, `scan`,
+  `check`, `show`, `certify`, `decide`); the rest (`status`, `audit`,
+  `list-scanners`, `export`, `init-keys`) produce an audit record with no
+  verdict, so the aggregation reports them as `MISSING`. Verified on a live host:
+  of 1476 events, `pii_scan`/`code_scan`/`prompt_scan` were 100% verdict-bearing
+  while three of four `skill_ledger` events lacked one.
+- That `MISSING` noise is handled **in the "取值语义" table, not by filtering**.
+  A judgment-command allowlist in the pipeline was considered and rejected as too
+  complex for the one-line command constraint. Accepted residual cost: the
+  `risk_items` headline count still includes non-judgment `skill_ledger` records,
+  so the skill instructs the Agent to report them as "非判定操作" and to treat
+  `MISSING` as a real pending item only for the other three scan types. Do not
+  "fix" this by making `MISSING` risk-free across the board — that would blind the
+  three scanners where a missing verdict is genuinely anomalous.
+- The aggregation output is counts + RISK lines only; `pass`/`allow` events
+  never get a per-event line and their `details` are not fetched. This is a
+  context-cost invariant, not cosmetics: a security report must not flood the
+  Agent conversation. Keep the "上下文开销控制" guidance (count first, set an
+  explicit `--limit` or paginate until every matching event is covered, expand
+  only pending items, drill by `event_id` on demand, aggregate through the
+  pipe) intact when editing. Never let the aggregation path rely on the CLI
+  default `--limit 100`: counts between 101 and 200 must still be fetched in
+  full before reporting risk totals.
+- The "参数取值约束" section is a security control, not style. Every documented
+  command interpolates `<session_id>`/`<event_id>` into a single-quoted shell
+  string, and the skill explicitly accepts user-supplied correlation IDs, so an
+  unvalidated value closes the quote and yields command injection (verified
+  reproducible). Do not narrow all IDs to UUIDs: adapters persist values such as
+  `session-001` or `thread_xxx`. Keep a bounded safe-character full-match
+  requirement for generic correlation IDs, and keep the stricter UUID check for
+  cosh-ng `runtime_context.provider_session_id`, which is expected to be a UUID.
+- The "获取单条事件细节" section exists because `events` has **no `--event-id`
+  filter**; single-event drill-down must go through client-side `jq` selection.
+  Keep it that way unless the CLI gains such a filter. Detail lives under the
+  uniform `details` = `{request, result}` shape, with `details.result.findings[]`
+  as the per-hit evidence; document it at that level instead of enumerating
+  each scanner's inner finding keys, which differ per scanner and would rot.
+- Keep the "报告不得重新引入敏感值" rule: reports may only cite the redacted
+  fields the event already carries (`evidence_redacted` et al., produced by
+  `pii_checker/audit.py`'s `_sanitize_result`, which drops `raw_evidence` and
+  keeps only `text_length`/`text_sha256` on the request side). Recovering the
+  original value from conversation history to "explain better" turns a
+  read-only query into a fresh leak, because model output is itself PII-scanned
+  (`source=model_output`). Describe redaction formats by pattern rather than
+  pasting observed values.
+- The "获取当前 session_id" section documents a cosh-ng-only path: the cosh-ng
+  `runtime_context` tool returns `provider_session_id`, which is the same value
+  cosh-ng passes to hooks as `session_id` and therefore the same value stored on
+  security events and observability records. Keep that section explicitly scoped
+  to cosh-ng and keep the generic fallback next to it; no other agent runtime
+  exposes that tool as of this release. If one starts to, update both the skill
+  section and its contract test.
+- Only cosh-ng lets an Agent resolve its own `session_id`. Every other runtime
+  must fall back to a time range or, only when the user explicitly asks for the
+  latest recorded session, `--last`, and state the real query scope in its
+  answer, so keep the skill from telling those Agents to ask the user for an
+  id they cannot obtain. `run_id` and `trace_id` are never self-resolvable.
+- Keep the warning that `COSH_SESSION_ID` is not the agent session id. In
+  cosh-ng it is the shell/terminal identity recorded as `shell_session_id`, so
+  querying with it silently returns zero events and reads as "no security
+  events". If cosh-ng changes how the session id is exposed, update the skill
+  section and its contract test in the same change.
 
 ---
 
@@ -493,7 +623,7 @@ Do NOT write guidelines from design intent or mental models. Write them AFTER ve
 - Eight modules in overview table (Sandbox is architecture-only, no dedicated usage section). Seven usage sections: Prompt Scanner, Code Scanner, Skill Ledger, PII Checker, Security Baseline, Observability, Security Events. Do not merge them.
 - Agent integration order in docs: CLI (always available) → OpenClaw plugin → Hermes plugin → cosh hook (auto-loaded, no user action needed). This reflects manual-effort-first ordering.
 - `loongshield` may be mentioned alongside `agent-sec-cli harden` — loongshield is an Alinux system component users already know; `agent-sec-cli harden` is ANOLISA's unified entry point wrapping it.
-- ML model warmup: state that models come from ModelScope (Llama-Prompt-Guard-2-86M). Never reference internal model registries.
+- ML model preparation: state that L2 uses ModelScope model `modelscope.cn/ANOLISA/Qwen3Guard-Gen-0.6B-GGUF`; operators must run `ollama pull` first, and `scan-prompt warmup` only verifies availability. Never reference internal model registries.
 
 ### Gotchas to Warn About
 - Code Scanner verdict enum defines `pass` / `warn` / `deny` / `error`. Built-in rules currently produce `warn` or `pass`; `deny` and `error` are available for custom/LLM-driven rules. Do not invent levels outside this enum (no "critical", no "info").

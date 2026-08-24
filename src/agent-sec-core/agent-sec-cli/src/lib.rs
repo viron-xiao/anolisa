@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use prompt_scanner::{
     PromptScanner, ScanConfig, ScanMode, ScannerError, Turn, ENGINE_VERSION, MODEL_QWEN3_GUARD,
+    MODEL_WARDEN_GEN,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -136,8 +137,8 @@ fn warmup_scanner(py: Python<'_>, mode: &str, model: Option<&str>) -> PyResult<(
 }
 
 /// Describe the native scanner engine (version, implemented layers,
-/// supported modes) as a JSON string, so callers can probe engine
-/// capabilities.
+/// supported modes, selectable L2 backends) as a JSON string, so callers can
+/// probe engine capabilities.
 #[pyfunction]
 fn scanner_engine_info() -> String {
     serde_json::json!({
@@ -145,7 +146,9 @@ fn scanner_engine_info() -> String {
         "engine_version": ENGINE_VERSION,
         "implemented_layers": ["rule_engine", "ml_classifier", "multi_turn_intent"],
         "modes": ["fast", "standard", "strict", "multi_turn"],
+        // The default L2 backend; `l2_models` lists every selectable one.
         "l2_model": MODEL_QWEN3_GUARD,
+        "l2_models": [MODEL_QWEN3_GUARD, MODEL_WARDEN_GEN],
     })
     .to_string()
 }
@@ -153,7 +156,27 @@ fn scanner_engine_info() -> String {
 /// Python module implemented in Rust.
 /// Available as `from agent_sec_cli._native import ...` in Python.
 #[pymodule]
-fn _native(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _native(py: Python, m: &PyModule) -> PyResult<()> {
+    // Route Rust `log` records into Python's `logging`.  This is the only
+    // place a logger can be installed: the crate ships as a cdylib with no
+    // `main`, so without this call the `log` facade discards every record —
+    // including the model-service warnings about a non-loopback base URL and
+    // about rejected tuning values.
+    //
+    // Caching is off on purpose.  The cached variants pin each target's Python
+    // logger and level on first use and can only be invalidated through the
+    // `ResetHandle` returned here, so any later reconfiguration on the Python
+    // side — attaching a handler at runtime, or the per-test logging reset in
+    // `cli_logging` — would silently keep routing records by stale settings.
+    // Holding the handle instead would mean exposing a reset hook back to
+    // Python; not worth it for a dependency tree that logs a handful of
+    // warnings per invocation.
+    //
+    // A failing `install` means a logger is already registered (module reload,
+    // sub-interpreter); the existing bridge stays valid, so importing must not
+    // fail over it.  A failing `new` means `import logging` itself broke, which
+    // is worth propagating.
+    let _ = pyo3_log::Logger::new(py, pyo3_log::Caching::Nothing)?.install();
     m.add_function(wrap_pyfunction!(scan_prompt_json, m)?)?;
     m.add_function(wrap_pyfunction!(scan_multi_turn_json, m)?)?;
     m.add_function(wrap_pyfunction!(warmup_scanner, m)?)?;

@@ -16,10 +16,13 @@ Python 框架包。
 | Qoder | `qoder` | 已硬关闭 | 输出改写后的 Shell 输入 | 输出 `additionalContext` | 在响应压缩后尝试 | — |
 | Claude Code | `claude-code` | 已硬关闭 | 替换 Bash 输入 | 2.1.121 及以上替换输出；否则透传 | 仅在替换结果可保持文本时使用 | — |
 | Codex | `codex` | 已硬关闭 | 替换受支持的 Shell 输入 | 保留原文，追加分析或压缩备选内容 | 用于生成该备选内容 | — |
+| DeepSeek Harness | `dsh` | 未注册 | 未注册 | 只在结果更小时替换已接受的单文本块 JSON 结果 | 未注册 | 未注册 |
 | OpenCode | `opencode` | 已硬关闭 | 替换 Bash 输入 | 替换工具输出 | 在响应压缩后尝试 | ✅ |
-| Qwen Code | `qwencode` | 已硬关闭 | 输出改写后的 Shell 输入 | 输出 `additionalContext` | 在响应压缩后尝试 | ✅ |
+| Qwen Code | `qwencode` | 已硬关闭 | 输出改写后的 Shell 输入 | 输出 `additionalContext` | 在响应压缩后尝试 | — |
 
-“—”表示当前 Adapter 没有注册此能力；对应的 Tokenless CLI 命令仍可能可用。
+“—”表示该能力不可用：当前 Adapter 没有注册，或当前宿主版本不会运行；对应的 Tokenless CLI 命令仍可能可用。
+
+Schema 压缩到达模型路径的方式因宿主而异：cosh 与 Cosh-NG 触发 `BeforeModel` Hook；OpenCode 通过其 `tool.definition` 插件 Hook 逐个压缩工具定义（MCP 工具不经过该 Hook）；Qwen Code 的清单声明了 `BeforeModel` Hook，但当前 Qwen Code 版本在注册时会跳过这一未知事件名，Schema Hook 实际不会运行，因此矩阵标记为不可用。该条目保留注册，未来 Qwen Code 版本实现该事件后会自动生效。
 
 这些 Adapter 仍会注册 Tool Ready，但会在检查、修复或阻断之前无条件硬退出，任何运行时设置都无法重新启用。工具执行后的失败归因不受影响。
 
@@ -38,9 +41,77 @@ OpenCode 当前使用下文说明的随附生命周期脚本，本版本尚未�
 | Shell/exec | 字符串 65,536 字符、数组保留 128 项、深度 8 |
 | 其他结构化工具 | 字符串 1,048,576 字符、数组保留 65,536 项、深度 32 |
 
-共享响应 Hook、OpenClaw 和 Hermes 会跳过短于 200 字符的输入。Codex 会跳过短于 500 字符的输入；只有输入至少为 4,000 字符时才附加压缩内容，否则只追加诊断或摘要。共享路径还会跳过带 YAML frontmatter、形似 Skill 的文本。
+共享响应 Hook、OpenClaw 和 Hermes 会跳过短于 200 字符的输入。Codex 会跳过短于 500 字符的输入；只有输入至少为 4,000 字符时才附加压缩内容，否则只追加诊断或摘要。共享路径还会跳过带 YAML frontmatter、形似 Skill 的文本。TOON 编码仅对至少 500 字符的负载执行（当前实现的阈值，后续可能调整）；更小的负载保留压缩后的形式，因为 TOON 对小型 JSON 的节省可以忽略不计。该阈值适用于所有支持 TOON 的管线：共享响应 Hook、独立 TOON Hook、Codex、OpenClaw 和 Hermes。
 
 Claude Code 需要 2.1.121 或更高版本才能使用 `updatedToolOutput`。版本更旧或无法确定时，响应压缩会关闭，以免重复注入原文。结构化工具输出会保留宿主 Schema，不会转换成文本 TOON；以字符串承载的 JSON 在 TOON 更小时可以使用 TOON。
+
+### DeepSeek Harness 原生处理路径
+
+DSH Bundle 要求 Node.js 22 或更高版本，并需要兼容的 DSH profile。应在同一条
+enable 命令中列出全部目标 profile，随后使用其中一个名称启动 DSH。
+
+```bash
+anolisa adapter enable tokenless dsh \
+  --profile web \
+  --profile headless
+dsh --profile web
+```
+
+`--profile` 是必填且可重复的参数。每次 enable 或 re-enable 都会把本次参数视为
+完整目标集合。旧 receipt 中已有但新命令没有列出的 profile 会卸载 Bundle，因此
+每次都要列出需要继续使用 Tokenless 的全部 profile。ANOLISA 会把选择的 profile
+和解析后的 DSH home 写入 adapter receipt。后续 status、disable 和 re-enable 会
+继续操作同一棵 profile 目录树。
+
+Plugin 在 DSH 的 `tools/post-execute` waterfall 上运行。只有成功结果包含一个文本块，
+且文本是 JSON object 或 array 时，才会尝试执行 `tokenless compress-response`。
+CLI 返回更短的合法 JSON 后才会替换内容。多文本块、图片、普通文本、非法 JSON、
+错误结果、Code Mode 子调用和默认内容读取类工具不参与压缩。CLI 缺失、失败或
+超时也会保留原始内容。当前原生路径不执行 TOON 第二阶段，也没有启动子进程前的
+最小尺寸门控。
+
+在 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 中覆盖安装后的 row，然后重启
+对应的 DSH profile。
+
+```yaml
+- id: anolisa-tokenless
+  config:
+    responseCompressionEnabled: true
+    timeoutMs: 5000
+    maxBuffer: 4194304
+    noStash: false
+```
+
+后续 DSH patch layer 会替换该 row 的完整 `config` 值。Plugin 会为省略的 key 提供
+默认值，因此只需写出准备修改的 key。
+
+| 配置项 | 默认值 | 行为 |
+|--------|--------|------|
+| `responseCompressionEnabled` | `true` | 控制响应压缩。设为 `false` 后，环境错误归因仍保持启用。 |
+| `tokenlessBin` | `$TOKENLESS_BIN`，随后使用 `tokenless` | 选择 Tokenless CLI 可执行文件。非空 Plugin 配置优先于环境变量。 |
+| `skipTools` | 下文列出的内容读取类集合 | 跳过匹配工具的压缩。配置数组会替换默认集合，空数组表示不跳过任何工具。错误归因仍保持启用。 |
+| `shellTools` | 下文列出的 Shell 和 process 集合 | 选择 Shell 阈值，也决定哪些工具的结构化 `value` 可以用于失败归因。配置数组会替换默认集合。 |
+| `truncateStringsAt` | Shell 为 `65536`，其他工具为 `1048576` | 覆盖全部工具类别的字符串保留上限。只接受正整数。 |
+| `truncateArraysAt` | Shell 为 `128`，其他工具为 `65536` | 覆盖全部工具类别的数组保留上限。只接受正整数。 |
+| `maxDepth` | Shell 为 `8`，其他工具为 `32` | 覆盖全部工具类别的 JSON 最大深度。只接受正整数。 |
+| `timeoutMs` | `3000` | 限制一次 Tokenless 子进程的运行时间，单位为毫秒。只接受正整数。 |
+| `maxBuffer` | `2097152` | 限制捕获的子进程输出，单位为 byte。只接受正整数。 |
+| `agentId` | `dsh` | 设置 Tokenless 统计记录中的 `--agent-id`。 |
+| `noStash` | `false` | 设为 `true` 时传入 `--no-stash`。默认允许把删除的数组项写入 Stash。 |
+
+默认 `skipTools` 集合包括 `Read`、`read`、`read_file`、`read_many_files`、`Glob`、
+`glob`、`search_file`、`list_directory`、`list_dir`、`Grep`、`grep`、`grep_code`、
+`grep_search`、`search_files`、`Lsp`、`lsp`、`NotebookRead`、`notebook_read` 和
+`notebookread`。
+
+默认 `shellTools` 集合包括 `Bash`、`bash`、`Shell`、`shell`、`exec`、`terminal`、
+`run_shell_command`、`run_in_terminal`、`get_terminal_output`、`execute_command` 和
+`process`。
+
+DSH 使用 `isError` 标记的原始失败可以为任何工具追加依赖、权限、路径、网络或包
+错误归因。结构化输出只会为 `shellTools` 分类。归因独立于压缩，关闭或跳过压缩、
+压缩没有得到更短结果时仍会生效。后续 waterfall listener 替换 canonical `value`
+后，Tokenless 会按替换值重新分类，不会沿用已经被替换结果的旧归因。
 
 ## 通过 anolisa 管理（推荐）
 
@@ -82,9 +153,17 @@ anolisa adapter enable tokenless qoder
 anolisa adapter enable tokenless claude-code
 anolisa adapter enable tokenless codex
 anolisa adapter enable tokenless qwencode
+anolisa adapter enable tokenless dsh \
+  --profile web \
+  --profile headless
 ```
 
-只需启用实际使用的 Agent 产品。启用多个产品时，应逐个执行并分别验证。
+只需启用实际使用的 Agent 产品。多个产品应分别执行并验证各自的命令。DSH 的全部
+目标 profile 应写在同一条 enable 命令中。
+
+DeepSeek Harness 按 profile 管理，因此必须至少提供一个 `--profile`。每个名称应与
+`dsh --profile <profile>` 使用的名称一致，不带 profile 的通用命令会被拒绝。
+后续 enable 或 re-enable 必须再次列出需要保留的全部 profile。
 
 OpenCode 应使用 [npm 安装后的手动接入](#npm-安装后的手动接入)中的随附安装脚本。
 
@@ -193,6 +272,13 @@ Marketplace Plugin 在 Claude Code 重启后生效，也可以按照安装脚本
 
 Plugin 在新的 Codex 会话中加载。关闭旧会话并重新启动后验证统计。它的 PostToolUse Hook 是追加型的：统计只能作为压缩候选遥测，不能证明原始 Codex 工具结果已离开 Prompt。
 
+### DeepSeek Harness
+
+原生 Bundle 会在选定的 DSH profile 启动时加载。启用 Bundle 或修改 profile patch
+后，重启 `dsh --profile <profile>`，运行一个返回可压缩 JSON 的工具，再检查
+`tokenless stats list`。禁用命令是 `anolisa adapter disable tokenless dsh`。
+receipt 已经记录 profile 名称，因此 disable 不再接受 `--profile`。
+
 ### OpenCode
 
 OpenCode 启动时会自动加载配置目录下的 Plugin。使用上述 Tokenless 生命周期脚本
@@ -218,7 +304,7 @@ Python 包支持 AgentScope 1.0.11 至 1.0.x 和 AgentScope 2.0.x。应根据已
 
 | AgentScope 版本 | 支持的入口 |
 |---|---|
-| 1.0.11 至 1.0.x | 通过 `integration.install(agent)` 接入直接构造的 Agent |
+| 1.0.11 至 1.0.x | 使用 Tokenless Toolkit 和 `install(..., session_id=...)` |
 | 2.0.0 | 通过 `integration.tools` 和 `integration.middlewares` 直接构造 Agent |
 | 2.0.1 至 2.0.x | 直接构造 Agent，或通过 `integration.app_options()` 接入 App |
 
@@ -232,8 +318,32 @@ python -m pip install \
   target/wheels/anolisa_tokenless_agentscope-*.whl
 ```
 
+原生 Wheel 还通过 typed Python 对象开放与 CLI 相同的只读 Stats 查询能力：
+
+```python
+from anolisa_tokenless import TokenlessStats
+
+stats = TokenlessStats("/absolute/path/to/tenant-tokenless-data")
+
+status = stats.status
+summary = stats.summary()
+recent = stats.list(limit=20)
+record = stats.show(recent[0].id)
+session_diff = stats.diff(session_id="conversation-id")
+comparison = stats.compare("baseline-session", "tokenless-session")
+```
+
+`TokenlessSdk.stats` 会延迟返回绑定该 SDK 数据目录的客户端。Token 数量是估算值，并且
+只有产生正向节省的操作才会记录。`show()` 和 Record/Tool-use 的 `diff()` 结果可能包含
+`stats.db` 中保存的敏感工具输入与输出；Summary、List 和 Compare 不返回保存的内容。
+该 API 不能清空数据或修改记录开关。这里的只读是指这些公开操作；打开客户端时遵循
+CLI 初始化流程，可能创建或迁移 `stats.db`，所以数据目录必须可写。Summary 或 Compare
+未指定 Limit 时，最多读取最近 10,000 条记录；Session 和 Tool-use Diff 同样最多读取
+最近 10,000 条匹配记录。要获得有意义的对比，应先传入 dry-run Baseline Session，再
+传入启用 Tokenless 的 Session。
+
 两个大版本都使用 `TokenlessAgentScope` 和 `TokenlessConfig`，只有最后的挂载方式不同。
-AgentScope 1.x 必须先创建 Agent 和所有工具函数，再安装集成；之后注册的工具不会被包装：
+AgentScope 1.x 使用 Tokenless Toolkit；普通工具与 MCP 注册入口也会覆盖构造后新增的工具：
 
 ```python
 from agentscope.agent import ReActAgent
@@ -245,8 +355,10 @@ integration = TokenlessAgentScope(
         data_dir="/absolute/path/to/tenant-tokenless-data",
     ),
 )
+toolkit = integration.create_toolkit()
+toolkit.register_tool_function(application_tool)
 agent = ReActAgent(..., toolkit=toolkit)
-integration.install(agent)
+integration.install(agent, session_id="conversation-id")
 ```
 
 AgentScope 2.x 应在构造 Toolkit 和 Agent 时传入恢复 Tool 和中间件。该方式从 2.0.0
@@ -300,20 +412,19 @@ Agent。原有 `TokenlessMiddleware` 2.x API 继续保留兼容；新代码应�
 | `balanced`（默认） | 跳过 | Shell：65,536 / 128 / 深度 8；其他采用 conservative 限制 |
 | `aggressive` | 跳过 | CLI 默认值：4,096 / 32 / 深度 8 |
 
-集成会原样转发中间流式 chunk，只替换成功的最终 `ToolResponse`；响应和 block 的
-标识、元数据都会保留。Tokenless 失败或 UTF-8 结果没有严格变小时保留原文。
-JSON object/array 仍为 JSON，普通文本仍为文本，`DataBlock` 永不修改。
+集成会原样转发中间流式 chunk 并保留框架对象，只转换复制后的调用参数和最终模型可见
+文本。Tokenless 优化失败或 UTF-8 结果没有严格变小时保留原文，`DataBlock` 永不修改。
 
-集成还提供默认名为 `tokenless_retrieve` 的恢复 Tool。只有参数是严格的 24 位十六进制
-哈希，且对应的 `<<tokenless:HASH>>` marker 在 AgentScope 1.x memory 或 AgentScope
-2.x context/summary 中可见时，才会返回内容；该 Tool 永远不参与压缩。这一窄权限仍依赖
+集成还提供默认名为 `tokenless_retrieve` 的恢复 Tool。只有 marker 对当前模型可见时才
+会向模型发布该 Tool，并且只接受该 Session 精确保留的 marker 集合中的 24 位十六进制
+hash；该 Tool 永远不参与压缩。这一窄权限仍依赖
 存储隔离：每个用户或租户必须显式传入独立的绝对 `data_dir`。省略 `data_dir` 时，
 `TOKENLESS_DATA_DIR` 只作为进程级回退，不得由多个租户共用；也不要依赖跨节点恢复。
 stash 当前使用固定的一小时 TTL，Agent 应在这一边界前恢复所需内容。
 
-压缩和恢复会从 async worker thread 调用进程内 `anolisa-tokenless` Runtime；该集成
-不会启动 CLI 进程或授予 Shell 权限，也不接入 MCP、TOON、RTK 命令重写或
-Schema 压缩。
+两个 Adapter 都启用 Schema 压缩、RTK 命令改写、响应压缩、TOON、恢复、环境错误提示
+和逐调用归属。平台 Wheel 内置 RTK 并直接链接 TOON，不会搜索系统 helper。Tool Ready
+仍保持硬关闭。
 
 ## 验证是否真正接入
 

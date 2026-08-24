@@ -12,7 +12,7 @@ use anolisa_core::{
     RegistrationManager, TelemetryChannel, Uploader, generate_link_id, require_root,
 };
 use anolisa_platform::fs_layout::FsLayout;
-use anolisa_platform::systemd::{self, SystemdError};
+use anolisa_platform::systemd::{Systemd, SystemdError};
 use clap::{Parser, Subcommand};
 
 use crate::context::CliContext;
@@ -22,6 +22,13 @@ use crate::response::{CliError, render_json};
 const SERVICE_NAME: &str = "anolisa-telemetry";
 /// Filename of the unit written into the system unit directory.
 const UNIT_FILENAME: &str = "anolisa-telemetry.service";
+/// User-facing command for inspecting telemetry state.
+const STATUS_COMMAND: &str = "anolisa telemetry status";
+
+/// Returns the management command for a telemetry systemd unit target.
+pub(crate) fn status_command_for_service_target(target: &str) -> Option<&'static str> {
+    matches!(target, SERVICE_NAME | UNIT_FILENAME).then_some(STATUS_COMMAND)
+}
 
 #[derive(Parser)]
 pub struct TelemetryArgs {
@@ -184,7 +191,9 @@ fn install_and_enable_service(ctx: &CliContext) -> Result<(), CliError> {
         ));
     }
 
-    systemd::enable_unit(SERVICE_NAME).map_err(|e| runtime(cmd, e))
+    Systemd::system()
+        .enable_unit(SERVICE_NAME)
+        .map_err(|e| runtime(cmd, e))
 }
 
 /// Best-effort, non-blocking teardown so `telemetry disable` never hangs.
@@ -192,7 +201,7 @@ fn install_and_enable_service(ctx: &CliContext) -> Result<(), CliError> {
 /// See [`handle_disable`] for why we avoid `disable --now`. A missing unit
 /// (never installed) is treated as success.
 fn disable_service() {
-    match systemd::disable_unit_deferred(SERVICE_NAME) {
+    match Systemd::system().disable_unit_deferred(SERVICE_NAME) {
         Ok(()) | Err(SystemdError::NotFound(_)) => {}
         Err(e) => eprintln!("warn: failed to disable {UNIT_FILENAME}: {e}"),
     }
@@ -342,6 +351,17 @@ mod tests {
             parse(&["t", "status"]),
             TelemetryCommands::Status { json: false }
         ));
+    }
+
+    #[test]
+    fn service_targets_share_the_canonical_status_command() {
+        for target in [SERVICE_NAME, UNIT_FILENAME] {
+            assert_eq!(
+                status_command_for_service_target(target),
+                Some("anolisa telemetry status"),
+            );
+        }
+        assert_eq!(status_command_for_service_target("telemetry"), None);
     }
 
     #[test]

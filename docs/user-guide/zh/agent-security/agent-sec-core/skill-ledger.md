@@ -212,7 +212,7 @@ Skill 工作流：
 
 ### 架构概览
 
-Skill Ledger 推荐与 SkillFS 联合使用：SkillFS 捕获 Skill 变更，通知 Skill Ledger daemon 扫描并刷新 `.skill-meta/activation.json`/xattr。宿主 hook/capability 默认仍可挂载，默认 `policy = "ask"`；当统一 exposure summary 有 `message` 时提示用户，没有 `message` 或用户已经做过决策时静默。
+Skill Ledger 推荐与 SkillFS 联合使用：SkillFS 捕获 Skill 变更，通知 Skill Ledger daemon 扫描并刷新 `.skill-meta/activation.json`/xattr。宿主 hook/capability 仍作为兼容路径挂载；有原生提示或确认能力的宿主默认 `policy = "ask"`，Hermes 因 Python plugin API 未暴露这两种机制而默认 `policy = "observe"`。
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -243,7 +243,7 @@ Skill Ledger 推荐与 SkillFS 联合使用：SkillFS 捕获 Skill 变更，通�
 ```
 
 - **推荐路径——SkillFS + daemon activation**：SkillFS 负责发现 Skill 文件变化；daemon 根据最新签名 manifest、用户决策和 activation policy 刷新可执行 activation 目标。Agent 运行时读取 activation metadata，而不是默认依赖宿主 hook 前置检查。
-- **兼容路径——宿主 hook/capability policy**：OpenClaw、Hermes、copilot-shell 和 Qwen Code 在 Skill 加载前调用 `agent-sec-cli skill-ledger show`；Codex 和 Qoder CLI 则在各自的本地 Skill 触发边界调用只读的 `agent-sec-cli skill-ledger check`。默认值为 `ask`；也可显式配置 `observe` / `warn` / `block`，旧值 `debug` 仅作为 `observe` 的兼容别名。
+- **兼容路径——宿主 hook/capability policy**：OpenClaw、Hermes、copilot-shell 和 Qwen Code 在 Skill 加载前调用 `agent-sec-cli skill-ledger show`；Codex 和 Qoder CLI 则在各自的本地 Skill 触发边界调用只读的 `agent-sec-cli skill-ledger check`。Hermes 仅支持 `observe` / `block` 且默认 `observe`；其它宿主保留各自原生的 `observe` / `warn` / `ask` / `block` 行为和默认值。
 - **Agent 驱动扫描**：`scan` 执行内置快速扫描并签名；`skill-ledger` Skill 在用户要求深度扫描时驱动完整的四阶段安全审查，并通过 `certify --findings` 导入结果。**按需触发**，由用户请求发起。
 
 ### 推荐路径：SkillFS + daemon activation
@@ -353,16 +353,18 @@ Hermes 布局下 activation 流程携带的是嵌套身份（`category/skill`）
 ### 统一宿主 Hook 控制
 
 宿主 adapter 使用 `SKILL_LEDGER_HOOK_ENABLED` 作为总开关，使用
-`SKILL_LEDGER_MODE` 选择行为。开关默认 `true`；policy 默认 `ask`，支持
-`observe`、`warn`、`ask`、`block`。`observe` 执行检查和审计但不显示用户提示；旧值
-`debug` 映射为 `observe`，旧值 `deny` 映射为 `block`。环境变量 policy 优先于
-Hermes/OpenClaw capability 配置。
+`SKILL_LEDGER_MODE` 选择行为。开关默认 `true`；有原生提示或确认能力的宿主默认
+`ask`。Hermes 默认 `observe` 且仅支持 `observe` / `block`；旧 `warn` / `ask` 会降级
+为 `observe` 并写宿主诊断。`observe` 执行检查和审计但不显示用户提示；旧值 `debug`
+映射为 `observe`，旧值 `deny` 映射为 `block`。环境变量 policy 优先于 Hermes/OpenClaw
+capability 配置。
 
 宿主 Agent 在加载插件时读取这些变量。修改后需重启承载该 hook 的 Agent 进程；
 hook 和 agent-sec-core 并不是需要单独重启的 policy 服务。
 
-hook 无法请求确认时，`ask` fallback 为 `warn`；hook 无法在当前边界执行阻断时，
-`block` 同样 fallback 为 `warn`，且不得声称已经阻断。设置
+Hermes 以外的宿主在 hook 无法请求确认时可将 `ask` fallback 为 `warn`。Hermes 不会
+通过改写助手最终回复模拟这两种 action，不支持的值统一降级为 `observe`。其它宿主在
+当前边界无法执行阻断时也不得声称已经阻断。设置
 `SKILL_LEDGER_HOOK_ENABLED=false` 后不读取业务输入、不初始化密钥，也不调用 CLI。
 
 ### 兼容路径：Hook / capability policy
@@ -376,11 +378,14 @@ hook 无法请求确认时，`ask` fallback 为 `warn`；hook 无法在当前边
 | `ask` | 默认值。`message == null` 静默放行；`message != null` 时请求用户确认或使用宿主 approval UI。 |
 | `block` | `message != null` 时直接阻断，并把 message 作为原因或告警信息。 |
 
+Hermes 只实现 `observe` 和 `block` 两行；兼容的 `warn` / `ask` 会转为 `observe` 并记录
+诊断，绝不通过 `transform_llm_output` 写入助手回复。
+
 `message` 的触发规则由 Skill Ledger 统一决定：用户已有 `allow` / `always_allow` / `rollback` / `block` 决策时不提示；latest 为 `pass` 或 `warn` 且可直接暴露时不提示；无用户决策且 latest 为 `deny` / `none` / `drifted` / `tampered` 时提示，并说明当前 active 是 fallback 版本还是安全 pending review stub。`latestStatus=unmanaged` 表示当前 daemon 无法管理该 root，无法写 `.skill-meta` 或记录用户决策，因此只作为诊断返回，`message=null`，所有 hook policy 包括 `block` 都静默放行。
 
 Codex 和 Qoder CLI 是低层完整性门禁，均在完成 canonical path 和根目录边界校验后执行 `skill-ledger check <skill_dir>`。Codex 在 `UserPromptSubmit` 解析 `$skill-name`；该边界无法请求确认，因此 `ask` fallback 为 `warn`。Qoder CLI 为 `Skill` tool 注册独立的 `PreToolUse` hook，根据事件中的绝对 `cwd` 建立 user → project 目录表，并解析 `SKILL.md` frontmatter `name`（无 frontmatter 时回退目录名）。Qoder frontmatter 存在但 `name` 缺失、歧义或使用 hook 无法安全解析的 YAML scalar 时，不会降级为非本地 Skill，而是按当前 policy 处理。`pass` 静默放行；`none` / `drifted` / `warn` / `deny` / `tampered` 以及 `error` 按 `observe` / `warn` / `ask` / `block` policy 静默审计、提示后放行、在支持的边界请求确认或阻断。Qoder CLI 不可用、执行失败、超时或输出不可解析也按该四档 policy 处理，而不是固定 fail-open；旧值 `debug` 仅作为 `observe` 的兼容别名。
 
-六个 adapter 均默认启用 Skill Ledger，policy 为 `ask`；copilot-shell、Codex、Qoder CLI 和 Qwen Code 在默认 manifest 注册各自的 hook 边界。OpenClaw 和 Hermes 还可使用 capability 配置，`SKILL_LEDGER_MODE` 仍作为部署级覆盖。除上述明确说明的 Qoder CLI 低层门禁外，其它兼容 hook 在 CLI 基础设施异常时保持 fail-open，避免阻断 Skill 加载。
+六个 adapter 均默认启用 Skill Ledger；Hermes 使用 `observe`，其它 adapter 保持 `ask`。copilot-shell、Codex、Qoder CLI 和 Qwen Code 在默认 manifest 注册各自的 hook 边界。OpenClaw 和 Hermes 还可使用 capability 配置，`SKILL_LEDGER_MODE` 仍作为部署级覆盖。除上述明确说明的 Qoder CLI 低层门禁外，其它兼容 hook 在 CLI 基础设施异常时保持 fail-open，避免阻断 Skill 加载。
 
 copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>/.copilot-shell/skills/`、`~/.copilot-shell/skills/`，以及 RPM 与 raw install 对应的 system 根目录 `/usr/share/anolisa/skills/` 和 `/usr/local/share/anolisa/skills/`。若 Skill 来自 custom、extension、remote 或其它路径，hook 会 fail-open 并跳过 skill-ledger 检查；OpenClaw 插件则按读取到的 `SKILL.md` 路径提取 Skill 目录。
 
@@ -405,9 +410,14 @@ copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>
 [capabilities.skill-ledger]
 enabled = true
 timeout = 5
-policy = "ask"
-enable_block = false
+policy = "observe"
 ```
+
+Hermes 只支持 `observe` 和原生 `block`。已有 `warn` / `ask` 值会降级为 `observe` 并写
+宿主诊断；旧配置中的 `enable_block=false` 同样映射为 `observe`。
+Hermes `observe` 模式下，非空 exposure summary 写 `INFO`；`deny` / `tampered` 状态或
+`reasonCode=tampered` 的激活结果提升为 `WARNING`。这些日志等级不会阻断 Skill，也不会
+向助手回复写入内容。
 
 **copilot-shell 配置方式**：默认 Cosh manifest 已注册 `skill-ledger` hook。默认 policy 为 `ask`；如需 observe-only、warning-only 或强拒绝，可设置 `SKILL_LEDGER_MODE=observe` / `warn` / `block`。`debug` 仍作为 `observe` 的别名。该环境变量应由可信宿主或部署环境设置，不应由 Skill、项目脚本或不可信 shell 启动逻辑设置；如需防止本地 shell profile 被篡改后降级策略，后续应迁移到可信宿主配置源。
 

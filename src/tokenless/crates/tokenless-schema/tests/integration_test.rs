@@ -286,7 +286,9 @@ fn test_response_compress_long_strings() {
 
 #[test]
 fn test_response_array_truncation() {
-    let compressor = ResponseCompressor::new().with_truncate_arrays_at(3);
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0);
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
 
@@ -671,7 +673,9 @@ fn bench_l1_stash_schema() {
 fn bench_l1_stash_response() {
     println!("\n=== L1: ResponseCompressor + Stash (reversible) ===");
     let store = Arc::new(InMemoryStore::new());
-    let compressor = ResponseCompressor::new().with_stash_store(store.clone());
+    let compressor = ResponseCompressor::new()
+        .with_array_tail_preserve(0)
+        .with_stash_store(store.clone());
 
     let mut total_orig = 0usize;
     let mut total_comp = 0usize;

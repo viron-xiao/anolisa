@@ -33,8 +33,8 @@ fn compress_ok(v: &Value) -> Value {
 fn huge_flat_array() {
     let arr: Vec<i64> = (0..100_000).collect();
     let out = compress_ok(&json!(arr));
-    // Default truncate_arrays_at=32 → 32 kept + 1 marker.
-    assert_eq!(out.as_array().unwrap().len(), 33);
+    // Default truncate_arrays_at=32 + array_tail_preserve=8 → 32 head + 1 marker + 8 tail.
+    assert_eq!(out.as_array().unwrap().len(), 41);
 }
 
 #[test]

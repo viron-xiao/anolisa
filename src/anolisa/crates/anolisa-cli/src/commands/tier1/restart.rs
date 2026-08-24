@@ -29,14 +29,17 @@
 //!   6. Calls `restart_service(unit)` per unit. Per-unit failures are collected
 //!      as warnings; a unit systemctl refuses does NOT abort the whole op.
 //!
-//! The selected state-root lock covers lookup through service dispatch. This
-//! prevents restart from racing teardown and makes the same pending-recovery
-//! gate used by other lifecycle mutations authoritative here as well.
+//! The execute path holds the exclusive state-root lock from lookup through
+//! service dispatch so restart cannot race teardown and the pending-recovery
+//! gate stays authoritative. `--dry-run` reads the same state and journals
+//! without creating or exclusively locking that root, matching
+//! forget/repair previews, so a non-root system preview can render a plan
+//! on a root-owned install.
 
 use clap::Parser;
 
 use anolisa_core::domain::{Installation, ProviderBinding};
-use anolisa_core::facts::JournalEvidence;
+use anolisa_core::facts::{JournalEvidence, pending_journal_for};
 use anolisa_core::lock::InstallLock;
 use anolisa_core::{
     ObjectKind, ServiceManager, ServiceScope, ServiceState,
@@ -50,7 +53,7 @@ use anolisa_platform::rpm_query::RpmPackageQuery;
 
 use crate::color::Palette;
 use crate::commands::common;
-use crate::commands::tier1::recovery::LockedJournalGate;
+use crate::commands::tier1::recovery::{LockedJournalGate, pending_operation_error};
 use crate::commands::tier1::rpm_install;
 use crate::context::CliContext;
 use crate::response::{CliError, render_json};
@@ -64,22 +67,60 @@ pub struct RestartArgs {
 }
 
 pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
-    let command = format!("restart {}", args.component);
+    let payload = compute_restart(&args.component, ctx)?;
+    render_restart(&payload, ctx)
+}
+
+/// Resolve units and either preview or dispatch the restart.
+///
+/// `--dry-run` must not `daemon-reload` or `restart_service`. Those are live
+/// systemd mutations; a preview that still dispatched would bounce units
+/// while the operator asked only for the plan. Unsupported scopes stay
+/// `not_supported` so the preview names the same units execute would skip.
+fn compute_restart(input: &str, ctx: &CliContext) -> Result<RestartPayload, CliError> {
+    compute_restart_with(input, ctx, None)
+}
+
+/// Resolve units and either preview or dispatch using the given managers.
+///
+/// Tests inject recording managers so a supported backend cannot hide a
+/// dry-run dispatch behind the host's `not_supported` skip.
+fn compute_restart_with(
+    input: &str,
+    ctx: &CliContext,
+    managers: Option<(&dyn ServiceManager, &dyn ServiceManager)>,
+) -> Result<RestartPayload, CliError> {
+    let command = format!("restart {input}");
 
     let install_mode = ctx.install_mode.as_str();
     let layout = common::resolve_layout(ctx);
-    let _lock = InstallLock::acquire(&layout.lock_file).map_err(|err| CliError::Runtime {
-        command: command.clone(),
-        reason: format!("failed to acquire install lock: {err}"),
-    })?;
-    let (resolved, view) = common::resolve_mutation_target(&args.component, ctx, &command)?;
+    // Preview only reads recorded units and journals. Creating or exclusively
+    // locking `/var/lib/anolisa/lock` would fail on a root-owned install
+    // before a non-root `--dry-run` could print the plan.
+    let exclusive_lock = if ctx.dry_run {
+        None
+    } else {
+        Some(
+            InstallLock::acquire(&layout.lock_file).map_err(|err| CliError::Runtime {
+                command: command.clone(),
+                reason: format!("failed to acquire install lock: {err}"),
+            })?,
+        )
+    };
+    let (resolved, view) = common::resolve_mutation_target(input, ctx, &command)?;
     let journal_dir = rpm_install::journal_dir(&layout);
-    let journal_gate = LockedJournalGate::load(
-        &_lock,
-        JournalEvidence::new(&journal_dir, &view.writable.state.operations),
-        &command,
-    )?;
-    journal_gate.ensure_clear(&resolved, &command)?;
+    let evidence = JournalEvidence::new(&journal_dir, &view.writable.state.operations);
+    if let Some(ref lock) = exclusive_lock {
+        let journal_gate = LockedJournalGate::load(lock, evidence, &command)?;
+        journal_gate.ensure_clear(&resolved, &command)?;
+    } else if let Some(path) =
+        pending_journal_for(evidence, &resolved).map_err(|err| CliError::Runtime {
+            command: command.clone(),
+            reason: format!("failed to inspect operation journals: {err}"),
+        })?
+    {
+        return Err(pending_operation_error(&command, &resolved, &path));
+    }
     let comp = view
         .writable
         .state
@@ -108,18 +149,31 @@ pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
         // Ships only template units whose instances are per-user runtime state
         // restart cannot choose. Not an error: the package is fine,
         // so exit 0 and surface the per-user guidance already collected.
-        return render_guidance_only(&resolved, install_mode, warnings, ctx);
+        return Ok(guidance_only_payload(
+            &resolved,
+            install_mode,
+            warnings,
+            ctx.dry_run,
+        ));
     }
 
-    let env = EnvService::detect();
     // Restart routes each unit through the manager for its own scope — the
     // same per-scope partitioning uninstall uses. System units drive
     // `systemctl`, user units drive `systemctl --user`, so a mixed-scope
     // component never mis-drives a user unit through the system manager (or
     // vice versa): a unit whose scope has no driver here is a per-unit
     // `not_supported` skip rather than a wrong-namespace call.
-    let sys_manager = service_factory(install_mode, &env);
-    let user_manager = user_service_factory(install_mode, &env);
+    let detected_sys;
+    let detected_user;
+    let (sys_manager, user_manager) = match managers {
+        Some(pair) => pair,
+        None => {
+            let env = EnvService::detect();
+            detected_sys = service_factory(install_mode, &env);
+            detected_user = user_service_factory(install_mode, &env);
+            (detected_sys.as_ref(), detected_user.as_ref())
+        }
+    };
 
     // Summary fields describe the set of scopes actually present. The op is
     // "supported" if at least one unit's manager can drive it, and the label
@@ -137,6 +191,88 @@ pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
         (false, false) => unreachable!("restartable units present but no scope flagged"),
     };
 
+    let results = if ctx.dry_run {
+        preview_restart_results(&units, sys_manager, user_manager)
+    } else {
+        execute_restart_units(
+            &units,
+            sys_manager,
+            user_manager,
+            used_sys,
+            used_user,
+            &mut warnings,
+        )
+    };
+
+    Ok(RestartPayload {
+        component: resolved,
+        install_mode: install_mode.to_string(),
+        manager: manager_label,
+        supported,
+        dry_run: ctx.dry_run,
+        units: results,
+        warnings,
+    })
+}
+
+fn render_restart(payload: &RestartPayload, ctx: &CliContext) -> Result<(), CliError> {
+    if ctx.json {
+        return render_json(COMMAND, payload);
+    }
+
+    if !ctx.quiet {
+        if payload.units.is_empty() {
+            let color = Palette::new(ctx.no_color);
+            println!(
+                "{} {} {}",
+                color.command("restart"),
+                payload.component,
+                color.warn("no instances to restart")
+            );
+            for warning in &payload.warnings {
+                eprintln!("{} {}", color.warn("guidance:"), warning);
+            }
+        } else {
+            render_human(payload, ctx.no_color);
+        }
+    }
+    Ok(())
+}
+
+/// Describe units execute would touch without contacting systemd.
+fn preview_restart_results(
+    units: &[RestartUnit],
+    sys_manager: &dyn ServiceManager,
+    user_manager: &dyn ServiceManager,
+) -> Vec<RestartResult> {
+    units
+        .iter()
+        .map(|unit| {
+            let manager = manager_for_scope(unit.scope, sys_manager, user_manager);
+            if !manager.supported() {
+                unsupported_restart_result(unit, manager)
+            } else {
+                RestartResult {
+                    component: unit.component.clone(),
+                    unit: unit.unit.clone(),
+                    state: PLANNED_STATE.to_string(),
+                    changed: false,
+                    manager: manager.manager().to_string(),
+                    message: format!("dry-run: would restart {}", unit.unit),
+                }
+            }
+        })
+        .collect()
+}
+
+fn execute_restart_units(
+    units: &[RestartUnit],
+    sys_manager: &dyn ServiceManager,
+    user_manager: &dyn ServiceManager,
+    used_sys: bool,
+    used_user: bool,
+    warnings: &mut Vec<String>,
+) -> Vec<RestartResult> {
     // Freshly-placed units (a place-only install, or an RPM whose %post did not
     // reload the manager) aren't loadable until the manager reloads its unit
     // database, so restart would otherwise fail "unit not found". Reload once
@@ -153,36 +289,21 @@ pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
     }
 
     let mut results: Vec<RestartResult> = Vec::with_capacity(units.len());
-
-    for u in &units {
-        let manager: &dyn ServiceManager = match u.scope {
-            ServiceScope::System => sys_manager.as_ref(),
-            ServiceScope::User => user_manager.as_ref(),
-        };
+    for unit in units {
+        let manager = manager_for_scope(unit.scope, sys_manager, user_manager);
         if !manager.supported() {
             // Quiet skip: this unit's scope has no driver here (a user unit
             // in a system-mode restart, container, non-Linux). Reported
             // `not_supported` per unit so the boundary is explicit and the
             // unit is never mis-driven through another namespace.
-            let reason = manager
-                .unsupported_reason()
-                .unwrap_or("service manager not supported in this environment")
-                .to_string();
-            results.push(RestartResult {
-                component: u.component.clone(),
-                unit: u.unit.clone(),
-                state: "not_supported".to_string(),
-                changed: false,
-                manager: manager.manager().to_string(),
-                message: reason,
-            });
+            results.push(unsupported_restart_result(unit, manager));
             continue;
         }
-        match manager.restart_service(&u.unit) {
+        match manager.restart_service(&unit.unit) {
             Ok(outcome) => {
                 results.push(RestartResult {
-                    component: u.component.clone(),
-                    unit: u.unit.clone(),
+                    component: unit.component.clone(),
+                    unit: unit.unit.clone(),
                     state: outcome.state.as_str().to_string(),
                     changed: outcome.changed,
                     manager: outcome.manager,
@@ -191,8 +312,8 @@ pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
                 if matches!(outcome.state, ServiceState::Failed | ServiceState::Unknown) {
                     warnings.push(format!(
                         "{}/{} reports state '{}' after restart",
-                        u.component,
-                        u.unit,
+                        unit.component,
+                        unit.unit,
                         outcome.state.as_str()
                     ));
                 }
@@ -201,11 +322,11 @@ pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
                 let msg = format!("{err}");
                 warnings.push(format!(
                     "service restart skipped for {}/{}: {msg}",
-                    u.component, u.unit
+                    unit.component, unit.unit
                 ));
                 results.push(RestartResult {
-                    component: u.component.clone(),
-                    unit: u.unit.clone(),
+                    component: unit.component.clone(),
+                    unit: unit.unit.clone(),
                     state: "unknown".to_string(),
                     changed: false,
                     manager: manager.manager().to_string(),
@@ -214,30 +335,32 @@ pub fn handle(args: RestartArgs, ctx: &CliContext) -> Result<(), CliError> {
             }
         }
     }
+    results
+}
 
-    if ctx.json {
-        let payload = RestartPayload {
-            component: resolved.clone(),
-            install_mode: install_mode.to_string(),
-            manager: manager_label.clone(),
-            supported,
-            units: results.clone(),
-            warnings: warnings.clone(),
-        };
-        return render_json(COMMAND, &payload);
+fn manager_for_scope<'a>(
+    scope: ServiceScope,
+    sys_manager: &'a dyn ServiceManager,
+    user_manager: &'a dyn ServiceManager,
+) -> &'a dyn ServiceManager {
+    match scope {
+        ServiceScope::System => sys_manager,
+        ServiceScope::User => user_manager,
     }
+}
 
-    if !ctx.quiet {
-        render_human(
-            &resolved,
-            &manager_label,
-            supported,
-            &results,
-            &warnings,
-            ctx.no_color,
-        );
+fn unsupported_restart_result(unit: &RestartUnit, manager: &dyn ServiceManager) -> RestartResult {
+    RestartResult {
+        component: unit.component.clone(),
+        unit: unit.unit.clone(),
+        state: "not_supported".to_string(),
+        changed: false,
+        manager: manager.manager().to_string(),
+        message: manager
+            .unsupported_reason()
+            .unwrap_or("service manager not supported in this environment")
+            .to_string(),
     }
-    Ok(())
 }
 
 /// Absolute directories systemd searches for **system** unit files. A `.service`
@@ -376,43 +499,17 @@ fn guidance_only_payload(
     component: &str,
     install_mode: &str,
     warnings: Vec<String>,
+    dry_run: bool,
 ) -> RestartPayload {
     RestartPayload {
         component: component.to_string(),
         install_mode: install_mode.to_string(),
         manager: GUIDANCE_MANAGER.to_string(),
         supported: true,
+        dry_run,
         units: Vec::new(),
         warnings,
     }
-}
-
-/// Successful guidance-only outcome: the component ships only
-/// template units restart cannot expand, so there is nothing to drive but the
-/// package is healthy. Exits 0 with the per-user guidance as warnings.
-fn render_guidance_only(
-    component: &str,
-    install_mode: &str,
-    warnings: Vec<String>,
-    ctx: &CliContext,
-) -> Result<(), CliError> {
-    if ctx.json {
-        let payload = guidance_only_payload(component, install_mode, warnings);
-        return render_json(COMMAND, &payload);
-    }
-    if !ctx.quiet {
-        let color = Palette::new(ctx.no_color);
-        println!(
-            "{} {} {}",
-            color.command("restart"),
-            component,
-            color.warn("no instances to restart")
-        );
-        for w in &warnings {
-            eprintln!("{} {}", color.warn("guidance:"), w);
-        }
-    }
-    Ok(())
 }
 
 /// Keep the `.service` files that sit **directly** in a known systemd unit
@@ -482,45 +579,56 @@ struct RestartResult {
     message: String,
 }
 
-#[derive(serde::Serialize)]
+/// Wire state for a dry-run unit that execute would restart.
+const PLANNED_STATE: &str = "planned";
+
+#[derive(Debug, serde::Serialize)]
 struct RestartPayload {
     component: String,
     install_mode: String,
     manager: String,
     supported: bool,
+    dry_run: bool,
     units: Vec<RestartResult>,
     warnings: Vec<String>,
 }
 
-fn render_human(
-    component: &str,
-    manager_label: &str,
-    supported: bool,
-    results: &[RestartResult],
-    warnings: &[String],
-    no_color: bool,
-) {
-    let color = Palette::new(no_color);
-    if supported {
-        println!(
-            "{} {} {}",
-            color.command("restart"),
-            component,
-            color.ok("dispatched")
-        );
+/// Banner verb for the human summary. Unsupported scopes keep `skipped`
+/// even on `--dry-run`, so a preview does not look successful when every
+/// unit would be refused.
+fn human_banner_status(payload: &RestartPayload) -> &'static str {
+    if !payload.supported {
+        "skipped"
+    } else if payload.dry_run {
+        "planned"
     } else {
+        "dispatched"
+    }
+}
+
+fn render_human(payload: &RestartPayload, no_color: bool) {
+    let color = Palette::new(no_color);
+    let status = human_banner_status(payload);
+    if status == "skipped" {
         println!(
             "{} {} {} {}",
             color.command("restart"),
-            component,
-            color.warn("skipped"),
-            color.muted(format!("(manager={manager_label} unsupported)"))
+            payload.component,
+            color.warn(status),
+            color.muted(format!("(manager={} unsupported)", payload.manager))
+        );
+    } else {
+        println!(
+            "{} {} {}",
+            color.command("restart"),
+            payload.component,
+            color.ok(status)
         );
     }
-    println!("{} {}", color.label("manager:"), manager_label);
-    if !results.is_empty() {
+    println!("{} {}", color.label("manager:"), payload.manager);
+    if !payload.units.is_empty() {
         println!("{}", color.header("units:"));
-        for r in results {
+        for r in &payload.units {
             println!(
                 "  - {}/{} {} (changed={})",
                 r.component,
@@ -530,7 +638,7 @@ fn render_human(
             );
         }
     }
-    for w in warnings {
+    for w in &payload.warnings {
         eprintln!("{} {}", color.warn("warning:"), w);
     }
 }
@@ -547,6 +655,7 @@ mod tests {
     use anolisa_core::state::ServiceRef;
     use anolisa_core::state_store::StateStore;
     use anolisa_core::transaction::Transaction;
+    use anolisa_core::{FakeServiceManager, ServiceOp};
     use anolisa_platform::command::CommandOutput;
     use anolisa_platform::fs_layout::FsLayout;
     use std::path::PathBuf;
@@ -556,12 +665,96 @@ mod tests {
         let root = prefix
             .as_deref()
             .unwrap_or_else(|| std::path::Path::new("/tmp/anolisa-restart-validation"));
+        // Identity resolution consults the component index for names absent
+        // from state; a seeded local index keeps fixture names supported.
+        if install_mode == InstallMode::System
+            && let Some(prefix) = prefix.as_ref()
+        {
+            crate::commands::tier1::install::tests::seed_repo_config_with_index(
+                &anolisa_platform::fs_layout::FsLayout::system(Some(prefix.clone())),
+                crate::commands::tier1::install::tests::TEST_INDEX_COMPONENTS,
+            );
+        }
         crate::test_support::context_for_root(
             root,
             install_mode,
             prefix.clone(),
             Default::default(),
         )
+    }
+
+    fn ctx_with_options(
+        install_mode: InstallMode,
+        prefix: Option<PathBuf>,
+        options: crate::test_support::TestContextOptions,
+    ) -> CliContext {
+        let root = prefix
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("/tmp/anolisa-restart-validation"));
+        if install_mode == InstallMode::System
+            && let Some(prefix) = prefix.as_ref()
+        {
+            crate::commands::tier1::install::tests::seed_repo_config_with_index(
+                &anolisa_platform::fs_layout::FsLayout::system(Some(prefix.clone())),
+                crate::commands::tier1::install::tests::TEST_INDEX_COMPONENTS,
+            );
+        }
+        crate::test_support::context_for_root(root, install_mode, prefix.clone(), options)
+    }
+
+    const PROBE_UNIT: &str = "anolisa-restart-dry-run-probe.service";
+
+    fn planted_restart_ctx(dry_run: bool) -> (tempfile::TempDir, CliContext) {
+        let tmp = tempdir().expect("tmpdir");
+        let prefix = tmp.path().to_path_buf();
+        let layout = FsLayout::system(Some(prefix.clone()));
+        plant_owned_restartable(&layout, "agentsight", PROBE_UNIT, ServiceScope::System);
+        let ctx = ctx_with_options(
+            InstallMode::System,
+            Some(prefix),
+            crate::test_support::TestContextOptions {
+                dry_run,
+                quiet: true,
+                no_color: true,
+                ..Default::default()
+            },
+        );
+        (tmp, ctx)
+    }
+
+    fn plant_owned_restartable(layout: &FsLayout, name: &str, unit: &str, scope: ServiceScope) {
+        let state_path = layout.state_dir.join("installed.toml");
+        let mut store = StateStore::empty_for_layout(layout);
+        store.upsert(Installation {
+            kind: ObjectKind::Component,
+            name: name.to_string(),
+            scope: InstallationScope::System,
+            binding: ProviderBinding::Owned {
+                artifact: OwnedArtifact {
+                    version: "1.0.0".to_string(),
+                    distribution_source: None,
+                    raw_package: None,
+                    manifest_digest: None,
+                    files: Vec::new(),
+                    services: vec![ServiceRef {
+                        name: unit.to_string(),
+                        manager: "systemd".to_string(),
+                        restartable: true,
+                        enabled: true,
+                        scope,
+                    }],
+                    external_modified_files: Vec::new(),
+                    provisioned_packages: Vec::new(),
+                },
+            },
+            status: LifecycleStatus::Installed,
+            installed_at: "2026-07-21T00:00:00Z".to_string(),
+            last_operation_id: None,
+            subscription_scope: Default::default(),
+            enabled_features: Vec::new(),
+            health: Vec::new(),
+        });
+        store.save(&state_path).expect("save state");
     }
 
     /// Fake `CommandRunner` returning a canned `rpm -ql` listing (or a spawn
@@ -742,7 +935,10 @@ mod tests {
             "anolisa-memory@.service",
             ServiceScope::User,
         )];
-        let res = render_guidance_only("agent-memory", "system", warnings, &ctx);
+        let res = render_restart(
+            &guidance_only_payload("agent-memory", "system", warnings, ctx.dry_run),
+            &ctx,
+        );
         assert!(
             res.is_ok(),
             "templates-only restart must succeed, got {res:?}"
@@ -757,9 +953,10 @@ mod tests {
             "anolisa-memory@.service",
             ServiceScope::User,
         )];
-        let payload = guidance_only_payload("agent-memory", "system", warnings);
+        let payload = guidance_only_payload("agent-memory", "system", warnings, false);
         assert_eq!(payload.manager, "none");
         assert!(payload.supported);
+        assert!(!payload.dry_run);
         assert!(payload.units.is_empty());
         assert_eq!(payload.warnings.len(), 1);
         assert!(
@@ -822,5 +1019,280 @@ mod tests {
             "{}",
             err.reason()
         );
+    }
+
+    #[test]
+    fn dry_run_lists_recorded_units_without_dispatching() {
+        // Inject supported recording managers so this cannot go green on a
+        // host whose real manager is `not_supported` and therefore never
+        // calls reload/restart even on the execute path.
+        let (_tmp, ctx) = planted_restart_ctx(true);
+        let sys = FakeServiceManager::new();
+        let user = FakeServiceManager::with_scope(ServiceScope::User);
+
+        let payload =
+            compute_restart_with("agentsight", &ctx, Some((&sys, &user))).expect("dry-run preview");
+
+        assert!(payload.dry_run, "preview must mark dry_run");
+        assert!(payload.supported);
+        assert_eq!(payload.units.len(), 1, "{:?}", payload.units);
+        assert_eq!(payload.units[0].unit, PROBE_UNIT);
+        assert_eq!(payload.units[0].state, PLANNED_STATE);
+        assert!(!payload.units[0].changed);
+        assert!(
+            payload.units[0].message.contains("dry-run: would restart"),
+            "{}",
+            payload.units[0].message
+        );
+        assert!(
+            sys.calls().is_empty(),
+            "dry-run must not reload or restart: {:?}",
+            sys.calls()
+        );
+        assert!(
+            user.calls().is_empty(),
+            "dry-run must not touch the user manager: {:?}",
+            user.calls()
+        );
+        assert!(
+            payload
+                .warnings
+                .iter()
+                .all(|w| !w.contains("daemon-reload")),
+            "dry-run must not daemon-reload: {:?}",
+            payload.warnings
+        );
+    }
+
+    #[test]
+    fn execute_records_reload_and_restart_when_manager_is_supported() {
+        let (_tmp, ctx) = planted_restart_ctx(false);
+        let sys = FakeServiceManager::new();
+        let user = FakeServiceManager::with_scope(ServiceScope::User);
+
+        let payload =
+            compute_restart_with("agentsight", &ctx, Some((&sys, &user))).expect("execute restart");
+
+        assert!(!payload.dry_run);
+        assert!(payload.supported);
+        assert_eq!(payload.units.len(), 1, "{:?}", payload.units);
+        assert_eq!(payload.units[0].unit, PROBE_UNIT);
+        assert_ne!(payload.units[0].state, PLANNED_STATE);
+        assert_eq!(
+            sys.calls(),
+            vec![
+                (ServiceOp::DaemonReload, String::new()),
+                (ServiceOp::Restart, PROBE_UNIT.to_string()),
+            ]
+        );
+        assert!(
+            user.calls().is_empty(),
+            "system-only execute must not drive the user manager: {:?}",
+            user.calls()
+        );
+    }
+
+    #[test]
+    fn dry_run_human_banner_stays_skipped_when_unsupported() {
+        let unsupported = RestartPayload {
+            component: "agentsight".to_string(),
+            install_mode: "system".to_string(),
+            manager: "not-supported".to_string(),
+            supported: false,
+            dry_run: true,
+            units: vec![RestartResult {
+                component: "agentsight".to_string(),
+                unit: PROBE_UNIT.to_string(),
+                state: "not_supported".to_string(),
+                changed: false,
+                manager: "not-supported".to_string(),
+                message: "container".to_string(),
+            }],
+            warnings: Vec::new(),
+        };
+        assert_eq!(human_banner_status(&unsupported), "skipped");
+
+        let planned = RestartPayload {
+            supported: true,
+            manager: "fake".to_string(),
+            units: vec![RestartResult {
+                manager: "fake".to_string(),
+                state: PLANNED_STATE.to_string(),
+                message: "dry-run: would restart".to_string(),
+                ..unsupported.units[0].clone()
+            }],
+            ..unsupported
+        };
+        assert_eq!(human_banner_status(&planned), "planned");
+
+        let dispatched = RestartPayload {
+            dry_run: false,
+            ..planned
+        };
+        assert_eq!(human_banner_status(&dispatched), "dispatched");
+    }
+
+    #[test]
+    fn dry_run_still_refuses_an_absent_component() {
+        let tmp = tempdir().expect("tmpdir");
+        let ctx = ctx_with_options(
+            InstallMode::System,
+            Some(tmp.path().to_path_buf()),
+            crate::test_support::TestContextOptions {
+                dry_run: true,
+                quiet: true,
+                no_color: true,
+                ..Default::default()
+            },
+        );
+        let err = compute_restart("agentsight", &ctx).expect_err("absent target must fail");
+        assert_eq!(err.code(), "NOT_INSTALLED");
+    }
+
+    #[test]
+    fn dry_run_still_refuses_a_pending_lifecycle() {
+        let tmp = tempdir().expect("tmpdir");
+        let prefix = tmp.path().to_path_buf();
+        let layout = FsLayout::system(Some(prefix.clone()));
+        plant_owned_restartable(
+            &layout,
+            "agentsight",
+            "anolisa-restart-dry-run-probe.service",
+            ServiceScope::System,
+        );
+        let _pending = Transaction::begin_with_subject(
+            "uninstall",
+            Some("agentsight"),
+            layout.state_dir.join("installed.toml"),
+            &rpm_install::journal_dir(&layout),
+        )
+        .expect("begin pending uninstall");
+        let ctx = ctx_with_options(
+            InstallMode::System,
+            Some(prefix),
+            crate::test_support::TestContextOptions {
+                dry_run: true,
+                quiet: true,
+                no_color: true,
+                ..Default::default()
+            },
+        );
+
+        let err = compute_restart("agentsight", &ctx)
+            .expect_err("pending lifecycle must block the preview too");
+        assert!(err.reason().contains("pending operation journal"), "{err}");
+    }
+
+    #[test]
+    fn dry_run_does_not_create_the_exclusive_lock() {
+        let (_tmp, ctx) = planted_restart_ctx(true);
+        let layout = FsLayout::system(Some(ctx.prefix.clone().expect("planted prefix")));
+        assert!(
+            !layout.lock_file.exists(),
+            "fixture must start without a lock file"
+        );
+
+        let sys = FakeServiceManager::new();
+        let user = FakeServiceManager::with_scope(ServiceScope::User);
+        let payload =
+            compute_restart_with("agentsight", &ctx, Some((&sys, &user))).expect("dry-run preview");
+
+        assert!(payload.dry_run);
+        assert_eq!(payload.units[0].state, PLANNED_STATE);
+        assert!(
+            !layout.lock_file.exists(),
+            "preview must not create {}",
+            layout.lock_file.display()
+        );
+    }
+
+    #[test]
+    fn dry_run_previews_from_a_non_writable_system_state_root() {
+        // Root ignores directory mode bits, so this models a normal
+        // unprivileged preview against a root-owned `/var/lib/anolisa`.
+        if anolisa_platform::privilege::effective_uid() == 0 {
+            return;
+        }
+
+        let (tmp, dry_ctx) = planted_restart_ctx(true);
+        let layout = FsLayout::system(Some(tmp.path().to_path_buf()));
+        let exec_ctx = ctx_with_options(
+            InstallMode::System,
+            Some(tmp.path().to_path_buf()),
+            crate::test_support::TestContextOptions {
+                dry_run: false,
+                quiet: true,
+                no_color: true,
+                ..Default::default()
+            },
+        );
+        let _restore = RestorePermissions::dir_mode(&layout.state_dir, 0o555, 0o755);
+
+        let sys = FakeServiceManager::new();
+        let user = FakeServiceManager::with_scope(ServiceScope::User);
+        let payload = compute_restart_with("agentsight", &dry_ctx, Some((&sys, &user)))
+            .expect("non-writable preview must still list units");
+        assert!(payload.dry_run);
+        assert_eq!(payload.units[0].unit, PROBE_UNIT);
+        assert_eq!(payload.units[0].state, PLANNED_STATE);
+        assert!(
+            !layout.lock_file.exists(),
+            "preview must not create the exclusive lock"
+        );
+
+        let err = compute_restart("agentsight", &exec_ctx)
+            .expect_err("execute still needs a writable exclusive lock");
+        assert!(
+            err.reason().contains("failed to acquire install lock"),
+            "{err}"
+        );
+    }
+
+    struct RestorePermissions {
+        path: PathBuf,
+        restore: u32,
+    }
+
+    impl RestorePermissions {
+        fn dir_mode(path: &std::path::Path, restrict: u32, restore: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)
+                .expect("state dir metadata")
+                .permissions();
+            perms.set_mode(restrict);
+            std::fs::set_permissions(path, perms).expect("restrict state dir");
+            Self {
+                path: path.to_path_buf(),
+                restore,
+            }
+        }
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&self.path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(self.restore);
+                let _ = std::fs::set_permissions(&self.path, perms);
+            }
+        }
+    }
+
+    #[test]
+    fn preview_marks_unsupported_scopes_without_planned() {
+        let units = [RestartUnit {
+            component: "agentsight".to_string(),
+            unit: "agentsight.service".to_string(),
+            scope: ServiceScope::System,
+        }];
+        let manager = anolisa_core::NotSupportedServiceManager::new(
+            "container runtime detected — refusing to drive systemctl".to_string(),
+        );
+        let results = preview_restart_results(&units, &manager, &manager);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].state, "not_supported");
+        assert!(!results[0].changed);
+        assert_ne!(results[0].state, PLANNED_STATE);
     }
 }

@@ -9,6 +9,110 @@
 
 ## [未发布]
 
+## [0.3.6] - 2026-08-22
+
+### 修复
+
+- `anolisa --quiet adapter scan` 和 `anolisa --quiet adapter status` 现会
+  抑制所有非错误的人类可读输出，包括空状态提示与结果表格；`--json` 仍会输出
+  标准响应封装。Agent 可依赖 quiet 模式的 adapter 检查不产生人类可读输出
+  ([#2752](https://github.com/alibaba/anolisa/pull/2752))。
+- `anolisa --dry-run forget <component>` 现会与真实执行一样，以
+  `INVALID_ARGUMENT`、退出码 2 和 `adapter disable` 指引，拒绝仍有已启用
+  adapter 的 component。预览不再误报无法执行的 forget 会成功，同时仍会忽略
+  无关 component 的 adapter receipt
+  ([#2762](https://github.com/alibaba/anolisa/pull/2762))。
+
+## [0.3.5] - 2026-08-20
+
+### 修复
+
+- 卸载声明 bare systemd service template 的组件时，ANOLISA 现会通过
+  `name@*.service` 停止所有已加载实例，再禁用声明的 `name@.service` template。
+  基于 template 的 service 不会在 `anolisa uninstall` 后继续运行；单个实例停止
+  失败仍会以 warning 呈现，而不会阻止后续清理
+  ([#2603](https://github.com/alibaba/anolisa/pull/2603))。
+
+## [0.3.4] - 2026-08-19
+
+### 变更
+
+- 面向组件的命令现将 repository component index 作为 local state 中不存在的
+  名称的唯一身份权威。已安装和 recovery identity 在离线时仍可使用；不支持的
+  名称返回 `INVALID_ARGUMENT`，index 不可用返回 `EXECUTION_FAILED`，而
+  `NOT_INSTALLED` 现可明确表示受支持的组件尚未安装。`--repo` override 同时决定
+  整个 invocation 的 identity 与 package selection，因此 site-local package
+  mapping 和 RPM `Provides` metadata 不再能创建 index 未识别的组件名称
+  ([#2637](https://github.com/alibaba/anolisa/pull/2637))。
+
+### 修复
+
+- 本地 Raw repository index 缺失时，错误信息现会指出 active repository 来自
+  具体的 `repo.toml` path 还是一次性的 `--repo` override，并提供对应的 recovery
+  guidance。用户无需再猜测缺失 repository 由哪个配置来源指定
+  ([#2650](https://github.com/alibaba/anolisa/pull/2650))。
+
+## [0.3.3] - 2026-08-18
+
+### 新增
+
+- Telemetry instance snapshot 现会将检测到的 Docker、Podman、containerd、
+  Kubernetes cgroup 或 LXC runtime 写入 `instance.container`，bare-metal host
+  则省略该字段。这为下游 deployment statistics 与 troubleshooting 提供
+  container-aware signal，同时不会采集 container 或 pod identity
+  ([#2642](https://github.com/alibaba/anolisa/pull/2642))。
+
+### 变更
+
+- `anolisa status <component>` 现会依据 component index 验证新 target、解析
+  package alias，并为不支持的名称提示 `anolisa list`，同时将 telemetry service
+  target 引导至 `anolisa telemetry status`。Repository metadata 不可用时，仍可
+  检查已精确记录的 installed identity
+  ([#2626](https://github.com/alibaba/anolisa/pull/2626))。
+
+### 修复
+
+- Raw adapter bundle 安装现会保留 archive 中每个 file 的 mode，并记录 effective
+  mode 供 integrity check 使用。Framework hook 与 script 不再统一按 data file
+  安装，可继续保留 executable bit
+  ([#2619](https://github.com/alibaba/anolisa/pull/2619))。
+
+## [0.3.2] - 2026-08-17
+
+### 新增
+
+- ANOLISA 现为 plugin bundle 提供原生 DSH adapter driver。
+  `anolisa adapter enable <component> dsh --profile <name>` 支持重复指定
+  profile、验证 bundle identity、将 profile 变更委托给 DSH，并记录 enable
+  时的 DSH home，使 status、disable 和 re-enable 在 `DSH_HOME` 或 working
+  directory 变化后仍针对相同 profile。降级到更早的 ANOLISA release 前需先
+  disable DSH adapter
+  ([#2580](https://github.com/alibaba/anolisa/pull/2580))。
+- `anolisa logs --level <LEVEL>` 现为已有 `--severity` option 的可见别名，
+  使用相同的 validation 和 filtering behavior，同时 `severity` 仍为 canonical
+  JSON field
+  ([#2558](https://github.com/alibaba/anolisa/pull/2558))。
+
+### 变更
+
+- `anolisa list` 和 `anolisa install --all` 现依据 schema v2
+  `components-v2.toml` 中精确的 OS 与 architecture target 判断 component
+  availability。JSON output 以 `targets` 和 `target_available` 取代
+  `platforms` 和 `platform_available`；repository publisher 必须在保持 v1
+  index 不变的同时部署 v2 index
+  ([#2533](https://github.com/alibaba/anolisa/pull/2533))。
+
+### 修复
+
+- `anolisa --dry-run install` 现优先读取 resolved Raw artifact 旁的
+  `meta.toml`，仅在该 sibling file 不存在时回退到 version-level metadata。
+  Preview 现会验证所选 target 的 contract，并拒绝损坏的已发布 metadata，
+  不再掩盖错误，同时仍不会下载 artifact
+  ([#2551](https://github.com/alibaba/anolisa/pull/2551))。
+- System-helper status 现会在 `systemctl` 无法启动时报告 `unknown`，仅在 unit
+  的实际状态为 failed 时报告 `failed`
+  ([#2604](https://github.com/alibaba/anolisa/pull/2604))。
+
 ## [0.3.1] - 2026-08-13
 
 ### 修复

@@ -339,6 +339,41 @@ export async function fetchSessions(
   return apiFetch<SessionSummary[]>(`${API_BASE}/api/sessions${qs}`);
 }
 
+/** Candidate session summary sent to the semantic search endpoint. */
+export interface SemanticSearchCandidate {
+  session_id: string;
+  first_message: string | null;
+  last_message: string | null;
+  project: string | null;
+}
+
+/** One LLM-ranked semantic match. */
+export interface SemanticSearchResult {
+  session_id: string;
+  relevance: 'high' | 'medium';
+  reason: string;
+}
+
+export interface SemanticSearchResponse {
+  results: SemanticSearchResult[];
+}
+
+/**
+ * Ask the configured LLM to rank candidate sessions by semantic relevance to
+ * `query`. Returns an empty list when semantic search is unavailable or the
+ * caller sent too few candidates.
+ */
+export async function semanticSearchSessions(body: {
+  query: string;
+  candidates: SemanticSearchCandidate[];
+}): Promise<SemanticSearchResponse> {
+  return apiFetch<SemanticSearchResponse>(`${API_BASE}/api/sessions/search`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 /**
  * List all trace IDs within a session, with per-trace token stats.
  * Optional startNs/endNs are forwarded as query parameters for future
@@ -578,6 +613,38 @@ export interface TimeseriesResponse {
   model_series: ModelTimeseriesBucket[];
 }
 
+export interface MetricPercentiles {
+  p50: number;
+  p95: number;
+  p99: number;
+}
+
+export interface LatencyMetricsSummary {
+  agent_name: string | null;
+  call_count: number;
+  streaming_call_count: number;
+  ttft_ms: MetricPercentiles | null;
+  tps_tokens_per_second: MetricPercentiles | null;
+  tpot_ms_per_token: MetricPercentiles | null;
+  e2e_latency_ms: MetricPercentiles | null;
+}
+
+/**
+ * Fetch percentile latency metrics grouped by Agent.
+ */
+export async function fetchLatencyMetrics(
+  startNs: number,
+  endNs: number,
+  agentName?: string
+): Promise<LatencyMetricsSummary[]> {
+  const params = new URLSearchParams({
+    start_ns: String(startNs),
+    end_ns: String(endNs),
+  });
+  if (agentName) params.set('agent_name', agentName);
+  return apiFetch<LatencyMetricsSummary[]>(`${API_BASE}/api/metrics/latency?${params.toString()}`);
+}
+
 /**
  * Fetch time-bucketed token stats and per-model breakdowns.
  */
@@ -637,7 +704,9 @@ export interface SessionSavings {
   baseline_tokens: number;
   saved_tokens: number;
   compounded_saved: number;
+  /** Fraction of tokens saved, in [0, 1] (not a percentage). */
   savings_rate: number;
+  /** Fraction saved including compounding, in [0, 1] (not a percentage). */
   compounded_savings_rate: number;
   request_count: number;
   tool_saved: number;
@@ -659,7 +728,9 @@ export interface SavingsSummary {
   baseline_tokens: number;
   total_saved_tokens: number;
   total_compounded_saved: number;
+  /** Fraction of tokens saved, in [0, 1] (not a percentage). */
   savings_rate: number;
+  /** Fraction saved including compounding, in [0, 1] (not a percentage). */
   compounded_savings_rate: number;
   total_tool_saved: number;
   total_mcp_saved: number;
@@ -705,6 +776,7 @@ export interface SessionSavingsDetail {
   total_actual_tokens: number;
   total_compounded_saved: number;
   total_original_tokens: number;
+  /** Fraction of tokens saved, in [0, 1] (not a percentage). */
   savings_rate: number;
   items: OptimizationItem[];
 }
@@ -862,28 +934,6 @@ export interface ConversationInterruptionCount {
   };
   types: InterruptionTypeDetail[];
 }
-
-/** Map English interruption_type keys to Chinese labels. */
-export const INTERRUPTION_TYPE_CN: Record<string, string> = {
-  llm_error: 'LLM 错误',
-  sse_truncated: 'SSE 截断',
-  context_overflow: '上下文溢出',
-  agent_crash: 'Agent 崩溃',
-  token_limit: 'Token 超限',
-  rate_limit: '速率限制',
-  auth_error: '鉴权错误',
-  network_timeout: '网络超时',
-  service_unavailable: '服务不可用',
-  safety_filter: '安全过滤',
-  retry_storm: '重试风暴',
-  dead_loop: '死循环',
-  tool_failure: '工具调用失败',
-  empty_response: '空响应',
-  resource_exhaustion: '资源耗尽',
-  slow_response: '响应过慢',
-  state_machine_error: '状态机异常',
-  unauthorized_action: '未授权操作',
-};
 
 /**
  * Fetch all unresolved interruptions for a session.
@@ -1769,6 +1819,7 @@ export type AppCapability =
   | 'optimization'
   | 'skills'
   | 'security'
+  | 'system_audit'
   | 'enforcement'
   | 'atif'
   | 'settings'

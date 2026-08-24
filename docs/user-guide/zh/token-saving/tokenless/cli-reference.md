@@ -40,6 +40,22 @@ cat response.json | tokenless compress-response
 - JSON 相关命令要求输入为合法 JSON。
 - 压缩后没有 Token 收益时，CLI 向 stderr 说明原因，并输出原文。
 
+### 最小有效 Payload
+
+`compress-schema` 和 `compress-response` 没有固定的最小输入大小。对于每个通过输入
+规则的合法 JSON，CLI 都会生成候选结果，并用同一个启发式规则估算两者的 Token 数：每个 CJK
+字符计一个 Token，其他字符每四个计一个 Token 并向上取整。在 Active 模式下，只有候选结果的
+估算值严格小于原文（`after < before`）时才会输出候选结果；否则 stdout 输出原文，stderr
+报告 `did not reduce size`，且不写入统计记录。在 Dry-run 模式
+（`TOKENLESS_COMPRESSION_ENABLED=0` 或 `compression_enabled=false`）下，stdout 始终输出
+原文；候选结果更小时，如果已启用 Stats 或 SLS 记录，则把它记为预测节省。
+
+因此，盈亏平衡点取决于内容和 JSON 结构，而不只取决于字节数或字符数。包含可移除字段
+的小 Payload 仍可能被压缩，而已经紧凑的较大 Payload 也可能原样透传。下文的描述、
+字符串、数组和深度阈值只决定单项转换何时触发，并不是整个 Payload 的最小大小。
+Agent Adapter 还可能在启动 CLI 前应用独立的大小门槛，详见
+[Adapter 处理规则](framework-integration.md#adapter-处理规则)。
+
 ## `compress-schema`
 
 压缩单个 OpenAI Function Calling Schema：
@@ -54,7 +70,24 @@ tokenless compress-schema -f tool.json
 cat tools.json | tokenless compress-schema --batch
 ```
 
-输入本身是数组时会自动使用 batch 处理。常用参数：
+接受的输入条目形态（按条目自动识别）：
+
+- OpenAI function 包装：`{"function": {"name", "description", "parameters"}}`
+- 直接 Schema：`{"name", "description", "parameters"}`
+- Gemini / copilot-shell 包装：`{"functionDeclarations": [{"name", "description", "parameters" | "parametersJsonSchema"}, ...]}`；copilot-shell 的 BeforeModel hook 以该形态下发工具声明（`llm_request.config.tools`）。包装内的声明逐个压缩（参数 schema 优先取 `parametersJsonSchema`，其次取 `parameters`），包装本身及其同级字段原样保留。
+
+输入本身是数组时会自动使用 batch 处理。
+
+包含顶层 `tools` 数组的完整请求对象也受支持，其中的 Function Calling 定义可以是
+OpenAI `{"function": {...}}` Wrapper、Gemini `{"functionDeclarations": [...]}` 工具对象，
+或裸 `{name, description, parameters}` 定义。该结构不要传 `--batch`；非函数工具及
+`tools` 之外的字段会原样保留。
+
+```bash
+tokenless compress-schema -f request.json
+```
+
+常用参数：
 
 | 参数 | 说明 |
 |------|------|
@@ -98,13 +131,16 @@ tokenless compress-response -f response.json
 |------|--------|------|
 | `-f, --file <path>` | stdin | 输入文件 |
 | `--truncate-strings-at <n>` | `4096` | 字符串截断阈值 |
-| `--truncate-arrays-at <n>` | `32` | 数组元素保留上限 |
+| `--truncate-arrays-at <n>` | `32` | 触发数组截断的长度阈值；保留前 `n` 个元素 |
+| `--array-tail-preserve <n>` | `8` | 截断数组时从尾部保留的元素数；`0` 禁用尾部保留 |
 | `--max-depth <n>` | `8` | 最大嵌套深度 |
 | `--agent-id <id>` | `cli` | 统计中的 Agent 标识 |
 | `--session-id <id>` | — | 统计中的 Session 标识 |
 | `--tool-use-id <id>` | — | 统计中的工具调用标识 |
 | `--no-stash` | 关闭 | 禁用可逆 Stash |
 | `--stash-db <path>` | `~/.tokenless/stash.db` | 覆盖 Stash 数据库；无效路径会被拒绝为覆盖值，CLI 随后回退到环境变量或默认路径 |
+
+数组截断会保留 `--truncate-arrays-at` 个头部元素和 `--array-tail-preserve` 个尾部元素，并在两者之间插入截断标记。只有当数组长度超过首尾窗口之和时才会丢弃中间元素：默认配置下单条命令可保留 `n + 8` 个元素（外加截断标记）；当两个窗口覆盖整个数组时，所有元素都会保留且不插入标记。设置 `--array-tail-preserve 0` 可恢复纯头部截断。
 
 覆盖阈值：
 
@@ -123,7 +159,7 @@ debug, trace, traces, stack, stacktrace, logs, logging
 
 字段匹配和截断会改变模型看到的响应表示。处理关键 Payload 前，应先保存样例并对比压缩结果。
 
-Stash 只作用于字符串、数组尾部和深层子树截断。黑名单字段、`null` 和空值会直接移除，不会生成取回标记。
+Stash 只作用于字符串、截断数组中被丢弃的中间段和深层子树截断。尾部元素直接保留在输出中，不进入 Stash。黑名单字段、`null` 和空值会直接移除，不会生成取回标记。
 
 大多数 Adapter 会覆盖这些独立 CLI 默认值。共享 Shell 策略使用 `65536`、`128`、`8`；其他结构化工具策略使用 `1048576`、`65536`、`32`。内容读取类工具会被跳过。详见[框架集成 · Adapter 处理规则](framework-integration.md#adapter-处理规则)。
 
@@ -233,6 +269,7 @@ tokenless env-check --tool Shell --fix
 ```bash
 tokenless stats summary
 tokenless stats summary --json
+tokenless stats summary --limit 1000
 tokenless stats list --limit 20
 tokenless stats show <record-id>
 tokenless stats diff <record-id>
@@ -248,6 +285,8 @@ tokenless stats clear --yes
 ```bash
 tokenless stats summary --compare <baseline-session> <active-session>
 ```
+
+Session ID 不存在时以非零退出码失败，而不是输出 0% 对比，行为与 `stats diff --session` 一致。`stats summary --limit` 必须为正整数；`--limit 0` 会在解析阶段被拒绝，行为与 `stats diff --limit` 一致。
 
 查看单条记录，或一次工具调用中可确认衔接的阶段：
 

@@ -218,7 +218,19 @@ impl SchemaCompressor {
         self.stash_errors.set(self.stash_errors.get() + 1);
     }
 
-    /// Compress an OpenAI Function Calling schema.
+    /// Compress a function-calling tool declaration or request envelope.
+    ///
+    /// Supports these declaration and wrapper shapes:
+    /// - OpenAI `{"function": {name, description, parameters}}`
+    /// - Gemini `{"functionDeclarations": [{name, description, parametersJsonSchema}, ...]}`
+    /// - Bare `{name, description, parameters}` declarations, optionally with
+    ///   `"type": "function"`
+    /// - Request envelopes whose top-level `tools` array contains any of the
+    ///   shapes above
+    ///
+    /// The Gemini SDK stores the parameter schema under `parametersJsonSchema`
+    /// (JSON Schema format, used by copilot-shell's `DeclarativeTool`); the
+    /// OpenAI wrapper and bare schema use `parameters`. Both are compressed.
     ///
     /// Unlike [`ResponseCompressor`](crate::ResponseCompressor), this does
     /// not reset stash session state. Pending rollback keys accumulate until
@@ -229,26 +241,36 @@ impl SchemaCompressor {
 
         let mut result = tool.clone();
 
-        // Check if this is a function wrapper or direct schema
-        if let Some(function) = result.get_mut("function") {
-            // Compress function-level description
-            if let Some(desc) = function.get("description").and_then(|d| d.as_str()) {
-                let compressed = self.truncate_description(desc, self.func_desc_max_len);
-                function["description"] = Value::String(compressed);
-            }
-
-            // Optionally remove title
-            #[allow(clippy::collapsible_if)]
-            if self.drop_titles {
-                if let Some(obj) = function.as_object_mut() {
-                    obj.remove("title");
+        // Dispatch by wrapper shape: a request `tools` array, Gemini
+        // `functionDeclarations`, an OpenAI `function`, or a bare declaration.
+        if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+            for entry in tools {
+                let is_bare_declaration = entry.get("type").is_none()
+                    && entry.get("name").and_then(Value::as_str).is_some()
+                    && (entry.get("parameters").is_some()
+                        || entry.get("parametersJsonSchema").is_some());
+                let is_function = entry.get("type").and_then(Value::as_str) == Some("function")
+                    || entry.get("function").is_some()
+                    || entry.get("functionDeclarations").is_some()
+                    || is_bare_declaration;
+                if is_function {
+                    *entry = self.compress(entry);
                 }
             }
-
-            // Compress parameters
-            if let Some(params) = function.get_mut("parameters") {
-                self.compress_json_schema(params, 1);
+        } else if let Some(decls) = result.get_mut("functionDeclarations") {
+            // Gemini tools format: a Tool object wraps an array of
+            // declarations `{ "functionDeclarations": [{name, description,
+            // parametersJsonSchema}, ...] }`. Compress each declaration in
+            // place and leave the rest of the Tool object (e.g.
+            // googleSearchRetrieval, codeExecution) untouched.
+            if let Some(arr) = decls.as_array_mut() {
+                for decl in arr.iter_mut() {
+                    self.compress_declaration(decl);
+                }
             }
+        } else if let Some(function) = result.get_mut("function") {
+            // OpenAI wrapper: { "function": {name, description, parameters} }
+            self.compress_declaration(function);
         } else {
             // Direct schema (no function wrapper). Let compress_json_schema
             // handle description, title removal, and nested properties at
@@ -256,8 +278,14 @@ impl SchemaCompressor {
             // then compress_json_schema would stash the marker string as K2,
             // requiring two retrieves to recover the original.
             if result.is_object() {
-                // Compress parameters if present (not a JSON Schema keyword;
-                // compress_json_schema does not recurse into it).
+                // Compress the parameter schema if present.
+                // compress_json_schema does not recurse into
+                // `parameters`/`parametersJsonSchema` (not JSON Schema
+                // keywords), so handle both explicitly — Gemini SDK uses
+                // parametersJsonSchema, OpenAI/bare use parameters.
+                if let Some(params) = result.get_mut("parametersJsonSchema") {
+                    self.compress_json_schema(params, 1);
+                }
                 if let Some(params) = result.get_mut("parameters") {
                     self.compress_json_schema(params, 1);
                 }
@@ -272,6 +300,42 @@ impl SchemaCompressor {
         }
 
         result
+    }
+
+    /// Compress a single function declaration — the `{name, description,
+    /// parameters}` object shared by the OpenAI `function` wrapper and each
+    /// entry of the Gemini `functionDeclarations` array.
+    ///
+    /// The parameter schema may live under `parametersJsonSchema` (Gemini SDK
+    /// JSON Schema format, used by copilot-shell's `DeclarativeTool`) or
+    /// `parameters` (legacy Gemini Schema object format / OpenAI wrapper).
+    /// The two are mutually exclusive; compress whichever is present.
+    fn compress_declaration(&self, decl: &mut Value) {
+        let Some(obj) = decl.as_object_mut() else {
+            return;
+        };
+
+        // Compress function-level description
+        if let Some(desc) = obj.get("description").and_then(|d| d.as_str()) {
+            let compressed = self.truncate_description(desc, self.func_desc_max_len);
+            obj.insert("description".to_string(), Value::String(compressed));
+        }
+
+        // Optionally remove title
+        if self.drop_titles {
+            obj.remove("title");
+        }
+
+        // Compress the parameter schema. Gemini SDK stores it under
+        // `parametersJsonSchema` (copilot-shell's DeclarativeTool path); the
+        // legacy `parameters` field uses the Gemini Schema object format.
+        // Both are handled so the registry path and OpenAI wrappers compress.
+        if let Some(params) = obj.get_mut("parametersJsonSchema") {
+            self.compress_json_schema(params, 1);
+        }
+        if let Some(params) = obj.get_mut("parameters") {
+            self.compress_json_schema(params, 1);
+        }
     }
 
     /// Recursively compress a JSON Schema

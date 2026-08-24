@@ -10,15 +10,17 @@ intent analysis into a single `Verdict`.
 |-------|--------|--------------|
 | Preprocessing | `preprocessor` | Unicode normalisation and obfuscation decoding |
 | L1 | `detectors::rule_engine` | Regex rules over the prompt and decoded variants |
-| L2 | `detectors::ml_classifier` | Model-backed classification (Qwen3Guard on Ollama) |
+| L2 | `detectors::ml_classifier` | Model-backed classification (Qwen3Guard or Warden-Gen on Ollama) |
 | L3 | _(reserved)_ | Conversation-aware semantic analysis — not implemented yet; naming it in `layers` is a config error |
 | L4 | `detectors::multi_turn_intent` | Conversation-level intent classification |
 
 Layers are selected by `ScanMode` presets and combined into a final
 `Verdict`. `Fast` runs L1 only; `Standard` adds L2; `MultiTurn` adds L4.
-`semantic` (L3) is listed in the optional-detector table and has a display
-name reserved in results, but ships no detector today — selecting it fails
-configuration rather than silently passing.
+`semantic` (L3) has a display name reserved in results but ships no detector
+today — selecting it fails configuration rather than silently passing. No
+layer is optional: an unavailable one fails construction instead of being
+skipped, so `degraded` / `layers_failed` always account for the full
+configured set.
 
 ## Usage
 

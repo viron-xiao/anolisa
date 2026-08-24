@@ -57,7 +57,7 @@ AI Agent 通过加载 Skill（结构化指令 + 辅助脚本）扩展能力。Sk
 - **Scanner Registry**：可扩展扫描框架。通过配置注册扫描器（`builtin`/`cli`/`skill`/`api` 四种调用类型）和结果解析器（将异构扫描输出归一化为统一 `NormalizedFinding` 格式）。本版本默认注册 `skill-vetter`（`type: "skill"`，由 Agent 深度扫描后通过 `certify --findings` 消费）、`code-scanner` 和 `static-scanner`（均为 `type: "builtin"`，可由 `scan` 自动调用）。当前仅实现 `findings-array` parser；`cli`/`api` adapter 及其它 parser 类型为预留扩展点。旧名称 `skill-code-scanner`、`cisco-static-scanner` 仅作为兼容 alias 读取，不再作为公开名称展示或写入新 manifest。
 - **skill-ledger Skill**：一个 Skill，三个阶段。Phase 1 做环境准备与状态查看；Phase 2 默认执行快速扫描认证（`scan` 调用内置 `code-scanner` 与 `static-scanner`）；Phase 3 在用户显式要求或确认后执行 Agent 驱动深度扫描（`skill-vetter`），再用 `certify --findings ... --delete-findings` 写入版本链。
 - **SkillFS + daemon activation**：推荐运行态入口。SkillFS 捕获 Skill 文件变化后调用 daemon 的 `skill_ledger.skillfs_notify_change` 接口，daemon 根据签名 manifest 和 activation policy 刷新 `.skill-meta/activation.json`，并尽力同步写入 xattr。
-- **Hook / capability 兼容层**：OpenClaw、copilot-shell、Hermes 和 Qwen Code 可挂载 `skill-ledger show` 作为兼容入口并读取统一 exposure summary 中的 `message`；Codex 和 Qoder CLI 在各自的 Skill 触发边界调用只读 `skill-ledger check`。默认发行配置继续挂载/注册，`policy = "ask"`。
+- **Hook / capability 兼容层**：OpenClaw、copilot-shell、Hermes 和 Qwen Code 可挂载 `skill-ledger show` 作为兼容入口并读取统一 exposure summary 中的 `message`；Codex 和 Qoder CLI 在各自的 Skill 触发边界调用只读 `skill-ledger check`。默认发行配置继续挂载/注册；支持原生确认的宿主默认 `policy = "ask"`，Hermes 默认 `policy = "observe"`。
 
 ---
 
@@ -631,7 +631,7 @@ agent-sec-cli skill-ledger certify <skill_dir> --findings /tmp/skill-vetter-find
 
 ### 设计原则
 
-推荐部署模式是 SkillFS 捕获变更并触发 daemon activation refresh。宿主 hook/capability 作为兼容入口保留并默认挂载，默认 `policy = "ask"`。OpenClaw、copilot-shell、Hermes 和 Qwen Code 根据 `skill-ledger show` 的统一 exposure summary 决定是否提示；Codex 和 Qoder CLI 在各自的 Skill 触发边界直接消费只读 `skill-ledger check` 状态。
+推荐部署模式是 SkillFS 捕获变更并触发 daemon activation refresh。宿主 hook/capability 作为兼容入口保留并默认挂载。除 Hermes 使用 `policy = "observe"` 外，其余支持提示或确认的宿主默认 `policy = "ask"`。OpenClaw、copilot-shell、Hermes 和 Qwen Code 根据 `skill-ledger show` 的统一 exposure summary 决定宿主动作；Codex 和 Qoder CLI 在各自的 Skill 触发边界直接消费只读 `skill-ledger check` 状态。
 
 使用 exposure summary 的宿主不直接读取 `check.status`，也不自行实现扫描状态分支：
 
@@ -678,13 +678,13 @@ OpenClaw、copilot-shell、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、�
 
 ## 6. 宿主集成
 
-推荐宿主集成由 SkillFS 驱动：SkillFS 负责捕获 Skill 目录变更，通知 Skill Ledger daemon 扫描并刷新 `.skill-meta/activation.json`/xattr。宿主 hook/capability 作为兼容路径保留并默认使用 `ask` policy，各宿主的 Skill 模型和 Hook 机制存在差异：
+推荐宿主集成由 SkillFS 驱动：SkillFS 负责捕获 Skill 目录变更，通知 Skill Ledger daemon 扫描并刷新 `.skill-meta/activation.json`/xattr。宿主 hook/capability 作为兼容路径保留；Hermes 默认使用 `observe`，其余宿主默认使用 `ask`，因为各宿主的 Skill 模型和 Hook 机制存在差异：
 
 | 宿主 | 触发与检查 | `observe` | `warn` | `ask` | `block` | 覆盖与默认值 |
 |------|------------|-----------|--------|-------|---------|------------|
 | OpenClaw | `before_tool_call` 读取 SKILL.md → `show` | debug 后放行 | logger warning 后放行 | `requireApproval` | `block` / `blockReason` | `~/.openclaw/skills/`；`enabled=true, policy="ask"` |
 | copilot-shell | `PreToolUse(skill)` → `show` | stderr 审计后放行 | `decision: "allow"` + `reason` | `decision: "ask"` | `decision: "block"` | project / user / system；默认注册且 policy 为 `ask` |
-| Hermes | `pre_tool_call(skill_view)` → `show` | logger 审计后放行 | 最终回复注入 warning | fallback 为 `warn` | `{"action": "block"}` | `~/.hermes/skills/**`；`enabled=true, policy="ask"` |
+| Hermes | `pre_tool_call(skill_view)` → `show` | logger 审计后放行 | 降级为 `observe` 并记录诊断 | 降级为 `observe` 并记录诊断 | `{"action": "block"}` | `~/.hermes/skills/**`；`enabled=true, policy="observe"` |
 | Qoder CLI | `PreToolUse(Skill)` → `check` | stderr 审计后放行 | `decision: "allow"` + `systemMessage` | `permissionDecision: "ask"` | `permissionDecision: "deny"` | project / user；默认注册且 policy 为 `ask` |
 | Codex | `UserPromptSubmit($skill-name)` → `check` | 静默审计后放行 | `systemMessage` 后放行 | fallback 为 `warn` | `decision: "block"` | repo / user / system；默认注册且 policy 为 `ask` |
 | Qwen Code | `PreToolUse(skill)` → `show` | stderr 诊断后放行 | `systemMessage` 后放行 | `permissionDecision: "ask"` | `permissionDecision: "deny"` | project / user；默认注册且 policy 为 `ask` |
@@ -727,7 +727,7 @@ OpenClaw、copilot-shell、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、�
 
 ### 6.3 Hermes（Plugin Hook）
 
-以 Hermes Plugin 形式分发，默认 `capabilities.skill-ledger.enabled=true` 且 `policy="ask"`。`pre_tool_call` handler 过滤 `skill_view`，仅根据 `name` / `skill` / `skill_name` 在 Hermes 默认本地目录 `~/.hermes/skills` 下解析 Skill 目录后调用 `agent-sec-cli skill-ledger show`。`file_path` / `path` 在 Hermes 中表示 Skill 内 supporting file，不作为 Skill 身份来源。若无法解析、匹配到多个候选、命中 `~/.hermes/config.yaml` 的 `skills.external_dirs` 或 plugin-provided skills 等当前未覆盖来源，hook 采用 fail-open。`policy=observe` 时只写审计日志；`policy=ask` / `warn` 时，summary message 会记录为本轮 warning，并由 `transform_llm_output` 追加到最终回复开头；`policy=block` 在 message 非空时直接阻断本次 `skill_view`。`max_warnings_per_turn = 0` 只影响 `ask` / `warn` 的用户可见 warning 注入。旧 `enable_block` 仅在未配置 `policy` 时作为兼容映射，旧 `block_statuses` 不再参与运行态判断。
+以 Hermes Plugin 形式分发，默认 `capabilities.skill-ledger.enabled=true` 且 `policy="observe"`。`pre_tool_call` handler 过滤 `skill_view`，仅根据 `name` / `skill` / `skill_name` 在 Hermes 默认本地目录 `~/.hermes/skills` 下解析 Skill 目录后调用 `agent-sec-cli skill-ledger show`。`file_path` / `path` 在 Hermes 中表示 Skill 内 supporting file，不作为 Skill 身份来源。若无法解析、匹配到多个候选、命中 `~/.hermes/config.yaml` 的 `skills.external_dirs` 或 plugin-provided skills 等当前未覆盖来源，hook 采用 fail-open。`policy=observe` 时只写审计日志；`policy=block` 在 message 非空时直接阻断本次 `skill_view`。Hermes 未向 Python plugin 暴露原生 advisory/确认 API，因此旧 `policy=warn` / `ask` 降级为 `observe` 并记录一次宿主诊断，不再通过 `transform_llm_output` 修改最终回复。旧 `enable_block=true` / `false` 分别映射为 `block` / `observe`，旧 `block_statuses` 不再参与运行态判断，`max_warnings_per_turn` / `max_warning_contexts` 已废弃并忽略。
 
 ### 6.4 Qoder CLI（Command Hook）
 

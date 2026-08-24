@@ -6,13 +6,19 @@ LLM Token 优化工具包——Schema/响应压缩 + 命令重写 + 工具环境
 
 ## 核心能力
 
-| 能力 | Token 节省 | 说明 |
+| 能力 | 节省率示例 | 说明 |
 |------|-----------|------|
-| Schema 压缩 | ~57% | 压缩 OpenAI Function Calling 工具定义 |
-| 响应压缩 | ~26–78% | 压缩 API/工具响应（因内容类型而异） |
-| TOON 上下文压缩 | 15–40% | 将 JSON 编码为 TOON 格式 |
+| Schema 压缩 | 参考 fixture 47.3% | 压缩 OpenAI Function Calling 工具定义 |
+| 响应压缩 | 参考 fixture 65.8% | 压缩 API/工具响应 |
+| TOON 上下文压缩 | 参考响应 17.0% | 将 JSON 编码为 TOON 格式 |
 | 命令重写 | 60–90% | 通过 RTK 过滤 CLI 输出（支持 70+ 命令） |
 | Tool Ready | 减少重试浪费 | 旧版调用前预检、自动修复与阻断；当前硬关闭 |
+
+表中 Schema、响应和 TOON 数字是 Tokenless 0.7.11 对仓库内置参考 fixture 的独立测试
+结果，既不是生产范围，也不能相加。实际压缩率取决于 Payload 的大小和结构、可移除字段、
+配置阈值，以及工具数据在会话中的占比。短小或已经紧凑的 Payload 可能只节省几个百分
+点，也可能直接原样透传。精确输入、命令、完整结果和限制见
+[Tokenless 效果度量](../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md#运行仓库参考负载)。
 
 Tool Ready 当前在所有 Adapter 中无条件硬旁路，不会读取依赖规范、执行调用前检查、自动修复环境或阻止工具调用。任何环境变量都无法恢复旧行为；重新启用必须修改源码并重新发布。
 
@@ -20,21 +26,30 @@ Tool Ready 当前在所有 Adapter 中无条件硬旁路，不会读取依赖规
 
 ## 适用场景与预期效果
 
-tokenless 只优化**工具调用响应**进入 LLM 上下文前的冗余，不触及模型推理与对话历史。收益高度取决于会话中工具响应的占比与形态。
+tokenless 优化进入 LLM 上下文前、由它实际处理的工具相关内容，包括工具 Schema、
+工具/API 响应和受支持的 Shell 输出；它不触及模型推理与对话历史。收益高度取决于
+这些内容在会话中的占比与形态。
 
 ### 哪些场景收益高
 
 | 工作负载 | 主要受益策略 | 原因 |
 |----------|-------------|------|
 | Shell 密集（编译/测试/排查） | 命令重写（RTK） | `cargo`/`npm`/`go`/`pytest` 等输出含大量进度/警告噪声，RTK 削减 60–90% |
-| API/抓取密集（REST、web_fetch） | 响应压缩 + TOON | JSON 含 debug/null/空值与语法开销，压缩 26–78%，TOON 再省 15–40% |
-| 工具数量多的 Agent | Schema 压缩 | 大量 Function Calling 定义冗余描述，~57% |
+| API/抓取密集（REST、web_fetch） | 响应压缩 + TOON | JSON 可能含可移除的 debug/null/空值；足够大且结构规则的数据也有可削减的语法开销 |
+| 工具数量多的 Agent | Schema 压缩 | 大量 Function Calling 定义可能含冗长描述和可移除元数据 |
 | 长响应需保真 | 可逆压缩（Stash） | 截断后可 `retrieve` 原文，端到端无损，可放心收紧阈值 |
 
 ### 哪些场景收益低或不适用
 
 - **纯对话/少工具调用**：工具响应占比极低，整体节省接近 0。
-- **响应本就短小**：压缩后 `after >= before`，CLI 输出原文且不记录统计（属正常）。
+- **没有固定最小 Payload**：`compress-schema` 和 `compress-response` 会为每个通过输入
+  规则的合法 JSON 生成候选结果。在 Active 模式下，只有候选结果的估算 Token 数严格少于原文时
+  才输出它。包含可移除内容的小输入仍可能被压缩，而已经紧凑的较大输入也可能原样透传；CLI 会把
+  原因写入 stderr，且不记录统计。在 Dry-run 模式下，CLI 始终输出原文，并可能把较小的候选结果
+  记为预测节省。[CLI 参考](../../docs/user-guide/zh/token-saving/tokenless/cli-reference.md)
+  中的描述、字符串、数组和深度阈值只决定单项转换何时触发，并不是整个 Payload 的最小大小；
+  Agent Adapter 还可能应用独立的
+  [预检门槛](../../docs/user-guide/zh/token-saving/tokenless/framework-integration.md#adapter-处理规则)。
 - **模型推理 token / 计费 token**：不在 tokenless 经手范围。
 
 ### 预期效果估算
@@ -52,7 +67,7 @@ tokenless 只优化**工具调用响应**进入 LLM 上下文前的冗余，不�
 
 例如：面板显示压缩率 60%，若工具响应占总消耗 20%，实际节省率为 60% × 20% = **12%**。这也是为何在总消耗 1500 万 Token 的实验中节省量观感偏小——tokenless 只作用于其中约 300 万 Token 的工具响应部分。
 
-> Stash 使压缩**端到端无损**：可适度收紧截断阈值换取更高 inline 节省，需要原文时经 `<<tokenless:KEY>>` 标记取回，不影响正确性。建议用 `TOKENLESS_COMPRESSION_ENABLED=0/1` 双跑对照真实节省。
+> Stash 使压缩**端到端无损**：可适度收紧截断阈值换取更高 inline 节省，需要原文时经 `<<tokenless:KEY>>` 标记取回，不影响正确性。建议用 `TOKENLESS_COMPRESSION_ENABLED=0/1` 双跑对照真实节省。数组截断默认保留头部 32 项与尾部 8 项（`--array-tail-preserve`，默认 8，设为 0 关闭尾部保留），被丢弃的中间段进入 Stash；完整参数见用户手册 CLI 参考。
 > 各策略触发条件与阈值见 [用户手册](../../docs/user-guide/zh/token-saving/tokenless/user-manual.md)。
 
 ## 集成路径
@@ -66,18 +81,19 @@ tokenless 只优化**工具调用响应**进入 LLM 上下文前的冗余，不�
 - **Claude Code 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
 - **Codex 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
 - **OpenCode 插件** — Tool Ready（已硬关闭）+ 命令重写 + Schema/响应压缩 + TOON
+- **DeepSeek Harness 插件**。通过 DSH 原生 `tools/post-execute` 接入响应压缩和环境错误归因
 
 ### Agent 开发框架集成
 
-- **AgentScope Python 集成** — 替换成功的最终工具响应，并提供受 marker 约束的原生
-  恢复 Tool。
+- **AgentScope Python 集成** — 完整开放 Schema 压缩、RTK 改写、响应压缩、TOON、
+  受 marker 约束的恢复和归属统计。
 
 ## 快速开始
 
 首选 ANOLISA CLI 安装已发布的组件。
 
-安装脚本会把 `anolisa` 放到 `~/.local/bin`。user mode 安装的 `tokenless`、
-`rtk` 和 `toon` 也在这个目录。如果当前 Shell 还找不到命令，先把该目录加入
+安装脚本会把 `anolisa` 放到 `~/.local/bin`。user mode 安装的 `tokenless`
+和 `rtk` 也在这个目录。如果当前 Shell 还找不到命令，先把该目录加入
 `PATH`。
 
 ```bash
@@ -116,6 +132,32 @@ anolisa adapter enable tokenless openclaw
 anolisa adapter status tokenless
 ```
 
+DeepSeek Harness 必须指定至少一个 profile。需要启用多个 profile 时，应在同一条
+命令中列出全部名称，完整集合语义见下文。启动 DSH 时请使用已经启用的名称。
+
+```bash
+anolisa adapter enable tokenless dsh --profile <profile>
+dsh --profile <profile>
+```
+
+### Schema 压缩 CLI
+
+`compress-schema` 支持单个工具定义、工具定义 JSON 数组，以及包含顶层
+`tools` 数组的完整请求对象。处理完整请求对象时不传 `--batch`；其中的 OpenAI
+Wrapper、Gemini `functionDeclarations` 工具对象及裸 Function Calling 定义会被压缩，
+非函数工具及 `tools` 之外的字段会原样保留。
+
+```bash
+# 单个工具定义
+tokenless compress-schema -f tool.json
+
+# 工具定义数组
+tokenless compress-schema -f tools.json --batch
+
+# 包含顶层 tools 数组的请求对象
+tokenless compress-schema -f request.json
+```
+
 从源码构建适合开发者。
 
 ```bash
@@ -126,7 +168,7 @@ cd Token-Less
 make setup
 ```
 
-源码安装会把 `tokenless` 放在 `~/.local/bin`，`rtk` 和 `toon` 辅助
+源码安装会把 `tokenless` 放在 `~/.local/bin`，`rtk` 辅助
 二进制也位于同一个目录，并部署开发所需的全部 adapter。
 
 ### 构建 Python Runtime
@@ -146,10 +188,29 @@ Maturin。请先安装 [`uv`](https://docs.astral.sh/uv/)，或者在 `PATH` 中
 命令不包含 Python Extension。
 
 `anolisa_tokenless` 模块支持 CPython 3.11 及更高版本，但只能在构建该原生
-Wheel 的对应平台使用。当前只开放 JSON 响应压缩和 Stash 取回，不捆绑
-CLI、RTK、TOON 或框架集成。仓库会构建并测试该包，但目前尚未发布到
+Wheel 的对应平台使用。它开放四个 Tokenless 生命周期接口并内置对应平台的 RTK；
+TOON 已链接进原生 Runtime，不依赖 Tokenless CLI 或系统 helper。仓库会构建并测试该包，
+但目前尚未发布到
 PyPI。具体见 [Runtime 设计](docs/design/runtime-library_zh.md) 和
 [用户手册](../../docs/user-guide/zh/token-saving/tokenless/user-manual.md#从源码构建-python-runtime)。
+
+同一个 Wheel 还提供不依赖 CLI 的只读 typed Stats 查询。可以让 `TokenlessStats` 指向
+Runtime 使用的状态目录，或使用延迟创建的 `sdk.stats`：
+
+```python
+from anolisa_tokenless import TokenlessStats
+
+stats = TokenlessStats("/absolute/path/to/tokenless-data")
+summary = stats.summary()
+print(summary.total.tokens_saved, summary.total.tokens_saved_percent)
+```
+
+Token 数量是估算值，并且只有产生正向节省的操作才会记录。`show()` 和详细 `diff()`
+结果可能包含 `stats.db` 中保存的敏感工具输入与输出。这里的只读是指 API 能力；客户端
+打开时遵循 CLI 初始化流程，可能创建或迁移 `stats.db`，因此数据目录必须可写。
+`summary(limit=None)` 和 `compare(..., limit=None)` 最多查询最近 10,000 条记录；Session
+或 Tool-use Diff 最多读取最近 10,000 条匹配记录。要获得有意义的对比，应先传入 dry-run
+Session，再传入启用 Tokenless 的 Session。
 
 ### OpenCode 安装
 
@@ -165,6 +226,26 @@ make opencode-install
 不会覆盖同名的非托管文件。配置目录支持 `OPENCODE_CONFIG_DIR`、
 `XDG_CONFIG_HOME` 和显式的 `TOKENLESS_OPENCODE_CONFIG_DIR` 覆盖。
 安装后重启 OpenCode 即可加载插件。
+
+### DeepSeek Harness 插件
+
+DSH 原生 Bundle 通过 `tools/post-execute` 压缩成功的单文本块 JSON 工具结果。
+Tokenless CLI 只有返回更短的合法 JSON 时才会替换结果，内容读取类工具默认保持
+原样。关闭响应压缩、跳过压缩或压缩无收益时，环境错误归因仍会工作。
+
+需要启用多个 DSH profile 时，应在同一条命令中重复传入 `--profile`。
+
+```bash
+anolisa adapter enable tokenless dsh \
+  --profile web \
+  --profile headless
+```
+
+每次 enable 或 re-enable 都会把本次传入的 profile 视为完整目标集合。旧 receipt
+中已有但本次没有列出的 profile 会卸载 Bundle，因此每次都要列出需要继续使用
+Tokenless 的全部 profile。每个名称必须与 `dsh --profile <profile>` 使用的名称
+一致。配置写在对应 profile 的 `cordis.patch.yml` 中。全部配置项和默认值见
+[DeepSeek Harness 集成参考](../../docs/user-guide/zh/token-saving/tokenless/framework-integration.md#deepseek-harness-原生处理路径)。
 
 ### AgentScope 框架集成
 
@@ -182,8 +263,8 @@ python -m pip install \
 两个大版本使用相同的公开入口和配置对象；由于 AgentScope 1.x 与 2.x 提供的生命周期
 扩展点不同，仅最后的挂载方式不同。
 
-AgentScope 1.x 必须在 Agent 和所有工具函数创建后安装集成。安装时会把恢复工具绑定到
-该 Agent 的 memory，只有 memory 中可见的 marker 才能授权恢复对应 stash。
+AgentScope 1.x 使用 Tokenless Toolkit，因此在 Agent 构造前后动态注册的普通工具和
+MCP 工具都会获得相同的生命周期处理。安装时必须显式提供 Session 标识。
 
 ```python
 from agentscope.agent import ReActAgent
@@ -195,8 +276,10 @@ integration = TokenlessAgentScope(
         data_dir="/absolute/path/to/tenant-tokenless-data",
     ),
 )
+toolkit = integration.create_toolkit()
+toolkit.register_tool_function(application_tool)
 agent = ReActAgent(..., toolkit=toolkit)
-integration.install(agent)
+integration.install(agent, session_id="conversation-id")
 ```
 
 AgentScope 2.x 在构造阶段接收恢复 Tool 和中间件；该方式从 2.0.0 即可使用，不依赖后续
@@ -245,17 +328,20 @@ AgentScope 2.0.0 尚未提供 App 级 Agent middleware 和 Tool 注入，因此�
 | `balanced` | 跳过 Read/Glob/Grep；Shell 使用 65,536 / 128 / 深度 8，其他采用 conservative 限制 |
 | `aggressive` | 跳过 Read/Glob/Grep；其他采用 CLI 默认的 4,096 / 32 / 深度 8 |
 
-默认模式为 `balanced`。只读恢复 Tool 仅在 24 位哈希对应的 marker 出现在
-AgentScope 1.x memory 或 AgentScope 2.x context/summary 中时自动允许。1.x 的
-`install()` 必须在待压缩工具注册完成后调用；之后动态注册的工具不会被包装。直接构造
-Agent 时，每个用户或租户必须显式传入不同的绝对 `data_dir`；省略 `data_dir` 时，
+默认模式为 `balanced`。只有模型当前可见 marker 时才会向模型发布只读恢复 Tool，
+并且它只接受本次模型调用保留的精确 marker 集合中的 hash。直接构造 Agent 时，每个
+用户或租户必须显式传入不同的绝对 `data_dir`；省略 `data_dir` 时，
 `TOKENLESS_DATA_DIR` 只作为进程级回退。除非应用有明确生命周期策略，否则保留默认
-一小时 stash TTL，且不要依赖跨节点恢复。该集成不启用 Shell、MCP、TOON、RTK 或
-Schema 压缩。源码位于 `python/agentscope/`，可后续独立发布 Wheel。
+一小时 stash TTL，且不要依赖跨节点恢复。
+
+两个 AgentScope Adapter 都启用 Schema 压缩、RTK 命令改写、响应压缩、TOON、恢复、
+环境错误提示和逐调用归属。原生 Wheel 内置 RTK 并直接链接 TOON，不搜索系统可执行文件。
+宿主对象和流式 chunk 保持不变，只转换复制后的调用参数和最终模型可见文本。Tool Ready
+仍保持硬关闭。
 
 ## Raw 打包
 
-Raw 打包接收同一目录中已经构建好的 `tokenless`、`rtk`、`toon`，并按照
+Raw 打包接收同一目录中已经构建好的 `tokenless` 和 `rtk`，并按照
 组件维护的稳定目录结构生成制品：
 
 ```bash
@@ -285,10 +371,13 @@ node npm/scripts/package-npm.js --all
 
 ## 查看 Token 节省明细
 
-`show` 用于原样打印完整的压缩前后内容；`diff` 用于解释估算 Token
-节省，并只突出发生变化的行：
+`stats summary` 用于查看合计；`show` 用于原样打印完整的压缩前后内容；
+`diff` 用于解释估算 Token 节省，并只突出发生变化的行：
 
 ```bash
+tokenless stats summary
+tokenless stats summary --limit 1000
+tokenless stats summary --compare <baseline-session> <active-session>
 tokenless stats show 42
 tokenless stats diff 42
 tokenless stats diff --session <session-id>
@@ -296,9 +385,11 @@ tokenless stats diff --session <session-id> --tool-use-id <tool-use-id>
 tokenless stats diff 42 --json
 ```
 
-Session 总览只包含指标；单记录和 tool-use 报告包含 unified content
-diff。只有相邻 active 阶段的输出与输入内容完全一致时才会串成一条链，
-从而避免重复计算中间阶段的 Token。完整选项和度量限制见
+`stats summary --limit` 必须为正整数；`--limit 0` 会在解析阶段被拒绝。
+`--compare` 在任一 Session 没有记录时失败，而不是报告 0% 节省。Session
+总览只包含指标；单记录和 tool-use 报告包含 unified content diff。只有相邻
+active 阶段的输出与输入内容完全一致时才会串成一条链，从而避免重复计算中间
+阶段的 Token。完整选项和度量限制见
 [Tokenless 效果度量](../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md)。
 
 ## 数据库位置
@@ -359,6 +450,7 @@ tokenless env-check --tool Shell --fix
 - `python/tokenless/` — 面向 CPython 3.11+ 的 PyO3 `anolisa_tokenless` 包
 - `python/agentscope/` — 独立的 AgentScope 框架集成与 Wheel 元数据
 - `adapters/tokenless/` — 面向具体 Agent/CLI 的 Plugin、Hook 与 Extension 适配器包
+- `adapters/tokenless/dsh/`。DeepSeek Harness 原生 Bundle
 - `third_party/rtk/` — RTK 命令重写引擎（vendored）
 - `packaging/raw/` — Tokenless 自维护的 ANOLISA Raw 打包与目标校验
 

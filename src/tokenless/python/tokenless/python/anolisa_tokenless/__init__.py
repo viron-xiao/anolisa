@@ -1,10 +1,39 @@
-"""In-process Python API for Tokenless response compression."""
+"""In-process Python SDK for complete Tokenless lifecycle optimization."""
 
 from anolisa_tokenless._native import (
     CompressionResult,
     TokenlessError,
     TokenlessRuntime,
     __version__,
+)
+from anolisa_tokenless.sdk import (
+    Attribution,
+    ModelRequest,
+    RetrieveRequest,
+    TokenlessSdk,
+    ToolCall,
+    ToolResult,
+    ToolStatus,
+)
+from anolisa_tokenless.stats import (
+    StatsComparison,
+    StatsContentDiff,
+    StatsDiff,
+    StatsDiffChain,
+    StatsDiffHunk,
+    StatsDiffLine,
+    StatsDiffScope,
+    StatsDiffSort,
+    StatsDiffStage,
+    StatsMode,
+    StatsNotFoundError,
+    StatsOperation,
+    StatsRecord,
+    StatsSavings,
+    StatsStashMetrics,
+    StatsStatus,
+    StatsSummary,
+    TokenlessStats,
 )
 from anolisa_tokenless.tool_response import (
     CompressionMode,
@@ -14,12 +43,37 @@ from anolisa_tokenless.tool_response import (
 )
 
 __all__ = [
+    "Attribution",
     "CompressionMode",
     "CompressionResult",
+    "ModelRequest",
     "RetrievalError",
+    "RetrieveRequest",
+    "StatsComparison",
+    "StatsContentDiff",
+    "StatsDiff",
+    "StatsDiffChain",
+    "StatsDiffHunk",
+    "StatsDiffLine",
+    "StatsDiffScope",
+    "StatsDiffSort",
+    "StatsDiffStage",
+    "StatsMode",
+    "StatsNotFoundError",
+    "StatsOperation",
+    "StatsRecord",
+    "StatsSavings",
+    "StatsStashMetrics",
+    "StatsStatus",
+    "StatsSummary",
     "TokenlessConfig",
     "TokenlessError",
     "TokenlessRuntime",
+    "TokenlessSdk",
+    "TokenlessStats",
+    "ToolCall",
     "ToolResponseCompressor",
+    "ToolResult",
+    "ToolStatus",
     "__version__",
 ]

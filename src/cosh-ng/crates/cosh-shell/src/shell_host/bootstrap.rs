@@ -110,6 +110,9 @@ fn start_shell_session(
 
     unsafe {
         command.pre_exec(|| {
+            // The inner user shell must observe the SIGPIPE disposition the
+            // host process inherited, not the Rust runtime's rewrite.
+            super::sigpipe::restore_in_child()?;
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -124,14 +127,23 @@ fn start_shell_session(
         });
     }
 
-    let child = command.spawn()?;
-    let mut parser = OscParser::new(config.session_id.clone(), output_ref_dir, marker_token);
+    let mut parser = OscParser::with_retention(
+        config.session_id.clone(),
+        output_ref_dir,
+        marker_token,
+        config.transcript_retention,
+        &config.work_dir,
+    )?;
     if let Some(observer) = config.shell_environment_observer.clone() {
         parser = parser.with_environment_observer(observer);
     }
     if let Some(observer) = config.shell_history_file_observer.clone() {
         parser = parser.with_history_file_observer(observer);
     }
+
+    // Build all fallible session-owned storage before spawning the shell so
+    // an unwritable spool cannot leave an unmanaged child process behind.
+    let child = command.spawn()?;
     push_shell_started_event(&mut parser, config);
 
     Ok(PtySession {

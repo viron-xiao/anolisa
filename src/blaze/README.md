@@ -13,7 +13,15 @@ Designed as the per-host agent for E2B-style orchestrator platforms.
 
 - **HTTP API** — Unix domain socket (`/run/blaze/api.sock`) + TCP (`:14159`)
 - **Policy-driven backend selection** — workload class → backend priority list
-- **Lifecycle state machine** — durable state with restart recovery
+- **Lifecycle state machine** — durable state with restart recovery across 13
+  states: Pending, Creating, Running, Paused, Checkpointed, Restoring,
+  Hibernating, Hibernated, Resuming, RecoveryRequired, Reset, Warm, and
+  Destroyed
+- **Checkpoint capture** — full VM state, guest memory, and writable root
+  filesystem capture with queryable history for supported backends and storage
+  providers
+- **Hibernation** — release a running backend after publishing a verified
+  image, then resume it later, including across a daemon restart
 - **Guest operations** — bounded command execution and file transfer for
   running backends that expose a guest endpoint
 - **Template catalog** — bounded import and atomic publication of reusable artifacts
@@ -148,6 +156,11 @@ Blaze exposes sandbox lifecycle and guest operations through `/v1/sandboxes`.
 | POST | `/v1/sandboxes/{id}/exec` | Execute a guest command |
 | POST | `/v1/sandboxes/{id}/read` | Read a guest file |
 | POST | `/v1/sandboxes/{id}/write` | Replace a guest file |
+| POST | `/v1/sandboxes/{id}/checkpoint` | Capture a full checkpoint |
+| GET | `/v1/sandboxes/{id}/checkpoints` | List committed checkpoint history |
+| POST | `/v1/sandboxes/{id}/rollback/{checkpoint_id}` | Replace a running sandbox from a verified checkpoint |
+| POST | `/v1/sandboxes/{id}/hibernate` | Persist VM state and release the live backend |
+| POST | `/v1/sandboxes/{id}/resume` | Resume a hibernated sandbox and wait for enabled guest transport |
 | GET | `/v1/pools` | Reserved; returns `501` |
 | GET | `/v1/pools/{backend}/{class}` | Reserved; returns `501` |
 | POST | `/v1/pools/{backend}/{class}/drain` | Reserved; returns `501` |
@@ -192,9 +205,9 @@ fails, the startup warning includes the additional error and the durable record
 may still contain its previous state. Reconciliation continues with other
 accepted records.
 
-The `/v1/templates` routes are the single operator-facing template catalog.
-Importing an entry does not yet make sandbox creation select it; future create
-support will resolve optional names from this same catalog. See the
+The `/v1/templates` routes are the single operator-facing template catalog. A
+create request restores from an entry through the optional `template` field on
+`POST /v1/sandboxes`, resolved from this same catalog. See the
 [template catalog user guide](../../docs/user-guide/en/runtime/blaze.md#template-catalog)
 for configuration, accepted artifacts, limits, and publication rules.
 
@@ -210,6 +223,17 @@ that inventory is complete and consistent does the daemon reconcile each
 non-terminal sandbox independently. A cleanup failure during this later
 reconciliation leaves that sandbox `RecoveryRequired`, but does not prevent the
 remaining accepted records from being processed or the API from starting.
+
+A completed hibernation is exempt from this cleanup and is retained so it can be
+resumed later. An interrupted hibernate or resume is retained as
+`RecoveryRequired` for explicit destroy instead of being mistaken for a live
+runtime.
+
+During graceful shutdown, the daemon stops accepting new work and shuts down
+its background workers. Running backends are not torn down at shutdown: their
+persisted records are validated by the next daemon startup, which keeps a
+completed hibernation resumable and retains interrupted operations as
+`RecoveryRequired` for explicit handling.
 
 Inventory validation is fail-closed. Startup stops before the API listeners
 open if a UUID-owned entry is not a canonically named directory; if its
@@ -233,13 +257,90 @@ See the
 for writer coordination, inventory publication, reset rejection, legacy-state
 cleanup, and failure boundaries.
 
-The operation journal records the operation and start time, not completion of
-each resource step. An interrupted create is cleaned up rather than resumed,
-and an existing backend process is not adopted after restart. Failed recovery
-does not run in a background retry loop. Checkpoint capture and restore are not
-available in this change. Reset remains unavailable until runtime and storage
-can be reset together; this recovery flow does not add backend snapshot,
-capture, or restore operations.
+The operation journal records create and destroy operations and the durable
+phase reached by checkpoint capture. An interrupted create is cleaned up rather
+than resumed, and an existing backend process is not adopted after restart.
+Startup recovery destroys an interrupted sandbox instead of restoring its
+checkpoint. Failed recovery does not run in a background retry loop. Reset
+remains unavailable and does not restore a checkpoint.
+
+### Checkpoint capture and history
+
+`POST /v1/sandboxes/{id}/checkpoint` captures a running sandbox when both its
+backend and storage provider advertise full-capture support. A successful
+request pauses the backend, captures VM state, guest memory, and the writable
+root filesystem, publishes a self-contained integrity manifest, moves the
+sandbox checkpoint HEAD, and resumes the backend. The response includes the
+complete manifest plus the `checkpoint_id` and `instance_id` fields.
+Unsupported backend or storage combinations return HTTP 501 before changing
+sandbox state.
+
+`GET /v1/sandboxes/{id}/checkpoints` returns committed history summaries,
+including parentage, logical size, current-HEAD status, and HEAD reachability.
+
+`POST /v1/sandboxes/{id}/rollback/{checkpoint_id}` is available only when the
+current storage provider and checkpoint backend advertise compatible restore
+capabilities. The daemon verifies the selected checkpoint, its parent chain,
+runtime identity, and all artifact hashes before changing runtime state.
+
+The file provider stages a separate rootfs copy while the current backend is
+still running. After the old backend stops, the daemon selects that copy,
+starts and owns the replacement backend, moves HEAD to the selected checkpoint,
+and only then releases the previous rootfs. The dividing line is whether the
+daemon has begun stopping the old backend: a failure before that point, while
+still validating and staging the replacement rootfs, leaves the original
+runtime running untouched, as if the restore never happened. Once the daemon
+starts stopping the old backend, any later failure — including the stop itself
+failing or the daemon being unable to confirm the old backend actually
+stopped — retains the resources that actually exist and marks the sandbox
+`RecoveryRequired`, so a later destroy can finish cleanup without losing
+process ownership.
+
+`last_checkpoint` continues to mean the most recent completed capture. Restore
+moves catalog HEAD but does not rewrite capture history.
+
+See the [checkpoint capture and restore user guide](../../docs/user-guide/en/runtime/blaze.md#checkpoint-capture-history-and-restore)
+for response fields, supported capability combinations, and failure handling.
+
+### Hibernation and resume
+
+Hibernation is available only when the running backend supports full snapshot
+capture and its configured adapter can restore the same backend version. These
+compatibility checks happen before the lifecycle journal changes, so an
+unsupported combination leaves the sandbox running. How the workload is brought
+to a consistent stop is left to the backend's quiesce-for-capture hook, whose
+default pauses the backend; a self-freezing backend (one whose capture
+primitive stops the workload itself) overrides that hook and needs no separate
+pause support. A successful hibernate:
+
+1. records intent, quiesces the backend for capture, and writes the backend
+   payload and memory into a hidden staging directory;
+2. flushes the retained storage slot and records artifact sizes and SHA-256
+   digests in a manifest;
+3. synchronizes the complete image before stopping the backend;
+4. publishes the hibernation directory and commits `Hibernated`.
+
+A failure before the backend is stopped leaves the sandbox `Running`, except
+when persisting the hibernating intent crosses an uncertain durability boundary
+(the state rename succeeds but its directory sync fails) or staging fails after
+it: the durable record may then disagree with the live runtime, so the sandbox
+is retained as `RecoveryRequired` instead.
+
+Resume verifies the manifest identity, exact file set, and artifact digests
+before starting a replacement backend. The manager owns that backend before
+waiting for optional guest readiness and commits `Running` only after a final
+liveness check. A failure before the replacement backend starts returns the
+sandbox to `Hibernated` so the request can be retried; if the replacement's
+cleanup cannot be confirmed, its owner and the operation journal remain
+available through `RecoveryRequired`.
+
+The storage slot remains allocated while hibernated. A successful resume also
+retains the latest hibernation image until the next hibernate replaces it or an
+explicit destroy removes it. The daemon does not automatically complete an
+interrupted hibernate or resume after restart.
+
+See the [hibernation and resume user guide](../../docs/user-guide/en/runtime/blaze.md#hibernation-and-resume)
+for the status-code contract, artifact verification, and failure ownership.
 
 ### Guest operations
 

@@ -9,6 +9,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-08-22
+
+### Fixed
+
+- `anolisa --quiet adapter scan` and `anolisa --quiet adapter status` now
+  suppress all non-error human output, including empty-state messages and
+  result tables, while `--json` continues to emit the standard envelope.
+  Agents can rely on quiet adapter inspection producing no human output
+  ([#2752](https://github.com/alibaba/anolisa/pull/2752)).
+- `anolisa --dry-run forget <component>` now refuses a component that still
+  has enabled adapters with the same `INVALID_ARGUMENT`, exit code 2, and
+  `adapter disable` guidance as the real operation. Previews no longer report
+  that an impossible forget would succeed, while unrelated adapter receipts
+  remain ignored
+  ([#2762](https://github.com/alibaba/anolisa/pull/2762)).
+
+## [0.3.5] - 2026-08-20
+
+### Fixed
+
+- Uninstalling a component with a bare systemd service template now stops
+  every loaded instance through `name@*.service` before disabling the declared
+  `name@.service` template. Template-backed services no longer remain running
+  after `anolisa uninstall`, while individual stop failures continue to surface
+  as warnings without blocking cleanup
+  ([#2603](https://github.com/alibaba/anolisa/pull/2603)).
+
+## [0.3.4] - 2026-08-19
+
+### Changed
+
+- Component-targeting commands now use the repository component index as the
+  sole authority for names absent from local state. Installed and recovery
+  identities remain usable offline, while unsupported names return
+  `INVALID_ARGUMENT`, an unavailable index returns `EXECUTION_FAILED`, and
+  `NOT_INSTALLED` now reliably means a supported component is absent. A
+  `--repo` override also governs identity and package selection for the whole
+  invocation, so site-local package mappings and RPM `Provides` metadata can
+  no longer establish unrecognized component names
+  ([#2637](https://github.com/alibaba/anolisa/pull/2637)).
+
+### Fixed
+
+- Missing local Raw repository index errors now identify whether the active
+  repository came from the exact `repo.toml` path or a one-off `--repo`
+  override and provide matching recovery guidance. Users no longer need to
+  guess which source configured the missing repository
+  ([#2650](https://github.com/alibaba/anolisa/pull/2650)).
+
+## [0.3.3] - 2026-08-18
+
+### Added
+
+- Telemetry instance snapshots now include the detected container runtime as
+  `instance.container` for Docker, Podman, containerd, Kubernetes cgroups, and
+  LXC, while bare-metal hosts omit the field. This gives downstream deployment
+  statistics and troubleshooting a container-aware signal without collecting
+  container or pod identities
+  ([#2642](https://github.com/alibaba/anolisa/pull/2642)).
+
+### Changed
+
+- `anolisa status <component>` now validates new targets against the component
+  index, resolves package aliases, rejects unsupported names with `anolisa list`
+  guidance, and directs telemetry service targets to
+  `anolisa telemetry status`. Exact installed identities remain inspectable
+  when repository metadata is unavailable
+  ([#2626](https://github.com/alibaba/anolisa/pull/2626)).
+
+### Fixed
+
+- Raw adapter bundle installs now preserve each archive file's mode and record
+  the effective mode for integrity checks. Framework hooks and scripts retain
+  their executable bit instead of being installed uniformly as data files
+  ([#2619](https://github.com/alibaba/anolisa/pull/2619)).
+
+## [0.3.2] - 2026-08-17
+
+### Added
+
+- ANOLISA now provides a native DSH adapter driver for plugin bundles.
+  `anolisa adapter enable <component> dsh --profile <name>` accepts repeatable
+  profiles, validates the bundle identity, delegates profile changes to DSH,
+  and remembers the enable-time DSH home so status, disable, and re-enable keep
+  targeting the same profiles even if `DSH_HOME` or the working directory
+  changes. Disable DSH adapters before downgrading to an earlier ANOLISA release
+  ([#2580](https://github.com/alibaba/anolisa/pull/2580)).
+- `anolisa logs --level <LEVEL>` is now a visible alias for the existing
+  `--severity` option, with the same validation and filtering behavior while
+  `severity` remains the canonical JSON field
+  ([#2558](https://github.com/alibaba/anolisa/pull/2558)).
+
+### Changed
+
+- `anolisa list` and `anolisa install --all` now evaluate component
+  availability against an exact OS and architecture target from schema v2
+  `components-v2.toml`. JSON output replaces `platforms` and
+  `platform_available` with `targets` and `target_available`; repository
+  publishers must deploy the v2 index beside the unchanged v1 index
+  ([#2533](https://github.com/alibaba/anolisa/pull/2533)).
+
+### Fixed
+
+- `anolisa --dry-run install` now reads `meta.toml` beside the resolved Raw
+  artifact before falling back to version-level metadata only when the sibling
+  file is absent. Previews now validate the selected target's contract, reject
+  corrupt published metadata instead of masking it, and still avoid downloading
+  the artifact
+  ([#2551](https://github.com/alibaba/anolisa/pull/2551)).
+- System-helper status now reports `unknown` when `systemctl` cannot be started
+  and reports `failed` only for a unit whose actual state is failed
+  ([#2604](https://github.com/alibaba/anolisa/pull/2604)).
+
 ## [0.3.1] - 2026-08-13
 
 ### Fixed

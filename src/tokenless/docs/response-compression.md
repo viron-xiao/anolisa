@@ -9,7 +9,7 @@ Response 压缩由核心 Rust 库 `ResponseCompressor`（`crates/tokenless-schem
 | # | 规则 | 判断条件 | 处理方式 | 默认阈值 |
 |---|------|---------|---------|---------|
 | R1 | **字符串截断** | 字符串字节长度 > 4096 | 在 UTF-8 安全边界截断，追加 `… (truncated)` | 4096 字节 |
-| R2 | **数组截断** | 数组元素 > 32 | 保留前 32 个，末尾追加 `<... N more items truncated>` | 32 个 |
+| R2 | **数组截断** | 数组元素 > 32 | 保留前 32 个 + 末尾 8 个（`array_tail_preserve`），head 与 tail 之间插入 `<... N more items truncated, not stashed>`；head+tail 覆盖全部元素时不截断 | 32 + 8 个 |
 | R3 | **字段删除** | key 匹配黑名单 | 整个字段移除（不递归进入） | 7 个字段 |
 | R4 | **null 移除** | 值为 `null` | 从对象/数组中删除 | 启用 |
 | R5 | **空值移除** | 值为 `""` / `[]` / `{}` | 从对象/数组中删除 | 启用 |
@@ -185,17 +185,20 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 ### 示例 3 — 数组截断（R2）
 
-输入（`truncate_arrays_at = 3` 为例）：
+输入（`truncate_arrays_at = 3`、`array_tail_preserve = 0` 为例）：
 ```json
 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 ```
 
 输出：
 ```json
-[1, 2, 3, "<... 7 more items truncated>"]
+[1, 2, 3, "<... 7 more items truncated, not stashed>"]
 ```
 
-默认阈值 32 个元素。
+默认阈值 32 个元素。默认同时保留末尾 8 个元素（`array_tail_preserve = 8`）：
+截断时保留 head + tail，两者之间插入截断标记，中间被丢弃；若 head+tail
+能覆盖整个数组，则不截断、不加标记。上例在默认配置下（3 + 8 ≥ 10）会
+原样保留全部 10 个元素。
 
 ### 示例 4 — 深度截断（R6）
 
@@ -254,7 +257,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 ### 示例 6 — 数组内对象的复合压缩（R2 + R3 + R4）
 
-输入（`truncate_arrays_at = 2` 为例）：
+输入（`truncate_arrays_at = 2`、`array_tail_preserve = 0` 为例）：
 ```json
 [
   {"id": 1, "debug": "remove me", "value": null},
@@ -269,7 +272,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 [
   {"id": 1},
   {"id": 2},
-  "<... 2 more items truncated>"
+  "<... 2 more items truncated, not stashed>"
 ]
 ```
 
@@ -281,6 +284,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 |------|-------|-------------|
 | `truncate_strings_at` | 4096 | `with_truncate_strings_at(len)` |
 | `truncate_arrays_at` | 32 | `with_truncate_arrays_at(len)` |
+| `array_tail_preserve` | 8 | `with_array_tail_preserve(n)`（0 = 仅保留 head） |
 | `drop_nulls` | true | `with_drop_nulls(bool)` |
 | `drop_empty_fields` | true | `with_drop_empty_fields(bool)` |
 | `max_depth` | 8 | `with_max_depth(depth)` |
@@ -362,4 +366,7 @@ tokenless stats summary
 | 含 debug/trace 的 API 响应 | ~78% | ~82-85% | 响应压缩移除冗余字段后，TOON 消除剩余 JSON 语法 |
 | 表格数据 `[{...}]` | ~5-10% | ~40-60% | 响应压缩对表格效果有限，TOON 效果显著（实测 44%） |
 | 简单扁平对象 | ~0-10% | ~15-25% | JSON 语法开销占比有限 |
-| 嵌套 Schema 定义 | ~57% | ~60-65% | Schema 压缩由专门的 SchemaCompressor 处理 |
+
+Schema 压缩不经过本表的响应压缩或 TOON 流程。Tokenless 0.7.11 在仓库参考
+fixture 上的独立 Schema 压缩结果为 47.3%；该数字不是生产范围或任意 Schema
+的保证值，实际结果取决于输入结构、description 长度和可移除字段。

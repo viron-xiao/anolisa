@@ -1,5 +1,6 @@
 # Token-Less Unified Build System
-# Builds tokenless (schema/response compression), rtk (command rewriting), and toon (JSON encoding)
+# Builds tokenless (schema/response compression, TOON encoding via the
+# toon-format library) and rtk (command rewriting)
 
 INSTALL_PROFILE ?= user
 DESTDIR ?=
@@ -20,10 +21,12 @@ BIN_DIR ?= $(BINDIR)
 LIB_DIR ?= $(LIBEXECDIR)
 ADAPTER_SRC_DIR := adapters/tokenless
 OPENCLAW_PLUGIN_SRC_DIR := $(ADAPTER_SRC_DIR)/openclaw
+DSH_PLUGIN_SRC_DIR := $(ADAPTER_SRC_DIR)/dsh
 ADAPTER_TEMPLATES := \
     $(ADAPTER_SRC_DIR)/manifest.json \
     $(ADAPTER_SRC_DIR)/openclaw/package.json \
     $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json \
+    $(ADAPTER_SRC_DIR)/dsh/package.json \
     $(ADAPTER_SRC_DIR)/hermes/plugin.yaml \
     $(ADAPTER_SRC_DIR)/qoder/.qoder-plugin/plugin.json \
     $(ADAPTER_SRC_DIR)/claude-code/.claude-plugin/plugin.json \
@@ -34,20 +37,21 @@ ADAPTER_TEMPLATES := \
 # Shipped to %{_datadir}/anolisa/components/tokenless/component.toml and
 # embedded in raw archives as .anolisa/component.toml.
 COMPONENT_CONTRACT := .anolisa/component.toml
-TOON_VER := 0.5.0
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 NATIVE_NPM_TARGET := $(shell node -p 'process.platform + "-" + process.arch')
 NATIVE_NPM_INPUT_DIR := $(CURDIR)/target/npm-prebuilt/$(NATIVE_NPM_TARGET)
 PYTHON_RUNTIME_DIR := python/tokenless
 AGENTSCOPE_PACKAGE_DIR := python/agentscope
 PYTHON_WHEEL_DIR := $(CURDIR)/target/wheels
+PYTHON_RTK_PACKAGE_DIR := $(CURDIR)/$(PYTHON_RUNTIME_DIR)/python/anolisa_tokenless/_bin
+PYTHON_RTK_BINARY ?= $(CURDIR)/third_party/rtk/target/release/rtk
 MATURIN ?= uvx --from 'maturin>=1.9,<2.0' maturin
 PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
 
-.PHONY: build build-tokenless build-toon build-openclaw-plugin \
+.PHONY: build build-tokenless build-openclaw-plugin build-dsh-plugin \
         stamp-adapter-templates stamp-python-packages generate-component-contract \
         install uninstall test lint clean package-raw stage-raw \
-        test-raw-package test-npm-package \
+        test-raw-package test-npm-package test-toon-cleanup \
         install-binaries install-helpers install-adapter-resources install-cosh-extension \
         adapter-install adapter-uninstall adapter-scan \
         cosh-extension-install cosh-extension-uninstall \
@@ -67,17 +71,13 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
 all: build
 
 # Build both projects
-build: build-tokenless build-toon build-openclaw-plugin
+build: build-tokenless build-openclaw-plugin build-dsh-plugin
 
 build-tokenless:
 	@echo "==> Building tokenless + rtk..."
 	just setup-rtk
 	cargo build --release
 	cargo build --release --manifest-path third_party/rtk/Cargo.toml
-
-build-toon:
-	@echo "==> Installing toon binary (v$(TOON_VER))..."
-	cargo install toon-format --version $(TOON_VER) --locked
 
 # Generate adapter config files from .in templates (VERSION from Cargo.toml).
 stamp-adapter-templates: $(ADAPTER_TEMPLATES) $(COMPONENT_CONTRACT)
@@ -101,6 +101,10 @@ $(ADAPTER_SRC_DIR)/openclaw/package.json: $(ADAPTER_SRC_DIR)/openclaw/package.js
 
 $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json: $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json.in Cargo.toml
 	@echo "==> Generating openclaw/openclaw.plugin.json (version=$(VERSION))..."
+	sed 's/@VERSION@/$(VERSION)/g' $< > $@
+
+$(ADAPTER_SRC_DIR)/dsh/package.json: $(ADAPTER_SRC_DIR)/dsh/package.json.in Cargo.toml
+	@echo "==> Generating dsh/package.json (version=$(VERSION))..."
 	sed 's/@VERSION@/$(VERSION)/g' $< > $@
 
 $(ADAPTER_SRC_DIR)/hermes/plugin.yaml: $(ADAPTER_SRC_DIR)/hermes/plugin.yaml.in Cargo.toml
@@ -142,6 +146,19 @@ build-openclaw-plugin: stamp-adapter-templates
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
 
+# The dsh entry is deliberately plain ESM and has no build-time dependency on
+# the dsh SDK.  Keep this target as an explicit bundle validation seam so raw,
+# RPM, and npm packaging all fail before shipping an incomplete native plugin.
+build-dsh-plugin: stamp-adapter-templates
+	@echo "==> Validating native dsh plugin bundle..."
+	@test -f $(DSH_PLUGIN_SRC_DIR)/package.json \
+	    || { echo "ERROR: $(DSH_PLUGIN_SRC_DIR)/package.json is missing"; exit 1; }
+	@test -f $(DSH_PLUGIN_SRC_DIR)/cordis.patch.yml \
+	    || { echo "ERROR: $(DSH_PLUGIN_SRC_DIR)/cordis.patch.yml is missing"; exit 1; }
+	@test -f $(DSH_PLUGIN_SRC_DIR)/dist/index.js \
+	    || { echo "ERROR: $(DSH_PLUGIN_SRC_DIR)/dist/index.js is missing"; exit 1; }
+	@cd $(DSH_PLUGIN_SRC_DIR) && node --input-type=module -e "import('./dist/index.js').then((plugin) => { if (typeof plugin.apply !== 'function' || plugin.name !== 'anolisa-tokenless') process.exit(1) })"
+
 # Install binaries + adapter resources per FHS spec.
 install: build install-binaries install-helpers install-adapter-resources install-cosh-extension
 
@@ -150,15 +167,30 @@ install-binaries:
 	install -d -m 0755 $(DESTDIR)$(BINDIR)
 	install -p -m 0755 target/release/tokenless $(DESTDIR)$(BINDIR)/
 
+# Cleanup for the standalone toon binary shipped by older releases (TOON is
+# now linked into tokenless via the toon-format library). $(LIBEXECDIR) is a
+# Tokenless-owned directory, so its toon helper is always removed; the
+# $(BINDIR)/toon entry is removed only when it is a symlink pointing into a
+# Tokenless helper layout, so an unrelated user-installed `toon` executable
+# is preserved.
+define clean-stale-toon
+rm -f $(DESTDIR)$(LIBEXECDIR)/toon
+if [ -L "$(DESTDIR)$(BINDIR)/toon" ]; then \
+    case "$$(readlink "$(DESTDIR)$(BINDIR)/toon")" in \
+        */anolisa/tokenless/toon|*/anolisa/libexec/tokenless/toon) \
+            rm -f "$(DESTDIR)$(BINDIR)/toon" ;; \
+    esac; \
+fi
+endef
+
 install-helpers:
 	@echo "==> Installing helpers to $(DESTDIR)$(LIBEXECDIR)..."
 	install -d -m 0755 $(DESTDIR)$(LIBEXECDIR)
 	install -p -m 0755 third_party/rtk/target/release/rtk $(DESTDIR)$(LIBEXECDIR)/
-	install -p -m 0755 $(HOME)/.cargo/bin/toon $(DESTDIR)$(LIBEXECDIR)/
 	ln -sf $(LIBEXECDIR)/rtk $(DESTDIR)$(BINDIR)/rtk
-	ln -sf $(LIBEXECDIR)/toon $(DESTDIR)$(BINDIR)/toon
+	$(clean-stale-toon)
 
-install-adapter-resources: build-openclaw-plugin
+install-adapter-resources: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Installing adapter resources to $(DESTDIR)$(SHARE_DIR)..."
 	rm -rf $(DESTDIR)$(SHARE_DIR)
 	install -d -m 0755 $(DESTDIR)$(SHARE_DIR)
@@ -171,6 +203,12 @@ install-adapter-resources: build-openclaw-plugin
 	find $(DESTDIR)$(SHARE_DIR) -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod 0755 {} +
 	@test -f $(DESTDIR)$(SHARE_DIR)/openclaw/dist/index.js \
 	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/openclaw/dist/index.js missing after install-adapter-resources"; exit 1; }
+	@test -f $(DESTDIR)$(SHARE_DIR)/dsh/package.json \
+	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/dsh/package.json missing after install-adapter-resources"; exit 1; }
+	@test -f $(DESTDIR)$(SHARE_DIR)/dsh/cordis.patch.yml \
+	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/dsh/cordis.patch.yml missing after install-adapter-resources"; exit 1; }
+	@test -f $(DESTDIR)$(SHARE_DIR)/dsh/dist/index.js \
+	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/dsh/dist/index.js missing after install-adapter-resources"; exit 1; }
 
 install-cosh-extension:
 	@echo "==> Installing tokenless cosh extension to $(DESTDIR)$(COSH_EXTENSION_DIR)..."
@@ -184,13 +222,14 @@ install-cosh-extension:
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/tokenless
 	rm -f $(DESTDIR)$(LIBEXECDIR)/rtk
-	rm -f $(DESTDIR)$(LIBEXECDIR)/toon
+	$(clean-stale-toon)
 	rm -rf $(DESTDIR)$(SHARE_DIR)
 	rm -rf $(DESTDIR)$(COSH_EXTENSION_DIR)
 
 # Run tests
 test: test-tokenless test-hooks test-integration test-adapters \
-      test-claude-code-detect test-raw-package test-npm-package
+      test-claude-code-detect test-raw-package test-npm-package \
+      test-toon-cleanup
 
 test-tokenless:
 	@echo "==> Testing tokenless..."
@@ -209,16 +248,24 @@ test-claude-code-detect:
 test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
+	python3 tests/test_compress_toon_hook.py
+	python3 tests/test_codex_toon_threshold.py
+	python3 tests/test_hermes_toon_threshold.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hermes_plugin_import.py
 	python3 tests/test_agentscope_middleware.py
 	python3 tests/test_agentscope_v1.py
 	python3 tests/test_rewrite_hook.py
+	python3 tests/test_cosh_extension_matcher.py
 	python3 tests/test_resolve_agent_id.py
 
-test-adapters: build-openclaw-plugin
+test-adapters: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Testing openclaw RTK context propagation..."
 	node --test tests/test-openclaw-rtk-context.mjs
+	@echo "==> Testing openclaw TOON minimum payload threshold..."
+	node --test tests/test-openclaw-toon-threshold.mjs
+	@echo "==> Testing native dsh adapter bundle..."
+	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
 	@echo "==> Testing OpenCode adapter..."
@@ -230,9 +277,21 @@ test-adapters: build-openclaw-plugin
 # one build supports CPython 3.11 and later on that platform.
 python-wheel:
 	@echo "==> Building Tokenless Python wheel..."
+	@if [ "$(PYTHON_RTK_BINARY)" = "$(CURDIR)/third_party/rtk/target/release/rtk" ]; then \
+		just setup-rtk; \
+		cargo build --release --manifest-path third_party/rtk/Cargo.toml; \
+	fi
+	@test -x "$(PYTHON_RTK_BINARY)" || { \
+		echo "RTK binary is missing or not executable: $(PYTHON_RTK_BINARY)" >&2; \
+		exit 1; \
+	}
 	install -d -m 0755 $(PYTHON_WHEEL_DIR)
 	rm -f $(PYTHON_WHEEL_DIR)/anolisa_tokenless-*.whl
-	cd $(PYTHON_RUNTIME_DIR) && \
+	@set -e; \
+		install -d -m 0755 $(PYTHON_RTK_PACKAGE_DIR); \
+		install -p -m 0755 $(PYTHON_RTK_BINARY) $(PYTHON_RTK_PACKAGE_DIR)/rtk; \
+		trap 'rm -f $(PYTHON_RTK_PACKAGE_DIR)/rtk' EXIT; \
+		cd $(PYTHON_RUNTIME_DIR); \
 		$(MATURIN) build --profile python-release --interpreter python3 \
 			--compatibility pypi --auditwheel check \
 			--out $(PYTHON_WHEEL_DIR)
@@ -250,16 +309,16 @@ agentscope-wheel: stamp-python-packages
 test-agentscope-integration: python-wheel agentscope-wheel
 	@bash tests/test-agentscope-integration.sh
 
-# These targets only assemble the prebuilt BIN_DIR/{tokenless,rtk,toon} files
+# These targets only assemble the prebuilt BIN_DIR/{tokenless,rtk} files
 # into the portable raw-package contract maintained by this component.
 package-raw:
 	@$(MAKE) -B stamp-adapter-templates
-	@$(MAKE) build-openclaw-plugin
+	@$(MAKE) build-openclaw-plugin build-dsh-plugin
 	@./packaging/raw/package.sh package
 
 stage-raw:
 	@$(MAKE) -B stamp-adapter-templates
-	@$(MAKE) build-openclaw-plugin
+	@$(MAKE) build-openclaw-plugin build-dsh-plugin
 	@./packaging/raw/package.sh stage
 
 test-raw-package:
@@ -267,6 +326,9 @@ test-raw-package:
 
 test-npm-package:
 	@bash tests/test-package-npm-prebuilt.sh
+
+test-toon-cleanup:
+	@bash tests/test-toon-cleanup.sh
 
 # Lint (rtk excluded — vendored third-party source)
 lint:
@@ -447,7 +509,6 @@ setup: install adapter-install
 	@echo "  Binaries (FHS):"
 	@echo "    tokenless -> $(BIN_DIR)/tokenless"
 	@echo "    rtk       -> $(LIB_DIR)/rtk"
-	@echo "    toon      -> $(LIB_DIR)/toon"
 	@echo "  Extension (cosh):"
 	@echo "    $(COSH_EXTENSION_DIR)/"
 	@echo "  Adapter (FHS):"
@@ -458,18 +519,16 @@ setup: install adapter-install
 	@echo "Verify:"
 	@echo "  tokenless --version"
 	@echo "  rtk --version"
-	@echo "  toon --version"
 	@echo "  make adapter-scan"
 
 # --- npm Packaging ---
 # Preserve the convenient native entry point while keeping package-npm.js a
 # pure validator/assembler.
-prepare-npm-native-binaries: build-tokenless build-toon
+prepare-npm-native-binaries: build-tokenless
 	@install -d -m 0755 "$(NATIVE_NPM_INPUT_DIR)"
 	@install -p -m 0755 \
 		target/release/tokenless \
 		third_party/rtk/target/release/rtk \
-		"$(HOME)/.cargo/bin/toon" \
 		"$(NATIVE_NPM_INPUT_DIR)/"
 
 # Build and package the current host.
@@ -515,9 +574,8 @@ help:
 	@echo "Token-Less Build System"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build             Build tokenless + rtk + toon + openclaw plugin"
+	@echo "  build             Build tokenless + rtk + openclaw plugin"
 	@echo "  build-tokenless   Build tokenless + rtk (via justfile)"
-	@echo "  build-toon        Install toon binary via cargo install toon-format"
 	@echo "  build-openclaw-plugin  Compile OpenClaw plugin TS -> dist/index.js"
 	@echo "  install           Install binaries + adapter to FHS paths"
 	@echo "  uninstall         Remove installed files"
@@ -563,7 +621,7 @@ help:
 	@echo "  LIBEXECDIR       Helper binary install path"
 	@echo "  SHARE_DIR        Adapter resources path"
 	@echo "  COSH_EXTENSION_DIR  Cosh extension path"
-	@echo "  BIN_DIR          Directory containing prebuilt tokenless, rtk, and toon"
+	@echo "  BIN_DIR          Directory containing prebuilt tokenless and rtk"
 	@echo "  TARGET_OS        Raw target OS: linux or macos"
 	@echo "  TARGET_ARCH      Raw target arch: x86_64 or aarch64"
 	@echo "  OUTPUT_DIR       Raw artifact output directory (default: target/raw)"

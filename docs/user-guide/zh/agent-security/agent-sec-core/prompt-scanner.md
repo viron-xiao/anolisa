@@ -29,6 +29,7 @@ agent-sec-cli scan-prompt --input prompts.txt --format json
 | `--mode MODE` | 检测模式：`fast` / `standard` / `strict` / `multi_turn`；默认 `standard` |
 | `--format FMT` | 输出格式：`json`（默认）或 `text`（人类可读）|
 | `--source SOURCE` | 输入来源标签，写入 metadata，例如 `user_input`、`rag`、`tool_output` |
+| `--model MODEL` | L2 后端模型名；优先于 `PROMPT_SCANNER_L2_MODEL`，未设时用默认 Qwen3Guard |
 
 ## 检测模式
 
@@ -39,10 +40,38 @@ agent-sec-cli scan-prompt --input prompts.txt --format json
 | `strict` | L1 + L2 ML 分类器（L3 预留） | `False` | 50–200 ms | 高安全场景 |
 | `multi_turn` | L4 多轮意图检测 | — | 取决于模型 | 从 stdin 传入 JSON history（Ollama） |
 
-L2 分类器调用 `modelscope.cn/ANOLISA/Qwen3Guard-Gen-0.6B-GGUF`，由 Ollama 从项目自有的
+L2 分类器默认调用 `modelscope.cn/ANOLISA/Qwen3Guard-Gen-0.6B-GGUF`，由 Ollama 从项目自有的
 ModelScope 仓库拉取。执行一次
 `ollama pull modelscope.cn/ANOLISA/Qwen3Guard-Gen-0.6B-GGUF` 即可（无需重命名），
 再执行 `agent-sec-cli scan-prompt warmup` 验证模型可用，避免首次扫描时才发现模型缺失。
+
+### 切换 L2 后端
+
+设置 `PROMPT_SCANNER_L2_MODEL` 可把 L2 换成 Warden-Gen（也可用 `--model` 临时指定，优先级 `--model` > 环境变量 > 默认）：
+
+```bash
+ollama pull modelscope.cn/ANOLISA/Warden-Gen-0.6B-GGUF
+
+# 方式一：环境变量（对所有宿主 hook 生效）
+export PROMPT_SCANNER_L2_MODEL=modelscope.cn/ANOLISA/Warden-Gen-0.6B-GGUF
+agent-sec-cli scan-prompt warmup
+
+# 方式二：--model 临时指定（仅本次命令）
+agent-sec-cli scan-prompt --model modelscope.cn/ANOLISA/Warden-Gen-0.6B-GGUF --text "..."
+```
+
+所有宿主 hook 都通过命令行调用 `scan-prompt`，因此环境变量对它们同样生效；`--model` 主要用于终端临时切换。两者取值都必须是
+上面 `ollama pull` 使用的完整模型名。拼错只在 CLI 层“直接报错”：引擎在构造期就拒绝不支持的模型名，`scan-prompt` 返回
+`error` verdict 并以 `1` 退出，而不是静默关闭 L2。但六个宿主 hook 对这个非零退出码一律 fail-open，所以宿主内的同一个拼错
+只会被记为一条 failed 的 `prompt_scan` 事件，不阻断任何 prompt——在改回正确模型名之前，该宿主实际处于无 prompt 防护状态。
+改完环境变量后执行 `agent-sec-cli scan-prompt warmup`，让失败在宿主加载前暴露。两者都为空时沿用默认的 Qwen3Guard。
+
+L2 同一时刻只跑一个后端，不做级联或投票。
+
+想确认某个宿主实际会用哪个后端，可在该宿主的环境中执行
+`agent-sec-cli capabilities --capability prompt-scan --output json`，查看 `env`
+下的 `PROMPT_SCANNER_L2_MODEL` 条目：变量未设置时它会上报默认后端；若配的模型名
+不在引擎支持范围内，还会附一条 diagnostic。
 
 ## Verdict
 
@@ -61,17 +90,24 @@ Scanner 将各层结果聚合为一个 verdict：
 
 设置 `PROMPT_SCANNER_HOOK_ENABLED=false` 可完全跳过宿主 prompt scanner hook。启用时，以下环境变量控制部署级行为：
 
-| 环境变量 | 默认值 | 行为 |
-|----------|--------|------|
-| `PROMPT_SCANNER_HOOK_ENABLED` | `true` | 设为 `false` 时在读取输入前跳过 hook |
-| `PROMPT_SCANNER_MODE` | `observe` | `observe` 静默审计；`warn` 告警；`ask`/`block` 按宿主能力执行或 fallback 为 `warn`；`deny` 等价于 `block` |
-| `PROMPT_SCANNER_SCAN_MODE` | `standard` | 传给 `scan-prompt` 的扫描强度：`fast` / `standard` / `strict` |
-| `PROMPT_SCANNER_TIMEOUT` | `10` | Scanner 超时秒数 |
+| 环境变量 | 默认值 | 读取该变量的宿主 | 行为 |
+|----------|--------|------------------|------|
+| `PROMPT_SCANNER_HOOK_ENABLED` | `true` | 全部六个 | 设为 `false` 时在读取输入前跳过 hook |
+| `PROMPT_SCANNER_MODE` | `observe` | Qoder、Codex、Qwen Code | `observe` 静默审计；`deny` 会在 prompt scanner 返回 `warn` 或 `deny` finding 时阻断。`ask` 和 `block` 不是 prompt scanner 的有效模式。 |
+| `PROMPT_SCANNER_SCAN_MODE` | `standard` | 全部六个 | 传给 `scan-prompt` 的扫描强度：`fast` / `standard` / `strict` |
+| `PROMPT_SCANNER_TIMEOUT` | `10` | Qoder、Codex、Qwen Code | Scanner 超时秒数 |
 
-环境变量优先于 Hermes/OpenClaw capability 配置。宿主 Agent 在加载插件时读取这些变量，修改后需重启承载该
-hook 的 Agent 进程。
+cosh、Hermes 和 OpenClaw 只读取 `PROMPT_SCANNER_HOOK_ENABLED` 和 `PROMPT_SCANNER_SCAN_MODE`，
+在这些宿主上设置 `PROMPT_SCANNER_MODE` 或 `PROMPT_SCANNER_TIMEOUT` 不会生效。OpenClaw 的阻断
+行为由 `promptScanBlock` 决定，scanner 超时固定为 10 秒；Hermes 的 `prompt-scan-user-input`
+capability 本身是非阻断设计，没有阻断开关；cosh 也没有 prompt 策略开关。Qoder、Codex 和
+Qwen Code 需要使用 `PROMPT_SCANNER_MODE=deny` 阻断 prompt scanner finding。
 
-Scanner verdict `deny` 描述扫描风险；hook policy `block` 决定当前 adapter 是否执行阻断。
+对于确实会读取的环境变量，其优先于对应宿主配置。宿主 Agent 在加载插件时读取这些变量，
+修改后需重启承载该 hook 的 Agent 进程。
+
+Scanner verdict `deny` 描述扫描风险。对于 Qoder、Codex 和 Qwen Code prompt hook，
+`PROMPT_SCANNER_MODE=deny` 是将 prompt scanner finding 转成阻断 hook 结果的部署策略。
 
 ## Security Event 与 Observability
 

@@ -205,11 +205,13 @@ agentsight interruption --db /path/to/interruption_events.db list --last 48
 | `/health` | GET | 健康检查 |
 | `/metrics` | GET | Prometheus token 指标 |
 | `/api/sessions` | GET | 会话列表 |
+| `/api/sessions/search` | POST | 语义会话搜索（复用优化 LLM，Body: `{"query","candidates":[{session_id,first_message,last_message,project}]}`，候选 ≤200、≤5 跳过 LLM） |
 | `/api/sessions/{id}/traces` | GET | 会话下的 trace |
 | `/api/traces/{id}` | GET | trace 详情 |
 | `/api/conversations/{id}` | GET | conversation 事件详情 |
 | `/api/agent-names` | GET | Agent 名称列表 |
 | `/api/timeseries` | GET | 时序 Token 统计 |
+| `/api/metrics/latency` | GET | LLM latency and throughput percentile metrics |
 | `/api/agent-health` | GET | Agent 健康状态 |
 | `/api/agent-health/{pid}` | DELETE | 删除健康条目 |
 | `/api/agent-health/{pid}/restart` | POST | 重启 Agent |
@@ -227,7 +229,7 @@ agentsight interruption --db /path/to/interruption_events.db list --last 48
 | `/api/sessions/{id}/interruptions` | GET | 指定 session 的所有中断 |
 | `/api/conversations/{id}/interruptions` | GET | 指定 conversation 的所有中断 |
 | `/api/auth/login` | POST | Dashboard 登录（Body: `{"token":"..."}` ），成功设置 httpOnly cookie |
-| `/api/auth/status` | GET | 返回 `{"auth_enabled": bool}`（免认证，供前端判断是否需登录）|
+| `/api/auth/status` | GET | 返回 `{"auth_enabled": bool, "capabilities": [...]}`（免认证）；`capabilities` 为动态探测结果，取决于宿主机上安装的伴随组件（agent-sec / enforcer / tokenless），供前端 NavBar 过滤不可用页面 |
 | `/api/auth/verify` | GET | 校验当前 session cookie/token 是否有效，返回 `{"authenticated": bool}` |
 | `/api/optimize/sessions/{id}/{dim}` | POST | 运行单维度优化分析，`dim` ∈ `perf` / `perf-issues` / `cost` / `cost-waste` / `accuracy` / `summary`（后四者需 LLM 配置，10–60s；`summary` 为单次调用叙事摘要） |
 | `/api/optimize/sessions/{id}/results` | GET | 读取已持久化的优化分析结果 |

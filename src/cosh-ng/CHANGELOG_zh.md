@@ -4,7 +4,57 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，并遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
 
-## [0.17.0] — 未发布
+## [未发布]
+
+## [0.19.0] — 2026-08-21
+
+### 新功能
+- 新增本地 gateway 控制平面，支持持久化 Task 调度、运行时租约与崩溃恢复，可通过 `cosh agent task ...` 命令使用 (#2603)
+- 新增直接 ACP 入口命令 `cosh agent doctor` 与 `cosh agent run`，可在交互式 Shell 之外验证并驱动本地安装的 ACP adapter；权限流程为 once-only，仅在本地控制终端提示，并将脱敏证据记录到私有本地状态目录 (#2603)
+
+### 修复
+- awk 程序中 `system()` 调用前存在空格或行续符时也能被正确检测 (#2655)
+- 缺失的 precmd 状态标记现在映射为 -1，不再伪造为退出码 0，保证中断或伪造标记下的账本完整性 (#2709)
+
+## [0.18.0] — 2026-08-20
+
+### 新功能
+- 长时间交互式会话的 transcript 内存工作窗口现在有界，终端输出仍会完整写入会话 spool 文件，从而抑制内存无限增长 (#2682)
+- 支持需要任务增强的 MCP 长程工具调用，任务失败或超时时返回可操作的错误信息 (#2645)
+
+### 变更
+- **BREAKING**：`/usr/bin/cosh` 现在将非 TUI 调用直接透传给配置的 shell；在交互式终端外执行 `cosh --version`、`cosh --help` 或 `cosh <脚本>` 时行为与 shell 一致，不再进入 cosh TUI (#2625)
+
+### 修复
+- 在 cosh-core 驱动的 trust 审批模式下，被 hook 拦截的 shell 命令不再通过 staging grace 窗口实际执行 (#2125)
+- 外部组件已预先记录初始审批请求时，cosh-shell 现在能正确记录对应的审批决议 (#2402)
+- 同一批次中某个请求被拒绝后，审批被 hook 重写的 shell 命令不再报错 "could not route this approval" (#2667)
+- 当待处理的 turn extension 被新活动取代时，审计日志现在会补录对应的取消决议，避免留下未配对的请求条目 (#2695)
+
+## [0.17.2] — 2026-08-19
+
+### 修复
+- 将 `run_command` 输出上限设为 32 MB，防止 `dd if=/dev/zero`、`yes` 等失控命令导致进程被 OOM 杀死；超出上限时杀死进程组并返回 `OutputTooLarge` 错误，而非无限增长 (#2405)
+- 使 RPM `%post` 的 /etc/shells 注册幂等（先规范化并探测再追加），并新增 `%preun` 脚本：当用户仍以 `/usr/bin/cosh` 为登录 shell 时擦除操作失败关闭，防止 `rpm -e cosh-ng` 后遗留悬空 shell (#2599)
+
+## [0.17.1] — 2026-08-18
+
+### 修复
+- 通过事件驱动改造 raw relay 与 SIGINT 路径，将交互回显延迟从 p50 20 毫秒降至亚毫秒级，并消除长时间会话的高频空闲 CPU 轮询 (#2622)
+- 在 best-effort 审计存储写入失败时，仍保持已允许命令正常执行 (#2631)
+- 允许已审批流水线中的单引号参数包含换行，例如多行 jq 或 awk 脚本 (#2638)
+
+## [0.17.0] — 2026-08-17
+
+### 新功能
+- 当 hook id 同时存在于 shell 层与 agent 层时，`/hooks enable|disable <id>` 弹出交互式消歧面板，可选择切换 Shell hook、Agent hook 或两者 (#2400)
+
+### 变更
+- 空闲轮询时跳过冗余的历史事件处理，长时间运行的交互会话不再在空闲时重复执行与历史事件规模相当的工作 (#2546)
+
+### 修复
+- 修复 hook 输出显式 `"decision": null` 被当作透传的问题：现视为无效 hook 输出并默认拦截对应工具调用；若 hook 配置 `fail_open = true` 则放行但记录 `hook_failure` 通知；输出 `{}` 仍为合法透传 (#2529)
+- 修复 dnf 系统上 `cosh pkg install/remove --dry-run` 将可安装/可移除软件包的成功模拟误报为后端错误的问题 (#2605)
 
 ## [0.16.1] — 2026-08-14
 

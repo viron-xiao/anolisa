@@ -40,6 +40,26 @@ cat response.json | tokenless compress-response
 - JSON commands require valid JSON.
 - If compression does not reduce the estimated token count, the CLI explains this on stderr and returns the original.
 
+### Minimum useful payload
+
+`compress-schema` and `compress-response` have no fixed minimum input size. For
+every accepted valid JSON input, the CLI builds a candidate and estimates both
+versions as one token per CJK character plus one token per four other characters,
+rounded up. In active mode, it emits the candidate only when its estimate is strictly
+lower than the original (`after < before`). Otherwise stdout receives the original
+input, stderr reports `did not reduce size`, and no statistics record is written.
+In dry-run mode (`TOKENLESS_COMPRESSION_ENABLED=0` or
+`compression_enabled=false`), stdout always receives the original input; a smaller
+candidate is recorded as a predicted saving when statistics or SLS recording is enabled.
+
+The break-even point therefore depends on content and JSON shape, not only on
+bytes or characters. A small payload with a removable field can compress, while
+a larger already-compact payload can pass through unchanged. The description,
+string, array, and depth thresholds below only decide when individual
+transformations run; they are not minimum total payload sizes. Agent adapters
+can apply separate pre-spawn size gates; see
+[Adapter processing rules](framework-integration.md#adapter-processing-rules).
+
 ## `compress-schema`
 
 Compress one OpenAI Function Calling schema:
@@ -54,7 +74,25 @@ Compress a JSON array:
 cat tools.json | tokenless compress-schema --batch
 ```
 
-An array input enables batch handling automatically. Common options:
+Accepted item shapes (detected per item):
+
+- OpenAI function wrapper: `{"function": {"name", "description", "parameters"}}`
+- Direct schema: `{"name", "description", "parameters"}`
+- Gemini / copilot-shell wrapper: `{"functionDeclarations": [{"name", "description", "parameters" | "parametersJsonSchema"}, ...]}`; copilot-shell BeforeModel hooks deliver tool declarations in this shape (`llm_request.config.tools`). Declarations inside the wrapper are compressed individually (the parameter schema is read from `parametersJsonSchema` when present, otherwise from `parameters`); the wrapper itself and any sibling fields are preserved.
+
+An array input enables batch handling automatically.
+
+A complete request object with a top-level `tools` array is also accepted. Its
+Function Calling entries may be OpenAI `{"function": {...}}` wrappers, Gemini
+`{"functionDeclarations": [...]}` tool objects, or bare
+`{name, description, parameters}` declarations. Do not pass `--batch` for this
+shape; non-function tools and fields outside `tools` are preserved.
+
+```bash
+tokenless compress-schema -f request.json
+```
+
+Common options:
 
 | Option | Description |
 |--------|-------------|
@@ -98,13 +136,16 @@ By default it removes exact, case-sensitive blacklisted keys, `null`, and empty 
 |--------|---------|-------------|
 | `-f, --file <path>` | stdin | Input file |
 | `--truncate-strings-at <n>` | `4096` | String truncation threshold |
-| `--truncate-arrays-at <n>` | `32` | Maximum retained array items |
+| `--truncate-arrays-at <n>` | `32` | Array length that triggers truncation; the first `n` items are kept |
+| `--array-tail-preserve <n>` | `8` | Items preserved from the tail of truncated arrays; `0` disables tail preservation |
 | `--max-depth <n>` | `8` | Maximum nesting depth |
 | `--agent-id <id>` | `cli` | Agent identifier in statistics |
 | `--session-id <id>` | — | Session identifier in statistics |
 | `--tool-use-id <id>` | — | Tool-call identifier in statistics |
 | `--no-stash` | off | Disable reversible Stash |
 | `--stash-db <path>` | `~/.tokenless/stash.db` | Override the Stash database; an invalid path is rejected as an override and the CLI falls back to the environment or default path |
+
+Array truncation keeps a head window of `--truncate-arrays-at` items and a tail window of `--array-tail-preserve` items, with a truncation marker in between. Middle items are dropped only when the array is longer than both windows combined, so under the defaults a command can retain `n + 8` items plus the marker; when the two windows cover the whole array, every item is retained without a marker. Set `--array-tail-preserve 0` for head-only truncation.
 
 Override thresholds:
 
@@ -123,7 +164,7 @@ debug, trace, traces, stack, stacktrace, logs, logging
 
 Field matching and truncation change the response representation seen by the model. Save representative samples and compare the result before processing critical payloads.
 
-Stash applies only to truncation of strings, array tails, and deep subtrees. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
+Stash applies only to truncation of strings, the dropped middle segment of truncated arrays, and deep subtrees. Tail items are kept inline, not stashed. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
 
 Most adapters override these standalone defaults. Their shared shell profile uses `65536`, `128`, and `8`; the other-structured-tool profile uses `1048576`, `65536`, and `32`. Content-retrieval tools are skipped. See [Framework integration · Adapter processing rules](framework-integration.md#adapter-processing-rules).
 
@@ -235,6 +276,7 @@ tokenless env-check --tool Shell --fix
 ```bash
 tokenless stats summary
 tokenless stats summary --json
+tokenless stats summary --limit 1000
 tokenless stats list --limit 20
 tokenless stats show <record-id>
 tokenless stats diff <record-id>
@@ -250,6 +292,8 @@ Dual-run comparison:
 ```bash
 tokenless stats summary --compare <baseline-session> <active-session>
 ```
+
+A missing session ID fails with a non-zero exit instead of a 0% comparison, matching `stats diff --session`. `stats summary --limit` must be a positive integer; `--limit 0` is rejected at parse time, matching `stats diff --limit`.
 
 Inspect one record or the verified stages of one tool call:
 

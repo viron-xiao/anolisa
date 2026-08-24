@@ -17,7 +17,7 @@ cargo build --release --locked -p tokenless-cli
 ./target/release/tokenless --version
 ```
 
-This path produces only the standalone `tokenless` CLI. It does not install `rtk`, `toon`, or the agent integration resources. To use the complete feature set in an agent, install through the anolisa CLI as described in the [Quick Start](QUICKSTART.md).
+This path produces only the standalone `tokenless` CLI. It does not install `rtk` or the agent integration resources. To use the complete feature set in an agent, install through the anolisa CLI as described in the [Quick Start](QUICKSTART.md).
 
 ## Build the Python runtime from source
 
@@ -71,7 +71,7 @@ for the state and concurrency contract.
 
 | Capability | Behavior implemented in the current code | Important boundary |
 |------------|------------------------------------------|--------------------|
-| Schema compression | Removes `title` and `examples`, removes fenced and inline code from descriptions, collapses whitespace, and truncates descriptions | Only available through the cosh and Qwen Code schema hooks; other users can call the CLI |
+| Schema compression | Removes `title` and `examples`, removes fenced and inline code from descriptions, collapses whitespace, and truncates descriptions | Runs on the cosh/Cosh-NG `BeforeModel` hook and per OpenCode tool definition (Qwen Code's manifest entry is skipped by current hosts); other users can call the CLI |
 | Response compression | Removes exact, case-sensitive debug-field names, `null`, empty strings/arrays/objects, and truncates values past configured limits | Accepts JSON; content-retrieval tools are intentionally skipped by adapters |
 | TOON encoding | Encodes JSON and keeps the JSON input when the estimated token count does not decrease | Whether TOON replaces or accompanies the original depends on the adapter |
 | Command rewriting | Calls `rtk rewrite` and submits the rewritten shell input when a rule is available | The command actually sent to the shell changes; unsupported or denied rewrites pass through |
@@ -90,7 +90,7 @@ After the tool: response compression → optional Stash → TOON encoding → st
 Before the model: schema compression
 ```
 
-This is a capability map, not a pipeline that every framework runs. For example, OpenClaw disables TOON by default, Codex adds compressed context instead of replacing the original tool result, and only cosh and Qwen Code register schema compression. See [Framework integration](framework-integration.md).
+This is a capability map, not a pipeline that every framework runs. For example, OpenClaw disables TOON by default, Codex adds compressed context instead of replacing the original tool result, and schema compression only runs on cosh/Cosh-NG (`BeforeModel` hook) and OpenCode (per tool definition). See [Framework integration](framework-integration.md).
 
 ## Behaviors to understand
 
@@ -170,6 +170,7 @@ Command rewriting also changes the shell command submitted by the host. Most ada
 | Inspect savings or content changes, or run a dual comparison | [Measuring savings](measuring-savings.md) |
 | Change settings or understand local data | [Configuration and data privacy](configuration-and-privacy.md) |
 | Fix missing statistics, adapter, or Stash issues | [Troubleshooting](troubleshooting.md) |
+| Diagnose missing schema-compression records | [Troubleshooting · Schema compression produces no statistics](troubleshooting.md#schema-compression-produces-no-statistics) |
 | Upgrade or uninstall | [Troubleshooting · Upgrade and uninstall](troubleshooting.md#upgrade-and-uninstall) |
 
 ## Recommended rollout

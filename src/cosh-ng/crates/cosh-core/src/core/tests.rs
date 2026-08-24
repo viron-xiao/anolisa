@@ -13,10 +13,17 @@ async fn empty_reader() -> tokio::io::Lines<BufReader<&'static [u8]>> {
 }
 
 fn make_core(provider: MockProvider) -> CoshCore {
+    make_core_with_profile(provider, crate::cli::ExecutionProfile::Legacy)
+}
+
+fn make_core_with_profile(
+    provider: MockProvider,
+    execution_profile: crate::cli::ExecutionProfile,
+) -> CoshCore {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new();
-    CoshCore::new(config, Box::new(provider), tools)
+    CoshCore::new_with_profile(config, Box::new(provider), tools, execution_profile)
 }
 
 #[test]
@@ -111,7 +118,7 @@ async fn requested_and_reserved_output_tokens(
     config.agent.approval_mode = ApprovalMode::Trust;
     config.session.compaction = compaction.clone();
     let session_token_limit = config.agent.session_token_limit;
-    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), ToolRegistry::new());
     core.model = model.to_string();
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
@@ -222,7 +229,7 @@ fn allowlisted_tools_bypass_strict_approval() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::new(AtomicUsize::new(0)),
     }));
-    let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+    let core = CoshCore::new_legacy(config, Box::new(MockProvider::new(Vec::new())), tools);
 
     assert_eq!(
         core.classify_tool("shell", &serde_json::json!({})),
@@ -247,7 +254,7 @@ fn sensitive_write_requires_auto_approval_but_preserves_bypass_modes() {
     ] {
         let mut config = CoreConfig::default();
         config.agent.approval_mode = ApprovalMode::from_config(mode);
-        let core = CoshCore::new(
+        let core = CoshCore::new_legacy(
             config,
             Box::new(MockProvider::new(Vec::new())),
             ToolRegistry::with_defaults_for_test(),
@@ -262,7 +269,7 @@ fn sensitive_write_requires_auto_approval_but_preserves_bypass_modes() {
 
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Auto;
-    let core = CoshCore::new(
+    let core = CoshCore::new_legacy(
         config,
         Box::new(MockProvider::new(Vec::new())),
         ToolRegistry::with_defaults_for_test(),
@@ -276,7 +283,7 @@ fn sensitive_write_requires_auto_approval_but_preserves_bypass_modes() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Recommend;
     config.agent.allowed_tools.insert("write_file".to_string());
-    let core = CoshCore::new(
+    let core = CoshCore::new_legacy(
         config,
         Box::new(MockProvider::new(Vec::new())),
         ToolRegistry::with_defaults_for_test(),
@@ -315,7 +322,7 @@ async fn sensitive_write_audit_uses_generic_execution_path() {
     ]);
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
-    let mut core = CoshCore::new(
+    let mut core = CoshCore::new_legacy(
         config,
         Box::new(provider),
         ToolRegistry::with_defaults_for_test(),
@@ -351,7 +358,7 @@ fn mcp_tools_require_approval_outside_trust_mode() {
         config.agent.approval_mode = mode;
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(TestMcpTool));
-        let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+        let core = CoshCore::new_legacy(config, Box::new(MockProvider::new(Vec::new())), tools);
 
         assert_eq!(
             core.classify_tool("mcp__remote__search", &serde_json::json!({})),
@@ -371,7 +378,7 @@ fn exact_mcp_allowlist_entry_bypasses_approval() {
         .insert("mcp__remote__search".to_string());
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(TestMcpTool));
-    let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+    let core = CoshCore::new_legacy(config, Box::new(MockProvider::new(Vec::new())), tools);
 
     assert_eq!(
         core.classify_tool("mcp__remote__search", &serde_json::json!({})),
@@ -385,7 +392,7 @@ fn external_tools_require_approval_outside_trust_mode() {
     config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(ExternalTool));
-    let mut core = CoshCore::new(config, Box::new(MockProvider::text_only("unused")), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(MockProvider::text_only("unused")), tools);
     for mode in [ApprovalMode::Auto, ApprovalMode::Recommend] {
         core.config.agent.approval_mode = mode;
         assert_eq!(
@@ -412,7 +419,7 @@ fn approval_mode_covers_every_registered_tool_kind() {
         let mut tools = ToolRegistry::with_defaults_for_test().with_shell_evidence();
         tools.register(Box::new(TestMcpTool));
         tools.register(Box::new(ExternalTool));
-        let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+        let core = CoshCore::new_legacy(config, Box::new(MockProvider::new(Vec::new())), tools);
 
         for (name, kind, recommend, auto) in [
             (
@@ -505,7 +512,7 @@ fn unknown_tools_are_denied_in_every_approval_mode() {
             .agent
             .allowed_tools
             .insert("unknown_provider_tool".to_string());
-        let core = CoshCore::new(
+        let core = CoshCore::new_legacy(
             config,
             Box::new(MockProvider::new(Vec::new())),
             ToolRegistry::with_defaults_for_test(),
@@ -554,7 +561,7 @@ fn web_fetch_requires_approval_outside_trust_mode() {
         let mut config = CoreConfig::default();
         config.agent.approval_mode = mode;
         let tools = ToolRegistry::with_defaults_for_test();
-        let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+        let core = CoshCore::new_legacy(config, Box::new(MockProvider::new(Vec::new())), tools);
 
         assert_eq!(
             core.classify_tool("web_fetch", &serde_json::json!({})),
@@ -577,7 +584,7 @@ async fn project_context_reaches_the_provider_boundary() {
     };
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
-    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), ToolRegistry::new());
     core.shell_context = Some(ShellContext {
         cwd: dir.path().to_path_buf(),
         env: std::collections::HashMap::new(),
@@ -609,7 +616,7 @@ async fn provider_session_identity_stays_out_of_the_system_prompt() {
     };
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
-    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), ToolRegistry::new());
     let provider_session_id = core.session_id.clone();
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
@@ -643,7 +650,7 @@ async fn runtime_context_tool_reads_live_core_state_on_demand() {
         },
     );
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(MockProvider::new(Vec::new())), tools);
     core.set_session_resumed(true);
     core.compaction.load_state(None, 7);
     // Config reload does not rebuild the bound provider or hook system. The
@@ -700,7 +707,7 @@ async fn raw_shell_input_reaches_prompt_hook_without_changing_provider_content()
         fail_open: false,
         env: Default::default(),
     }];
-    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), ToolRegistry::new());
     let envelope = "Handle this natural-language shell prompt.\n\nuser_input: marker\nruntime_frame: marker\ncosh-shell Agent contract: marker";
     let raw = "user_input: marker\nruntime_frame: marker\ncosh-shell Agent contract: marker\napi_key=sk-raw-hook-secret";
     let mut reader = empty_reader().await;
@@ -738,7 +745,7 @@ async fn prompt_hook_falls_back_to_content_without_raw_shell_input() {
         fail_open: false,
         env: Default::default(),
     }];
-    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), ToolRegistry::new());
     let content = "legacy\nuser_input: marker";
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
@@ -757,7 +764,7 @@ async fn prompt_hook_falls_back_to_content_without_raw_shell_input() {
 
 #[test]
 fn shell_cwd_does_not_replace_the_fixed_project_root() {
-    let mut core = CoshCore::new(
+    let mut core = CoshCore::new_legacy(
         CoreConfig::default(),
         Box::new(MockProvider::new(Vec::new())),
         ToolRegistry::new(),
@@ -777,7 +784,7 @@ fn shell_cwd_does_not_replace_the_fixed_project_root() {
 
 #[test]
 fn fixed_project_root_is_the_cwd_without_shell_context() {
-    let mut core = CoshCore::new(
+    let mut core = CoshCore::new_legacy(
         CoreConfig::default(),
         Box::new(MockProvider::new(Vec::new())),
         ToolRegistry::new(),
@@ -798,7 +805,7 @@ async fn user_provided_secret_reaches_the_provider_boundary() {
     };
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
-    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), ToolRegistry::new());
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
     let secret = "sk-user-provided-secret-value";
@@ -868,7 +875,7 @@ print(json.dumps({"hookSpecificOutput": {"llm_request": {"config": {"tools": too
     tools.register(Box::new(CountingShellTool {
         calls: Arc::new(AtomicUsize::new(0)),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
 
@@ -915,7 +922,7 @@ print(json.dumps({"hookSpecificOutput": {"llm_request": {"config": {"tools": too
     tools.register(Box::new(CountingShellTool {
         calls: Arc::new(AtomicUsize::new(0)),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
 
@@ -1058,7 +1065,7 @@ async fn mcp_tools_do_not_execute_before_approval() {
         tools.register(Box::new(CountingMcpTool {
             calls: Arc::clone(&calls),
         }));
-        let mut core = CoshCore::new(config, Box::new(mcp_tool_provider()), tools);
+        let mut core = CoshCore::new_legacy(config, Box::new(mcp_tool_provider()), tools);
         let deny = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"deny"}}}"#;
         let mut reader = BufReader::new(deny.as_bytes()).lines();
         let mut output = Vec::new();
@@ -1211,7 +1218,7 @@ async fn multi_turn_with_tool() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut output = Vec::new();
     let mut reader = empty_reader().await;
 
@@ -1318,7 +1325,7 @@ async fn text_after_tool_call_is_not_visible_before_tool_result() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut output = Vec::new();
     let mut reader = empty_reader().await;
 
@@ -1366,7 +1373,7 @@ async fn tool_call_block_is_closed_when_stream_ends_without_tool_call_end() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut output = Vec::new();
     let mut reader = empty_reader().await;
 
@@ -1416,7 +1423,7 @@ async fn multiple_tool_call_blocks_are_closed_with_distinct_indexes_without_tool
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut output = Vec::new();
     let mut reader = empty_reader().await;
 
@@ -1489,7 +1496,7 @@ async fn approval_flow_allow() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Recommend;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let allow_response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"allow"}}}"#;
     let input = format!("{allow_response}\n");
@@ -1535,7 +1542,7 @@ async fn approval_flow_deny() {
     let input = format!("{deny_response}\n");
     let mut reader = BufReader::new(input.as_bytes()).lines();
 
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut output = Vec::new();
 
     core.handle_user_message("delete everything", &mut reader, &mut output)
@@ -1563,9 +1570,47 @@ async fn request_id_skips_mismatched() {
     let mut reader = BufReader::new(input.as_bytes()).lines();
 
     let result = core
-        .wait_for_approval("expected-id", false, &mut reader)
+        .wait_for_approval("expected-id", None, &mut reader)
         .await;
     assert!(matches!(result, ApprovalResult::Denied(_)));
+}
+
+#[test]
+fn brokered_profile_denies_the_removed_checkpoint_tool() {
+    let core = CoshCore::new_with_profile(
+        CoreConfig::default(),
+        Box::new(MockProvider::text_only("")),
+        ToolRegistry::gateway_brokered_v1(),
+        crate::cli::ExecutionProfile::GatewayBrokeredV1,
+    );
+
+    assert_eq!(
+        core.classify_tool("workspace_checkpoint_create", &serde_json::json!({})),
+        Outcome::Deny
+    );
+    assert!(!core
+        .tool_names()
+        .iter()
+        .any(|name| name == "workspace_checkpoint_create"));
+}
+
+#[tokio::test]
+async fn brokered_profile_rejects_a_checkpoint_execution_result() {
+    let core = make_core_with_profile(
+        MockProvider::text_only(""),
+        crate::cli::ExecutionProfile::GatewayBrokeredV1,
+    );
+    let input = r#"{"type":"control_response","response":{"subtype":"success","request_id":"expected-id","response":{"behavior":"host_executed_checkpoint_create","checkpointResult":{"checkpoint_id":"ckpt-123"}}}}
+"#;
+    let mut reader = BufReader::new(input.as_bytes()).lines();
+
+    let result = core
+        .wait_for_approval("expected-id", Some(ToolKind::HostedSideEffect), &mut reader)
+        .await;
+    assert!(matches!(
+        result,
+        ApprovalResult::Denied(Some(reason)) if reason == "unknown response"
+    ));
 }
 
 /// Serializes the two tests that mutate the process-wide
@@ -1585,7 +1630,7 @@ async fn unanswered_approval_times_out_instead_of_hanging_forever() {
     let mut reader = BufReader::new(client).lines();
 
     let result = core
-        .wait_for_approval("expected-id", false, &mut reader)
+        .wait_for_approval("expected-id", None, &mut reader)
         .await;
     std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
     assert!(matches!(result, ApprovalResult::TimedOut));
@@ -1613,7 +1658,7 @@ async fn answered_approval_beats_the_residual_timeout() {
     let mut reader = BufReader::new(&mut client).lines();
 
     let result = core
-        .wait_for_approval("expected-id", false, &mut reader)
+        .wait_for_approval("expected-id", None, &mut reader)
         .await;
     std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
     assert!(matches!(result, ApprovalResult::Allowed));
@@ -1650,7 +1695,7 @@ async fn approval_receipt_disarms_the_residual_timeout_for_a_pending_card() {
     let mut reader = BufReader::new(&mut client).lines();
 
     let result = core
-        .wait_for_approval("expected-id", false, &mut reader)
+        .wait_for_approval("expected-id", None, &mut reader)
         .await;
     std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
     assert!(matches!(result, ApprovalResult::Allowed));
@@ -1687,7 +1732,7 @@ async fn approval_receipt_disarms_the_residual_timeout_for_a_slow_host_command()
     let mut reader = BufReader::new(&mut client).lines();
 
     let result = core
-        .wait_for_approval("expected-id", true, &mut reader)
+        .wait_for_approval("expected-id", Some(ToolKind::ShellExec), &mut reader)
         .await;
     std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
     assert!(matches!(
@@ -1722,7 +1767,7 @@ async fn approval_receipt_for_a_different_request_keeps_the_residual_timeout() {
     let mut reader = BufReader::new(&mut client).lines();
 
     let result = core
-        .wait_for_approval("expected-id", false, &mut reader)
+        .wait_for_approval("expected-id", None, &mut reader)
         .await;
     std::env::remove_var("COSH_CORE_APPROVAL_TIMEOUT_SECS");
     assert!(matches!(result, ApprovalResult::TimedOut));
@@ -1762,7 +1807,7 @@ async fn approval_timeout_fails_the_turn_without_a_second_generation() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&shell_calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let (client, mut server) = tokio::io::duplex(256);
     let mut reader = BufReader::new(client).lines();
@@ -1875,7 +1920,7 @@ async fn approval_timeout_suppresses_the_sandbox_bypass_reprompt() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&shell_calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let (client, _server) = tokio::io::duplex(256);
     let mut reader = BufReader::new(client).lines();
@@ -1939,7 +1984,7 @@ async fn approval_flow_host_executed_shell_uses_tool_result() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&shell_calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"host_executed_shell","result":{"llmContent":"ShellCommandCompleted evidence\ncommand: df -h\nstatus: completed","returnDisplay":"df -h completed","metadata":{"command":"df -h","status":"completed","exit_code":0}}}}}"#;
     let input = format!("{response}\n");
@@ -2005,7 +2050,7 @@ async fn approval_flow_rejects_host_executed_for_non_shell_tool() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Recommend;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"host_executed_shell","result":{"llmContent":"should not be accepted","returnDisplay":null,"metadata":{"command":"echo bad","status":"completed","exit_code":0}}}}}"#;
     let input = format!("{response}\n");
@@ -2055,7 +2100,7 @@ async fn ask_user_question_flow() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let answer_response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"answer":"Rust"}}}"#;
     let input = format!("{answer_response}\n");
@@ -2075,6 +2120,59 @@ async fn ask_user_question_flow() {
             assert!(content.contains("Rust"));
         }
     }
+}
+
+#[tokio::test]
+async fn brokered_ask_user_binds_the_private_request_to_the_tool_call() {
+    let provider = MockProvider::new(vec![
+        vec![
+            GenerateEvent::ToolCallStart {
+                index: 0,
+                id: "question-call".to_string(),
+                name: "ask_user_question".to_string(),
+            },
+            GenerateEvent::ToolCallDelta {
+                index: 0,
+                arguments_delta: r#"{"question":"Choose a branch","options":[{"label":"main"}],"allow_free_text":false}"#.to_string(),
+            },
+            GenerateEvent::ToolCallEnd { index: 0 },
+            GenerateEvent::MessageEnd,
+        ],
+        vec![GenerateEvent::MessageEnd],
+    ]);
+    let mut core = CoshCore::new_with_profile(
+        CoreConfig::default(),
+        Box::new(provider),
+        ToolRegistry::gateway_brokered_v1(),
+        crate::cli::ExecutionProfile::GatewayBrokeredV1,
+    );
+    let input = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"answer","answer":"main"}}}
+"#;
+    let mut reader = BufReader::new(input.as_bytes()).lines();
+    let mut output = Vec::new();
+
+    core.handle_user_message("choose", &mut reader, &mut output)
+        .await
+        .unwrap();
+
+    let request = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|message| {
+            message
+                .pointer("/request/subtype")
+                .and_then(|value| value.as_str())
+                == Some("ask_user")
+        })
+        .expect("brokered ask_user request");
+    assert_eq!(
+        request
+            .pointer("/request/tool_use_id")
+            .and_then(|value| value.as_str()),
+        Some("question-call")
+    );
+    assert_eq!(core.tool_names(), vec!["ask_user_question"]);
 }
 
 #[tokio::test]
@@ -2102,7 +2200,7 @@ async fn cosh_shell_evidence_read_output_uses_control_protocol_result() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new().with_shell_evidence();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceExcerpt\noutput_id: terminal-output://raw-session-a1b2/cmd-1\nexcerpt_status: available\nstdout","returnDisplay":"captured output","metadata":{"action":"read_output","output_id":"terminal-output://raw-session-a1b2/cmd-1","excerpt_status":"available","is_error":false}}}}}"#;
     let input = format!("{response}\n");
@@ -2180,7 +2278,7 @@ async fn cosh_shell_evidence_uses_its_control_protocol_in_every_mode() {
         let mut config = CoreConfig::default();
         config.agent.approval_mode = mode;
         let tools = ToolRegistry::new().with_shell_evidence();
-        let mut core = CoshCore::new(config, Box::new(provider), tools);
+        let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
         let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceCommandIndex\ncommand_id: cmd-1","returnDisplay":null,"metadata":{"action":"list_commands","is_error":false}}}}}"#;
         let mut reader = BufReader::new(response.as_bytes()).lines();
         let mut output = Vec::new();
@@ -2226,7 +2324,7 @@ async fn cosh_shell_evidence_list_commands_uses_control_protocol_result() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new().with_shell_evidence();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceCommandIndex\ncommand_id: cmd-1\noutput_available: true","returnDisplay":null,"metadata":{"action":"list_commands","scope":"current_ledger","limit":2,"next_cursor":null,"is_error":false}}}}}"#;
     let input = format!("{response}\n");
@@ -2293,7 +2391,7 @@ async fn cosh_shell_evidence_preserves_error_result() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new().with_shell_evidence();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceExcerpt\noutput_id: terminal-output://old-session/cmd-1\nexcerpt_status: unavailable\nreason: stale_session","returnDisplay":"stale output","metadata":{"action":"read_output","output_id":"terminal-output://old-session/cmd-1","excerpt_status":"unavailable","is_error":true,"reason":"stale_session"}}}}}"#;
     let input = format!("{response}\n");
@@ -2340,7 +2438,7 @@ async fn cosh_shell_evidence_read_output_forwards_bypass_recent_filter() {
     ]);
 
     let tools = ToolRegistry::new().with_shell_evidence();
-    let mut core = CoshCore::new(CoreConfig::default(), Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(CoreConfig::default(), Box::new(provider), tools);
 
     let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceExcerpt\noutput_id: terminal-output://raw-session-a1b2/cmd-1\nexcerpt_status: available\nstdout","returnDisplay":"captured output","metadata":{"action":"read_output","output_id":"terminal-output://raw-session-a1b2/cmd-1","excerpt_status":"available","is_error":false}}}}}"#;
     let input = format!("{response}\n");
@@ -2435,7 +2533,7 @@ async fn cosh_shell_evidence_bypasses_normal_tool_hooks() {
         ..Default::default()
     };
     let tools = ToolRegistry::new().with_shell_evidence();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     let list_response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceCommandIndex\ncommand_id: cmd-1","returnDisplay":null,"metadata":{"action":"list_commands","is_error":false}}}}}"#;
     let read_response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-1","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceExcerpt\noutput_id: terminal-output://raw-session/cmd-1\nstdout","returnDisplay":"stdout","metadata":{"action":"read_output","is_error":false}}}}}"#;
@@ -2655,7 +2753,7 @@ async fn run_shell_turns(
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(MockProvider::new(turns)), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(MockProvider::new(turns)), tools);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
 
@@ -2733,7 +2831,7 @@ async fn stopping_on_exhaustion_still_answers_every_call_in_the_batch() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(
+    let mut core = CoshCore::new_legacy(
         config,
         Box::new(MockProvider::new(vec![
             unparseable_shell_turn("call-1"),
@@ -2886,7 +2984,7 @@ async fn run_ask_user_turn(arguments: Option<&str>) -> (String, CoshCore) {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
@@ -3108,7 +3206,7 @@ async fn valid_ask_user_arguments_still_produce_a_question_and_answer() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
     let input = "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"req-0\",\"response\":{\"answer\":\"Stash\"}}}\n";
     let mut reader = BufReader::new(input.as_bytes()).lines();
@@ -3189,7 +3287,7 @@ async fn malformed_tool_arguments_fail_without_executing_the_tool() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
@@ -3241,7 +3339,7 @@ async fn empty_arguments_still_invoke_a_regular_tool() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
 
@@ -3285,7 +3383,7 @@ async fn cosh_question_text_with_unsupported_schema_fails_visibly() {
         let mut config = CoreConfig::default();
         config.agent.approval_mode = ApprovalMode::Trust;
         let tools = ToolRegistry::with_defaults_for_test();
-        let mut core = CoshCore::new(config, Box::new(provider), tools);
+        let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
         core.audit = CoreAuditRecorder::test_capture(&core.session_id);
         let mut reader = empty_reader().await;
         let mut output = Vec::new();
@@ -3343,7 +3441,7 @@ async fn cosh_question_text_stays_visible_when_questions_are_disabled() {
         .retain_selected_tools("shell")
         .expect("selection drops the question tool");
     assert!(!tools.supports_ask_user_question());
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
 
@@ -3381,7 +3479,7 @@ async fn cosh_question_text_with_valid_schema_still_asks() {
     let mut config = CoreConfig::default();
     config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let input = "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"req-0\",\"response\":{\"answer\":\"main\"}}}\n";
     let mut reader = BufReader::new(input.as_bytes()).lines();
     let mut output = Vec::new();
@@ -3519,7 +3617,7 @@ fn approval_core(calls: Arc<AtomicUsize>) -> CoshCore {
     config.agent.approval_mode = ApprovalMode::Recommend;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool { calls }));
-    let mut core = CoshCore::new(config, Box::new(approval_provider()), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(approval_provider()), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
     core
 }
@@ -3652,7 +3750,7 @@ async fn hook_ask_writes_a_complete_can_use_tool_line_to_a_real_pipe() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
 
     // A socket pair rather than `std::io::pipe`: same kernel-buffered
     // byte stream, without raising the toolchain this crate needs.
@@ -3730,6 +3828,7 @@ async fn question_emit_failure_never_waits_for_an_answer() {
                 allow_free_text: true,
                 multi_select: false,
             },
+            None,
             &mut reader,
             &mut writer,
         )
@@ -3763,7 +3862,7 @@ async fn evidence_emit_failure_ends_the_turn_and_pairs_the_history() {
     config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tool::shell_evidence::ShellEvidenceTool));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     let mut reader = tokio::io::BufReader::new(NeverReadStdin).lines();
     let mut writer = FailingWriter::new(FailStep::Write);
 
@@ -3791,7 +3890,7 @@ async fn user_prompt_submit_ask_emit_failure_never_waits_for_a_response() {
     config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     config.hooks.user_prompt_submit = vec![ask_hook("prompt-ask-hook")];
-    let mut core = CoshCore::new(
+    let mut core = CoshCore::new_legacy(
         config,
         Box::new(MockProvider::text_only("must never be reached")),
         ToolRegistry::new(),
@@ -3861,7 +3960,7 @@ async fn transport_failure_on_one_call_skips_the_rest_of_the_batch() {
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&calls),
     }));
-    let mut core = CoshCore::new(config, Box::new(provider), tools);
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
     let mut reader = tokio::io::BufReader::new(NeverReadStdin).lines();
     let mut writer = FailingWriter::new(FailStep::Write);
@@ -3928,5 +4027,202 @@ async fn audit_failure_after_transport_failure_still_pairs_the_history() {
         1,
         "every declared tool call must still be answered: {:?}",
         core.messages
+    );
+}
+
+// ─── #2067: trust-mode shell handoff reroute & blocked-call release ───
+
+fn trust_shell_core(calls: Arc<AtomicUsize>, provider: MockProvider) -> CoshCore {
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Trust;
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(CountingShellTool { calls }));
+    CoshCore::new_legacy(config, Box::new(provider), tools)
+}
+
+fn fully_capable_client() -> ClientControlCapabilities {
+    ClientControlCapabilities {
+        can_handle_can_use_tool: true,
+        can_handle_host_executed_shell: true,
+    }
+}
+
+#[test]
+fn trust_classify_reroutes_shell_for_fully_capable_client() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut core = trust_shell_core(calls, MockProvider::new(vec![]));
+    core.client_capabilities = fully_capable_client();
+    assert!(matches!(
+        core.classify_tool("shell", &serde_json::json!({"command":"echo hi"})),
+        Outcome::RequireApproval
+    ));
+}
+
+#[test]
+fn trust_classify_keeps_shell_local_without_full_capabilities() {
+    let params = serde_json::json!({"command":"echo hi"});
+
+    // Legacy client: no initialize capabilities at all.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let core = trust_shell_core(calls, MockProvider::new(vec![]));
+    assert!(matches!(
+        core.classify_tool("shell", &params),
+        Outcome::Allow
+    ));
+
+    // Half-capable is not capable: both halves of the exchange are required.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut core = trust_shell_core(calls, MockProvider::new(vec![]));
+    core.client_capabilities = ClientControlCapabilities {
+        can_handle_can_use_tool: true,
+        can_handle_host_executed_shell: false,
+    };
+    assert!(matches!(
+        core.classify_tool("shell", &params),
+        Outcome::Allow
+    ));
+}
+
+#[test]
+fn trust_classify_keeps_non_shell_tools_local_for_capable_client() {
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Trust;
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(ExternalTool));
+    let mut core = CoshCore::new_legacy(config, Box::new(MockProvider::new(vec![])), tools);
+    core.client_capabilities = fully_capable_client();
+    assert!(matches!(
+        core.classify_tool("example.ops/mcp/server/tool", &serde_json::json!({})),
+        Outcome::Allow
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trust_capable_client_shell_call_requests_approval_without_any_hook() {
+    // No hooks configured: in trust mode the reroute alone must raise the
+    // approval request, and it must not be flagged as hook-driven.
+    let provider = approval_provider();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut core = trust_shell_core(Arc::clone(&calls), provider);
+    core.client_capabilities = fully_capable_client();
+
+    let (pipe_reader, pipe_writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let mut writer = std::io::BufWriter::new(pipe_writer);
+    let mut reader = empty_reader().await;
+
+    core.handle_user_message("run echo hi", &mut reader, &mut writer)
+        .await
+        .expect("an unanswered approval ends the turn as interrupted, not as an error");
+
+    drop(writer);
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(pipe_reader));
+    let request = lines
+        .by_ref()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+        .find(|value| value["request"]["subtype"] == "can_use_tool")
+        .expect("trust-mode shell call must be rerouted to can_use_tool for a capable client");
+    assert_eq!(request["request"]["tool_name"], "shell");
+    assert_eq!(request["request"]["tool_use_id"], "call-1");
+    // `hook_requires_approval` skips serialization when false, so the wire
+    // field must be absent here: the reroute is policy-driven, not hook-driven.
+    assert!(request["request"]["hook_requires_approval"].is_null());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no decision arrived, so the tool must not have run"
+    );
+}
+
+#[tokio::test]
+async fn hook_block_releases_staged_call_with_provider_native_result() {
+    let provider = MockProvider::new(vec![
+        vec![
+            GenerateEvent::ToolCallStart {
+                index: 0,
+                id: "call-block".to_string(),
+                name: "shell".to_string(),
+            },
+            GenerateEvent::ToolCallDelta {
+                index: 0,
+                arguments_delta: r#"{"command":"touch /tmp/should-not-exist"}"#.to_string(),
+            },
+            GenerateEvent::ToolCallEnd { index: 0 },
+            GenerateEvent::MessageEnd,
+        ],
+        vec![
+            GenerateEvent::TextDelta("blocked acknowledged".to_string()),
+            GenerateEvent::MessageEnd,
+        ],
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Hooks are bound into the HookSystem at construction time, so the block
+    // hook must be in the config handed to `CoshCore::new_legacy`.
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Trust;
+    config.hooks = config::HooksConfig {
+        enabled: true,
+        pre_tool_use: vec![config::HookDefinition {
+            command: "echo '{\"decision\":\"block\",\"reason\":\"no touch\"}'".to_string(),
+            name: Some("block-shell".to_string()),
+            matcher: Some("shell".to_string()),
+            timeout: Some(5000),
+            sequential: None,
+            fail_open: false,
+            env: Default::default(),
+        }],
+        ..Default::default()
+    };
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(CountingShellTool {
+        calls: Arc::clone(&calls),
+    }));
+    let mut core = CoshCore::new_legacy(config, Box::new(provider), tools);
+
+    let mut reader = empty_reader().await;
+    let mut output = Vec::new();
+    core.handle_user_message("touch it", &mut reader, &mut output)
+        .await
+        .unwrap();
+
+    let output_str = String::from_utf8(output).unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a blocked command must never execute"
+    );
+    assert!(
+        output_str.contains(r#""type":"tool_result""#),
+        "the blocked call must be released with a provider-native tool result: {output_str}"
+    );
+    assert!(
+        output_str.contains(r#""tool_use_id":"call-block""#),
+        "{output_str}"
+    );
+    assert!(
+        output_str.contains("Blocked by hook: no touch"),
+        "{output_str}"
+    );
+    assert!(
+        output_str.contains(r#""cosh_hook_verdict":"blocked""#),
+        "the blocked release must carry the machine-readable verdict marker: {output_str}"
+    );
+    assert!(
+        !output_str.contains("can_use_tool"),
+        "a hook block is a verdict, not an approval request: {output_str}"
+    );
+    assert!(
+        output_str.contains("blocked acknowledged"),
+        "the turn must continue after the blocked result reaches the LLM: {output_str}"
+    );
+    let blocked_results = core
+        .messages
+        .iter()
+        .filter(|m| m.tool_call_id.as_deref() == Some("call-block"))
+        .count();
+    assert_eq!(
+        blocked_results, 1,
+        "the LLM must see the blocked result exactly once"
     );
 }

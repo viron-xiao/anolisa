@@ -2,7 +2,10 @@ use std::process::Command;
 
 use tokenless_ccr::StashStore;
 use tokenless_runtime::{CompressOptions, compress_response_with_store};
-use tokenless_stats::{OperationType, StatsRecord, StatsRecorder, estimate_tokens, get_home_dir};
+use tokenless_stats::{
+    CompressionMode, OperationType, StatsRecord, StatsRecorder, estimate_tokens,
+    estimate_tokens_from_bytes, get_home_dir,
+};
 
 fn tokenless_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tokenless"))
@@ -322,6 +325,121 @@ fn compress_schema_batch_mode() {
 }
 
 #[test]
+fn compress_schema_batch_gemini_function_declarations() {
+    // copilot-shell BeforeModel hooks pass Gemini SDK tool entries
+    // ({"functionDeclarations": [...]}). The batch path must compress the
+    // nested declarations and keep the wrapper shape so the host can apply
+    // the rewritten array unchanged.
+    let long_desc = "Run a shell command in the workspace. ".repeat(20);
+    let schemas = serde_json::json!([
+        {
+            "functionDeclarations": [
+                {
+                    "name": "shell",
+                    "description": long_desc,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": long_desc}
+                        }
+                    }
+                }
+            ]
+        }
+    ]);
+    let input = serde_json::to_string(&schemas).unwrap();
+    let output = tokenless_bin()
+        .args(["compress-schema", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(output.status.success(), "compress-schema should succeed");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let decls = &result[0]["functionDeclarations"];
+    assert_eq!(decls[0]["name"], "shell");
+    // Limits are char counts, not byte lengths (the stash marker carries a
+    // multibyte ellipsis).
+    assert!(decls[0]["description"].as_str().unwrap().chars().count() <= 256);
+    let param_desc = decls[0]["parameters"]["properties"]["command"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(param_desc.chars().count() <= 160);
+    assert!(
+        output.stdout.len() < input.len(),
+        "compressed output must be smaller than the input"
+    );
+}
+
+#[test]
+fn compress_schema_tools_request_container() {
+    let input = serde_json::to_string_pretty(&serde_json::json!({
+        "model": "example-model",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "A".repeat(2000),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "B".repeat(1000)
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let output = tokenless_bin()
+        .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+        .env("TOKENLESS_STATS_ENABLED", "0")
+        .args(["compress-schema", "--no-stash"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "compress-schema failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["model"], "example-model");
+    assert!(
+        result["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 256
+    );
+    assert!(
+        result["tools"][0]["function"]["parameters"]["properties"]["query"]["description"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 160
+    );
+}
+
+#[test]
 fn compress_response_from_stdin() {
     let response =
         r#"{"data":"value","debug":"remove","trace":"remove","empty_field":"","null_field":null}"#;
@@ -493,6 +611,40 @@ fn compress_response_from_file() {
 }
 
 #[test]
+fn compress_response_array_tail_preserve_max_does_not_abort() {
+    // Regression: `--array-tail-preserve` is an unconstrained usize. Even
+    // usize::MAX must not overflow the head+tail budget (panic in debug,
+    // abort in release); the saturated budget keeps the whole array.
+    let huge = usize::MAX.to_string();
+    let output = tokenless_bin()
+        .args([
+            "compress-response",
+            "--truncate-arrays-at",
+            "1",
+            "--array-tail-preserve",
+            huge.as_str(),
+            "--no-stash",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"[1,2,3]\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CLI aborted on large --array-tail-preserve: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result, serde_json::json!([1, 2, 3]));
+}
+
+#[test]
 fn compress_response_no_stash() {
     let response = r#"{"data":"value","debug":"remove"}"#;
     let output = tokenless_bin()
@@ -508,6 +660,73 @@ fn compress_response_no_stash() {
         })
         .unwrap();
     assert!(output.status.success());
+}
+
+#[test]
+fn no_stash_response_to_toon_roundtrip_is_decodable() {
+    // Regression: `--no-stash` is a supported mode, and its plain truncation
+    // marker used to lack a TOON quoting trigger, so the pipeline
+    // compress-response --no-stash -> compress-toon -> decompress-toon exited
+    // 2 at the mid-array marker while both compression commands reported
+    // success. The marker now carries the `, not stashed` clause, which
+    // forces TOON quoting, so the whole pipeline must round-trip and the
+    // paired decoder must accept the TOON output.
+    let bad: Vec<serde_json::Value> = (0..60)
+        .map(|i| serde_json::json!({ "id": i, "value": "x" }))
+        .collect();
+    let good: Vec<serde_json::Value> = (0..5)
+        .map(|i| serde_json::json!({ "identifier": i, "repeated_field_alpha": "alpha-value" }))
+        .collect();
+    let payload = serde_json::json!({
+        "bad": bad,
+        "good": good,
+        "tool": "search",
+        "status": "ok",
+    });
+
+    let run_stage = |args: &[&str], input: &[u8]| -> Vec<u8> {
+        let output = tokenless_bin()
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(input)?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let compressed = run_stage(
+        &["compress-response", "--no-stash"],
+        payload.to_string().as_bytes(),
+    );
+    let toon = run_stage(&["compress-toon"], &compressed);
+    // The TOON candidate must actually be TOON (not a JSON fallback) for the
+    // pipeline under test.
+    let toon_text = String::from_utf8_lossy(&toon);
+    assert!(
+        toon_text.contains("more items truncated, not stashed"),
+        "plain marker present in the TOON output"
+    );
+    let decompressed = run_stage(&["decompress-toon"], &toon);
+    let decoded: serde_json::Value = serde_json::from_slice(&decompressed).unwrap();
+    assert_eq!(decoded["tool"], "search", "root key survives the pipeline");
+    assert_eq!(decoded["status"], "ok", "root key survives the pipeline");
+    assert_eq!(
+        decoded["bad"].as_array().map(Vec::len),
+        Some(41),
+        "32 head + marker + 8 tail preserved"
+    );
+    assert_eq!(decoded["good"].as_array().map(Vec::len), Some(5));
 }
 
 #[test]
@@ -840,6 +1059,174 @@ fn compress_toon_from_stdin() {
     let _ = output.status;
 }
 
+fn run_compress_toon(
+    fixture: &TempDataDir,
+    input: &str,
+    compression_enabled: &str,
+    session_id: &str,
+) -> std::process::Output {
+    fixture
+        .command()
+        .env("TOKENLESS_COMPRESSION_ENABLED", compression_enabled)
+        .env("TOKENLESS_STATS_ENABLED", "1")
+        .env("TOKENLESS_SLS_ENABLED", "0")
+        .args([
+            "compress-toon",
+            "--agent-id",
+            "integration-agent",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
+/// CJK payload where bytes/4 and the character estimator disagree. Dry-run
+/// stderr must publish the same predicted counts that `stats summary` stores.
+#[test]
+fn compress_toon_dry_run_predicted_tokens_match_recorded_stats_for_cjk() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let input = serde_json::to_string(&serde_json::json!({
+        "msg": "你好世界你好世界"
+    }))
+    .unwrap();
+    assert_ne!(
+        estimate_tokens(&input),
+        estimate_tokens_from_bytes(input.len()),
+        "fixture must be a CJK case where the two estimators disagree"
+    );
+
+    let output = run_compress_toon(&fixture, &input, "0", "cjk-toon-dry-run");
+    assert!(
+        output.status.success(),
+        "compress-toon dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        input,
+        "dry-run must emit the original JSON"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let recorder = StatsRecorder::new(fixture.data_dir.join("stats.db")).unwrap();
+    let records = recorder
+        .records_by_session("cjk-toon-dry-run", None)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let predicted = format!(
+        "predicted {} -> {} est. tokens",
+        records[0].before_tokens, records[0].after_tokens
+    );
+    assert!(
+        stderr.contains(&predicted),
+        "dry-run stderr must match recorded stats, got stderr={stderr:?} stats={}:{} predicted={predicted}",
+        records[0].before_tokens,
+        records[0].after_tokens
+    );
+    assert_eq!(records[0].before_tokens, estimate_tokens(&input));
+}
+
+/// ASCII JSON where both estimators agree still encodes to TOON when smaller.
+#[test]
+fn compress_toon_ascii_emits_toon_when_character_estimator_saves() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let input = r#"{"content":"some content","debug":"remove"}"#;
+    assert_eq!(
+        estimate_tokens(input),
+        estimate_tokens_from_bytes(input.len()),
+        "ascii fixture should keep the two estimators in agreement"
+    );
+
+    let output = run_compress_toon(&fixture, input, "1", "ascii-toon-active");
+    assert!(
+        output.status.success(),
+        "compress-toon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let emitted = stdout.trim_end();
+    assert_ne!(emitted, input, "active TOON with savings must replace JSON");
+    assert!(
+        emitted.contains("content:") || emitted.starts_with("content:"),
+        "expected TOON object encoding, got {emitted:?}"
+    );
+
+    let recorder = StatsRecorder::new(fixture.data_dir.join("stats.db")).unwrap();
+    let records = recorder
+        .records_by_session("ascii-toon-active", None)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].before_tokens, estimate_tokens(input));
+    assert_eq!(records[0].after_tokens, estimate_tokens(emitted));
+    assert!(records[0].after_tokens < records[0].before_tokens);
+}
+
+#[test]
+fn compress_toon_cjk_active_emits_toon_and_records_character_tokens() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let input = serde_json::to_string(&serde_json::json!({
+        "msg": "你好世界你好世界"
+    }))
+    .unwrap();
+    let output = run_compress_toon(&fixture, &input, "1", "cjk-toon-active");
+    assert!(
+        output.status.success(),
+        "compress-toon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let emitted = String::from_utf8(output.stdout).unwrap();
+    let emitted = emitted.trim_end();
+    assert_ne!(emitted, input);
+    assert!(
+        emitted.contains("msg:"),
+        "expected TOON encoding, got {emitted:?}"
+    );
+
+    let recorder = StatsRecorder::new(fixture.data_dir.join("stats.db")).unwrap();
+    let records = recorder
+        .records_by_session("cjk-toon-active", None)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].before_tokens, estimate_tokens(&input));
+    assert_eq!(records[0].after_tokens, estimate_tokens(emitted));
+}
+
+/// Parse failures keep the documented compress-command exit code 2 now
+/// that errors flow through the runtime mapping.
+#[test]
+fn compress_toon_invalid_json_exits_with_code_2() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let output = run_compress_toon(&fixture, "not json", "1", "toon-invalid-json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid JSON must exit 2, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JSON parse error"));
+}
+
 #[test]
 fn env_check_without_spec() {
     let output = tokenless_bin().args(["env-check"]).output().unwrap();
@@ -1071,4 +1458,190 @@ fn env_check_hard_bypass_json_is_stable_across_processes() {
             index + 1
         );
     }
+}
+
+#[test]
+fn stats_summary_compare_rejects_missing_sessions() {
+    let db = match TempStatsDb::new() {
+        Some(db) => db,
+        None => return,
+    };
+    let output = db
+        .command()
+        .args(["stats", "summary", "--compare", "missing-a", "missing-b"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No records found"));
+    assert!(stderr.contains("missing-a"));
+    assert!(stderr.contains("missing-b"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Tokenless Comparison Report"));
+    assert!(!stdout.contains("saved_percent"));
+}
+
+#[test]
+fn stats_summary_compare_json_rejects_one_missing_side() {
+    let db = match TempStatsDb::new() {
+        Some(db) => db,
+        None => return,
+    };
+    let output = db
+        .command()
+        .args([
+            "stats",
+            "summary",
+            "--json",
+            "--compare",
+            "missing-baseline",
+            "integration-session",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline session \"missing-baseline\""));
+    assert!(!stderr.contains("tokenless session"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("saved_percent"));
+}
+
+#[test]
+fn stats_summary_compare_reports_populated_sessions() {
+    let db = match TempStatsDb::new() {
+        Some(db) => db,
+        None => return,
+    };
+    let recorder = StatsRecorder::new(&db.path).unwrap();
+    recorder
+        .record(
+            &StatsRecord::new(
+                OperationType::CompressResponse,
+                "integration-agent".to_string(),
+                1600,
+                400,
+                800,
+                200,
+            )
+            .with_session_id("baseline-run")
+            .with_mode(CompressionMode::DryRun),
+        )
+        .unwrap();
+    recorder
+        .record(
+            &StatsRecord::new(
+                OperationType::CompressResponse,
+                "integration-agent".to_string(),
+                1600,
+                400,
+                800,
+                200,
+            )
+            .with_session_id("active-run")
+            .with_mode(CompressionMode::Active),
+        )
+        .unwrap();
+
+    let text = db
+        .command()
+        .args([
+            "stats",
+            "summary",
+            "--compare",
+            "baseline-run",
+            "active-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        text.status.success(),
+        "compare populated sessions; stderr: {}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("Tokenless Comparison Report"));
+    assert!(stdout.contains("TOTAL"));
+
+    let json = db
+        .command()
+        .args([
+            "stats",
+            "summary",
+            "--json",
+            "--compare",
+            "baseline-run",
+            "active-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(parsed["baseline_tokens"], 400);
+    assert_eq!(parsed["tokenless_tokens"], 200);
+    assert_eq!(parsed["saved_tokens"], 200);
+}
+
+#[test]
+fn stats_summary_compare_rejects_zero_limit() {
+    let db = match TempStatsDb::new() {
+        Some(db) => db,
+        None => return,
+    };
+    let recorder = StatsRecorder::new(&db.path).unwrap();
+    recorder
+        .record(
+            &StatsRecord::new(
+                OperationType::CompressResponse,
+                "integration-agent".to_string(),
+                1600,
+                400,
+                800,
+                200,
+            )
+            .with_session_id("baseline-run")
+            .with_mode(CompressionMode::DryRun),
+        )
+        .unwrap();
+    recorder
+        .record(
+            &StatsRecord::new(
+                OperationType::CompressResponse,
+                "integration-agent".to_string(),
+                1600,
+                400,
+                800,
+                200,
+            )
+            .with_session_id("active-run")
+            .with_mode(CompressionMode::Active),
+        )
+        .unwrap();
+
+    let output = db
+        .command()
+        .args([
+            "stats",
+            "summary",
+            "--limit",
+            "0",
+            "--compare",
+            "baseline-run",
+            "active-run",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("greater than zero"),
+        "zero limit must fail at parse time; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No records found"),
+        "populated sessions with --limit 0 must not look missing; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Tokenless Comparison Report"));
+    assert!(!stdout.contains("saved_percent"));
 }

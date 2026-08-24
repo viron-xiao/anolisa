@@ -129,6 +129,16 @@ To disable authentication (only recommended on trusted internal networks), set i
 }
 ```
 
+After editing `/etc/agentsight/config.json`, run `sudo systemctl reload agentsight.service` to apply the change — no `restart` needed.
+
+#### API Endpoint List
+
+`GET /api/docs` returns the full API route inventory (method, path, description) so scripts and integrations can discover endpoints; requests to unknown `/api/` paths also point to it in the 404 response.
+
+```bash
+curl http://127.0.0.1:7396/api/docs
+```
+
 ### agentsight dashboard — Show Dashboard Access Info
 
 Displays the Dashboard URL and auth token, then tries to open a browser. On ECS instances it also prints a security-group configuration guide.

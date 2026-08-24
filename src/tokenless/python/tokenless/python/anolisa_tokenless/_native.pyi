@@ -2,6 +2,29 @@ import os
 
 class TokenlessError(Exception): ...
 
+class _StatsQuery:
+    def __init__(self, data_dir: str | os.PathLike[str] | None = None) -> None: ...
+    def status_json(self) -> str: ...
+    def summary_json(self, limit: int | None = None) -> str: ...
+    def list_json(self, limit: int = 20) -> str: ...
+    def show_json(self, record_id: int) -> str | None: ...
+    def diff_json(
+        self,
+        *,
+        record_id: int | None = None,
+        session_id: str | None = None,
+        tool_use_id: str | None = None,
+        limit: int = 20,
+        sort: str = "saved",
+        context: int = 3,
+    ) -> str | None: ...
+    def compare_json(
+        self,
+        baseline_session_id: str,
+        tokenless_session_id: str,
+        limit: int | None = None,
+    ) -> str: ...
+
 class CompressionResult:
     @property
     def output(self) -> str: ...
@@ -45,6 +68,22 @@ class TokenlessRuntime:
         tool_use_id: str | None = None,
         stash_enabled: bool = True,
         require_reversible: bool = True,
+    ) -> CompressionResult: ...
+    def compress_schema(
+        self,
+        input: str,
+        *,
+        agent_id: str = "python",
+        session_id: str | None = None,
+        tool_use_id: str | None = None,
+    ) -> CompressionResult: ...
+    def compress_toon(
+        self,
+        input: str,
+        *,
+        agent_id: str = "python",
+        session_id: str | None = None,
+        tool_use_id: str | None = None,
     ) -> CompressionResult: ...
     def retrieve(self, hash_or_marker: str) -> str: ...
     @property

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.10.3
+
+### Features
+- Add semantic search to the sessions list. (#2733)
+- Add dsh plugin for DeepSeek Harness.
+- Group agents by type in discovery.
+- Add filtered_count to agent-health.
+- Add /api/docs route inventory.
+- Show LLM latency metrics in agent health cards. (#2586)
+
+### Fixes
+- Drop hardcoded minus on savings. (#2754)
+- Classify analyzer calls as internal. (#2755)
+- Return savings rates as fractions. (#2732)
+- Match tool args in loop detection. (#2719)
+- Probe companion components for dashboard capabilities. (#2696)
+- Scope graceful reap to worker agents.
+- Count no_port gateways as healthy in dashboard. (#2694)
+- Print deadloop hint on fresh install.
+- Reload config on SIGHUP.
+- Fill provider and session_id in audit events.
+- Demote decompress fallback to debug level.
+- Exclude sftp-server from agent discovery.
+- Correct copilot cmdline rule typo.
+
+## 0.10.2
+
+### Features
+- Enforce size limits on sqlite stores. (#2644)
+- Make dashboard UI bilingual (en/zh). (#2612)
+- Add raw packaging for immutable release artifacts. (#2550)
+- Add LLM latency metrics API. (#2578)
+
+### Fixes
+- Match latency agents case-insensitively. (#2590)
+- Address latency metrics CI follow-ups. (#2583)
+
 ## 0.10.1
 
 ### Features

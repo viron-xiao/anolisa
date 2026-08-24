@@ -127,6 +127,16 @@ Dashboard Token 认证默认开启：
 }
 ```
 
+修改 `/etc/agentsight/config.json` 后执行 `sudo systemctl reload agentsight.service` 即可生效，无需 `restart`。
+
+#### API 端点列表
+
+`GET /api/docs` 返回全部 API 路由清单（方法、路径、说明），供脚本集成与调试时发现端点；访问不存在的 `/api/` 路径时，404 响应也会提示该地址。
+
+```bash
+curl http://127.0.0.1:7396/api/docs
+```
+
 ### agentsight dashboard — 查看 Dashboard 访问信息
 
 显示 Dashboard 访问地址、认证 Token，并尝试打开浏览器。在 ECS 实例上还会输出安全组放行指引。

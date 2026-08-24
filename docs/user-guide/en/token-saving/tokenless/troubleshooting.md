@@ -120,6 +120,44 @@ Confirm that `TOKENLESS_STATS_ENABLED=0` is not set unexpectedly and that any
 custom database path remains under the real user home or selected data
 directory.
 
+## Schema compression produces no statistics
+
+How schema compression plugs in depends on the host:
+
+- **cosh and Cosh-NG** run it on the `BeforeModel` hook before every model call; the warnings in this section come from that hook.
+- **OpenCode** runs it per tool definition through its `tool.definition` plugin hook, not through `BeforeModel`. MCP tools do not pass through that hook, so an MCP-only tool set produces no records there, and the `BeforeModel` warnings below never apply.
+- **Qwen Code** ships a `BeforeModel` hook entry in the extension manifest, but current Qwen Code releases do not implement that hook event: the hook registry skips unknown event names, so only the other hook groups are registered and the schema hook never runs. Zero `compress-schema` records on Qwen Code are expected; this section cannot diagnose them.
+
+When there are no `compress-schema` records on a host that actually runs the hook, check the following in order:
+
+### 1. Confirm there is something to compress
+
+Statistics only record invocations that save tokens; a result that is not smaller than the original is not recorded. Built-in tool descriptions are usually short (below the 256-character function and 160-character parameter truncation thresholds, with no `title` or `examples` to remove), so compression yields no savings and zero records are expected. Verify directly with the current tool declarations — replace the sample array below with your real declarations (a valid JSON array; do not keep any placeholder text, angle brackets, or surrounding quotes):
+
+```bash
+echo '[{"name":"example_tool","description":"A deliberately long example tool description that exceeds the 256-character truncation threshold so schema compression has something to remove. A deliberately long example tool description that exceeds the 256-character truncation threshold so schema compression has something to remove."}]' | tokenless compress-schema --batch
+```
+
+If stderr shows `did not reduce size`, the current tool set has nothing to compress; tool sets with long descriptions (for example some MCP tools) record normally.
+
+### 2. Confirm the BeforeModel hook actually fires
+
+On cosh and Cosh-NG, when a BeforeModel event carries nothing schema compression can work on, the hook emits one of the following warnings (each at most once per session) and passes the request through unchanged:
+
+```text
+[tokenless] WARNING: BeforeModel payload is not a JSON object ...
+[tokenless] WARNING: BeforeModel payload carries no llm_request object ...
+[tokenless] WARNING: BeforeModel event carries no tool declarations ...
+```
+
+The first warning means the hook received a payload that is not a JSON object; the second means the payload carries no `llm_request` object; the third means the host fires BeforeModel but its event format carries no tool declarations (`llm_request.config.tools` or `llm_request.tools`) — check or upgrade the host's hook protocol version. With neither a warning nor any records, BeforeModel is not firing at all:
+
+- The extension or plugin is installed and enabled (`anolisa adapter status tokenless`).
+- Hooks are not disabled in the host configuration.
+- The host version supports the BeforeModel event.
+
+Then continue with the generic steps in [No statistics appear after enabling the adapter](#no-statistics-appear-after-enabling-the-adapter).
+
 ## Adapter enable fails
 
 Common causes:

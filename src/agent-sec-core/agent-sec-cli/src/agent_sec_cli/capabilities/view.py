@@ -6,6 +6,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Mapping
 
 CANONICAL_CAPABILITIES = (
@@ -31,6 +32,7 @@ _BOOLEAN_FALSE_VALUES = {"0", "false", "no", "off"}
 _HOOK_POLICY_ALIASES = {"debug": "observe", "deny": "block"}
 _HOOK_POLICIES = {"observe", "warn", "ask", "block"}
 _VALID_SCAN_MODES = {"fast", "standard", "strict"}
+_L2_MODEL_ENV = "PROMPT_SCANNER_L2_MODEL"
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class EnvSpec:
     aliases: Mapping[str, str] = field(default_factory=dict)
     value_kind: str = "string"
     max_value: float | None = None
+    require_positive: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,8 +97,24 @@ def _timeout(
     default: str,
     value_kind: str = "int",
     max_value: float | None = None,
+    require_positive: bool = False,
 ) -> EnvSpec:
-    return EnvSpec(name, default, value_kind=value_kind, max_value=max_value)
+    return EnvSpec(
+        name,
+        default,
+        value_kind=value_kind,
+        max_value=max_value,
+        require_positive=require_positive,
+    )
+
+
+def _observability_timeout() -> EnvSpec:
+    return _timeout(
+        "OBSERVABILITY_TIMEOUT",
+        "5",
+        max_value=5.0,
+        require_positive=True,
+    )
 
 
 def _mode(name: str, default: str, valid_values: set[str]) -> EnvSpec:
@@ -115,8 +134,46 @@ def _prompt_scan_mode() -> EnvSpec:
     return EnvSpec("PROMPT_SCANNER_SCAN_MODE", "standard", frozenset(_VALID_SCAN_MODES))
 
 
+def _l2_model() -> EnvSpec:
+    """Prompt scanner L2 backend override, shared by every integration.
+
+    No hook reads this variable itself: each one shells out to
+    ``agent-sec-cli scan-prompt``, which resolves it, so every host inherits
+    it. The default and the selectable backends come from the native engine at
+    resolution time, so this view never carries a second copy of the model
+    list.
+    """
+    return EnvSpec(_L2_MODEL_ENV, "", value_kind="identifier")
+
+
+@lru_cache(maxsize=1)
+def _engine_l2_backends() -> tuple[str, frozenset[str]]:
+    """Return the engine's default L2 backend and its selectable backends.
+
+    The native scanner owns both, so querying it keeps the view from
+    duplicating the model list. Falls back to ``("", frozenset())`` for any
+    import or payload problem: ``capabilities`` must stay usable before
+    ``maturin develop`` has built the extension, in which case the view
+    reports no default and cannot flag an unsupported backend.
+    """
+    try:
+        from agent_sec_cli import _native  # noqa: PLC0415 - optional at runtime
+
+        info = json.loads(_native.scanner_engine_info())
+        default = info["l2_model"]
+        models = info["l2_models"]
+        if not isinstance(default, str) or not isinstance(models, list):
+            return "", frozenset()
+        return default, frozenset(
+            item.lower() for item in models if isinstance(item, str)
+        )
+    except Exception:  # noqa: BLE001 - an unusable engine only degrades the view
+        return "", frozenset()
+
+
 _CODE_MODES_INTERACTIVE = {"observe", "ask", "block"}
 _CODE_MODES_BLOCK_ONLY = {"observe", "block"}
+_HERMES_NATIVE_MODES = {"observe", "block"}
 _PROMPT_MODES = {"observe", "deny"}
 
 _QODER_HOOKS = {
@@ -209,15 +266,14 @@ _OPENCLAW_HOOKS = {
 
 _HERMES_HOOKS = {
     "code-scan": ("pre_tool_call",),
-    "prompt-scan": ("pre_llm_call", "transform_llm_output", "on_session_end"),
+    "prompt-scan": ("pre_llm_call",),
     "pii-check": (
         "pre_llm_call",
         "pre_tool_call",
         "post_tool_call",
-        "transform_llm_output",
-        "on_session_end",
+        "post_llm_call",
     ),
-    "skill-ledger": ("pre_tool_call", "transform_llm_output"),
+    "skill-ledger": ("pre_tool_call",),
     "observability": (
         "pre_llm_call",
         "pre_api_request",
@@ -244,6 +300,7 @@ def _agent_specs(
     if include_prompt_mode:
         prompt_env.append(_plain_mode("PROMPT_SCANNER_MODE", "observe", _PROMPT_MODES))
     prompt_env.append(_prompt_scan_mode())
+    prompt_env.append(_l2_model())
     pii_env = [
         _hook_enabled("PII_CHECKER_HOOK_ENABLED"),
         _mode("PII_CHECKER_MODE", "observe", _HOOK_POLICIES),
@@ -265,7 +322,11 @@ def _agent_specs(
         "pii-check": CapabilitySpec(hooks["pii-check"], tuple(pii_env)),
         "skill-ledger": CapabilitySpec(hooks["skill-ledger"], tuple(skill_env), "ask"),
         "observability": CapabilitySpec(
-            hooks["observability"], (_hook_enabled("OBSERVABILITY_HOOK_ENABLED"),)
+            hooks["observability"],
+            (
+                _hook_enabled("OBSERVABILITY_HOOK_ENABLED"),
+                _observability_timeout(),
+            ),
         ),
     }
 
@@ -295,6 +356,20 @@ AGENT_SPECS: dict[str, dict[str, CapabilitySpec]] = {
         include_prompt_mode=False,
     ),
 }
+AGENT_SPECS["hermes"]["pii-check"] = CapabilitySpec(
+    _HERMES_HOOKS["pii-check"],
+    (
+        _hook_enabled("PII_CHECKER_HOOK_ENABLED"),
+        _mode("PII_CHECKER_MODE", "observe", _HERMES_NATIVE_MODES),
+    ),
+)
+AGENT_SPECS["hermes"]["skill-ledger"] = CapabilitySpec(
+    _HERMES_HOOKS["skill-ledger"],
+    (
+        _hook_enabled("SKILL_LEDGER_HOOK_ENABLED"),
+        _mode("SKILL_LEDGER_MODE", "observe", _HERMES_NATIVE_MODES),
+    ),
+)
 AGENT_SPECS["qoder"]["pii-check"] = CapabilitySpec(
     _QODER_HOOKS["pii-check"],
     (
@@ -344,30 +419,25 @@ AGENT_SPECS["cosh"]["prompt-scan"] = CapabilitySpec(
     (
         _hook_enabled("PROMPT_SCANNER_HOOK_ENABLED"),
         _prompt_scan_mode(),
+        _l2_model(),
     ),
     "ask",
 )
 
 STATIC_DEFAULT_TIMEOUTS = {
-    ("qoder", "observability"): "3",
     ("qwen", "skill-ledger"): "5",
-    ("qwen", "observability"): "3",
-    ("codex", "observability"): "3",
     ("cosh", "code-scan"): "10",
     ("cosh", "prompt-scan"): "10",
     ("cosh", "pii-check"): "10",
     ("cosh", "skill-ledger"): "5",
-    ("cosh", "observability"): "3",
     ("openclaw", "code-scan"): "10",
     ("openclaw", "prompt-scan"): "10",
     ("openclaw", "pii-check"): "10",
     ("openclaw", "skill-ledger"): "5",
-    ("openclaw", "observability"): "5",
     ("hermes", "code-scan"): "10",
     ("hermes", "prompt-scan"): "15",
     ("hermes", "pii-check"): "10",
     ("hermes", "skill-ledger"): "5",
-    ("hermes", "observability"): "5",
 }
 
 
@@ -501,10 +571,15 @@ def _resolve_env(
     diagnostics: list[str] = []
     for spec in specs:
         raw = env.get(spec.name)
+        default: Any = spec.default
         if spec.bool_style is not None:
             effective = _resolve_bool(spec, raw, diagnostics)
         elif spec.name.endswith("_TIMEOUT"):
             effective = _resolve_timeout(spec, raw, diagnostics)
+        elif spec.value_kind == "identifier":
+            engine_default, known = _engine_l2_backends()
+            default = engine_default or spec.default
+            effective = _resolve_identifier(spec, raw, default, known, diagnostics)
         elif raw is None:
             effective = spec.default
         else:
@@ -516,7 +591,7 @@ def _resolve_env(
         values[spec.name] = {
             "raw": raw,
             "effective": effective,
-            "default": spec.default,
+            "default": default,
         }
     return values, diagnostics, _enabled_from_values(values)
 
@@ -537,6 +612,38 @@ def _resolve_bool(spec: EnvSpec, raw: str | None, diagnostics: list[str]) -> boo
     return bool(spec.default)
 
 
+def _resolve_identifier(
+    spec: EnvSpec,
+    raw: str | None,
+    default: str,
+    known: frozenset[str],
+    diagnostics: list[str],
+) -> str:
+    """Resolve an opaque identifier such as an L2 model name.
+
+    Mirrors ``prompt_scanner.cli._resolve_l2_model``: a blank or
+    whitespace-only value means "not set" and falls back to the engine
+    default. Case is preserved because model names are case-sensitive registry
+    paths, and the value is escaped and length-capped because it is the one env
+    entry reported close to verbatim instead of as a normalized keyword.
+
+    An unsupported name is reported as configured rather than replaced by the
+    default: the engine rejects it at construction, so scans fail loudly and
+    the operator needs to see the value that caused it. ``known`` is empty when
+    the engine is unavailable, which skips the check instead of guessing.
+    """
+    if raw is None:
+        return default
+    text = raw.strip()
+    if not text:
+        return default
+    if known and text.lower() not in known:
+        diagnostics.append(
+            f"{spec.name} is not a supported L2 backend; prompt scans will fail"
+        )
+    return _safe_cli_value(text)
+
+
 def _resolve_timeout(spec: EnvSpec, raw: str | None, diagnostics: list[str]) -> str:
     if raw is None:
         return str(spec.default)
@@ -545,9 +652,14 @@ def _resolve_timeout(spec: EnvSpec, raw: str | None, diagnostics: list[str]) -> 
         if spec.value_kind == "int":
             value = int(text)
             if value <= 0:
+                if spec.require_positive:
+                    diagnostics.append(_fallback_diagnostic(spec))
+                    return str(spec.default)
                 diagnostics.append(
                     f"{spec.name} is nonpositive; the hook subprocess may fail open"
                 )
+            if spec.max_value is not None:
+                value = min(value, int(spec.max_value))
             return str(value)
         value = float(text)
     except (TypeError, ValueError):

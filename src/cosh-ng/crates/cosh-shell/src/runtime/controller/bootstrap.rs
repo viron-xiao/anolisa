@@ -16,7 +16,7 @@ use crate::runtime::prelude::*;
 use crate::runtime::startup::bootstrap_process_path_from_shell;
 use crate::runtime::state::{AnalysisMode, InlineState};
 
-use super::render_raw_inline_events;
+use super::render_raw_inline_event_view;
 
 fn build_adapter(kind: AdapterKind) -> AdapterInstance {
     match adapter_for_kind(kind) {
@@ -67,7 +67,10 @@ pub(crate) fn run_raw(
     shell_kind: RawShellKind,
     launch_options: LaunchOptions,
 ) -> i32 {
-    let args = std::env::args().collect::<Vec<_>>();
+    // args_os: argv[0] may be arbitrary bytes (the classifier admits any
+    // byte sequence whose basename is `cosh`), so String iteration would
+    // panic here.
+    let args = std::env::args_os().collect::<Vec<_>>();
 
     let Some(kind) = AdapterKind::parse(adapter_name) else {
         let adapter_name = crate::evidence::redact_sensitive_text(adapter_name).0;
@@ -87,6 +90,7 @@ pub(crate) fn run_raw(
             .unwrap_or_default()
     );
     let mut config = ShellHostConfig::new(session_id, work_dir);
+    config.bound_interactive_transcript();
 
     let isolated = args.iter().any(|a| a == "--isolated")
         || std::env::var("COSH_SHELL_ISOLATED").as_deref() == Ok("1");
@@ -98,8 +102,9 @@ pub(crate) fn run_raw(
             }
         }
     }
-    let login = args.first().is_some_and(|a| a.starts_with('-'))
-        || args.iter().any(|a| a == "--login" || a == "-l");
+    let login = args
+        .first()
+        .is_some_and(|argv0| crate::runtime::invocation::is_login_invocation(argv0, &args[1..]));
     config.login_shell = login;
     if config.native_mode {
         bootstrap_process_path_from_shell(&shell_kind, login);
@@ -237,15 +242,13 @@ pub(crate) fn run_raw(
 
     let raw_result = match shell_kind {
         RawShellKind::Bash => {
-            run_raw_interactive_bash_with_output_control(&config, |events, output| {
-                render_raw_inline_events(events, output, &adapter, "bash", &mut inline_state)
+            run_raw_interactive_bash_with_event_view(&config, |events, output| {
+                render_raw_inline_event_view(events, output, &adapter, "bash", &mut inline_state)
             })
         }
-        RawShellKind::Zsh => {
-            run_raw_interactive_zsh_with_output_control(&config, |events, output| {
-                render_raw_inline_events(events, output, &adapter, "zsh", &mut inline_state)
-            })
-        }
+        RawShellKind::Zsh => run_raw_interactive_zsh_with_event_view(&config, |events, output| {
+            render_raw_inline_event_view(events, output, &adapter, "zsh", &mut inline_state)
+        }),
         RawShellKind::MissingShellValue => {
             eprintln!("missing value for --shell; supported shells: bash, zsh");
             return 2;

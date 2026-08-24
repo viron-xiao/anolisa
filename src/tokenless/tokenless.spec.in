@@ -6,7 +6,8 @@ Version:        @VERSION@
 Release:        %{anolis_release}%{?dist}
 Summary:        LLM Token Optimization Toolkit - Schema/Response Compression + Command Rewriting + Tool Ready
 
-# Tokenless and RTK are Apache-2.0; the bundled toon-format binary is MIT.
+# Tokenless and RTK are Apache-2.0; the statically linked toon-format
+# library crate is MIT.
 License:        Apache-2.0 AND MIT
 URL:            https://github.com/alibaba/anolisa
 Source0:        %{name}-%{version}.tar.gz
@@ -16,12 +17,13 @@ Source0:        %{name}-%{version}.tar.gz
 # The 1.89 minimum is set because tokenless-cli uses str::floor_char_boundary
 # (stable since 1.89) via a hand-written compat fallback, and CI pins 1.89.0
 # to avoid local/CI version divergence. Vendored rtk source in tarball.
-# toon-format built via cargo install (requires network access to crates.io or mirror).
+# Workspace deps (including the toon-format library) come from crates.io, so
 # RPM build environments must configure a crates.io mirror (e.g. sparse+https://mirrors.aliyun.com/crates.io-index/).
 BuildRequires:  cargo
 BuildRequires:  rust >= 1.89
 # nodejs/npm are required to compile the OpenClaw TS plugin -> dist/index.js
-# via `make build-openclaw-plugin`. Provided by CI; declared here for chroot
+# via `make build-openclaw-plugin`. The native dsh bundle is plain ESM and is
+# validated by `make build-dsh-plugin`. Provided by CI; declared here for chroot
 # builds where they are not pre-installed.
 BuildRequires:  nodejs
 BuildRequires:  npm
@@ -46,11 +48,14 @@ Core Features:
 - Statistics Tracking: SQLite-based metrics for compression effectiveness
 
 The package includes:
-- tokenless: CLI tool for schema/response compression and toon integration
+- tokenless: CLI tool for schema/response compression and TOON encoding
+  (TOON is linked in via the crates.io toon-format library)
 - rtk: High-performance CLI proxy for command rewriting (vendored source, Apache-2.0, excluded from workspace)
-- toon: JSON to TOON format encoder/decoder (crates.io toon-format v0.5.0)
 
 Note: OpenClaw plugin is available under /usr/share/anolisa/adapters/tokenless/openclaw/.
+Native DeepSeek Harness (dsh) plugin bundle is available under
+/usr/share/anolisa/adapters/tokenless/dsh/. Register it with
+`anolisa adapter enable tokenless dsh --profile <profile>`.
 Copilot-shell extension is auto-discovered from /usr/share/anolisa/extensions/tokenless/.
 Hermes Agent plugin (response compression, TOON encoding, command rewriting via RTK,
 and Tool Ready) is available under /usr/share/anolisa/adapters/tokenless/hermes/.
@@ -80,21 +85,11 @@ cargo clean --release
 cargo build --release
 cargo build --release --manifest-path third_party/rtk/Cargo.toml
 
-# Build toon (standalone binary for Python hooks)
-# Note: toon-format's transitive deps (darling, image, time, plist, etc.)
-# have MSRV 1.88+, which exceeds the build environment's Rust 1.86.
-# Fall back to the system-provided toon binary when available.
-if test -x "%{_bindir}/toon"; then
-    echo "toon (system) already available, skipping cargo install"
-else
-    cargo install toon-format --version 0.5.0 --root %{_builddir}/toon-root --locked
-fi
-
 # Compile the OpenClaw TS plugin via the project Makefile.
 # Produces adapters/tokenless/openclaw/dist/index.js, which package.json
 # declares as both "main" and openclaw.extensions. Mirroring sec-core's
 # build-openclaw-plugin pattern — never hand-roll tsc/esbuild here.
-make build-openclaw-plugin
+make build-openclaw-plugin build-dsh-plugin
 
 %install
 rm -rf %{buildroot}
@@ -104,6 +99,7 @@ mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/common/hooks
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/common/commands
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/scripts
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/dist
+mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/dsh/dist
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/hermes/scripts
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qoder/.qoder-plugin
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qoder/scripts
@@ -123,19 +119,9 @@ mkdir -p %{buildroot}%{_docdir}/tokenless
 # Install binaries — tokenless (user-facing) to /usr/bin, helpers to /usr/libexec/anolisa/tokenless
 install -m 0755 target/release/tokenless %{buildroot}%{_bindir}/tokenless
 install -m 0755 third_party/rtk/target/release/rtk %{buildroot}%{_libexecdir}/anolisa/tokenless/rtk
-# Install toon — prefer cargo build output, fall back to system binary
-if [ -f %{_builddir}/toon-root/bin/toon ]; then
-    install -m 0755 %{_builddir}/toon-root/bin/toon %{buildroot}%{_libexecdir}/anolisa/tokenless/toon
-elif command -v toon &>/dev/null; then
-    cp "$(command -v toon)" %{buildroot}%{_libexecdir}/anolisa/tokenless/toon
-else
-    echo "ERROR: toon binary not found"
-    exit 1
-fi
 
-# Create symlinks so rtk and toon are discoverable via PATH
+# Create a symlink so rtk is discoverable via PATH
 ln -sf %{_libexecdir}/anolisa/tokenless/rtk %{buildroot}%{_bindir}/rtk
-ln -sf %{_libexecdir}/anolisa/tokenless/toon %{buildroot}%{_bindir}/toon
 
 # Install documentation. The bilingual user manual moved to the
 # repository-level docs/user-guide tree and is published with the ANOLISA
@@ -166,6 +152,12 @@ install -m 0755 adapters/tokenless/openclaw/scripts/uninstall.sh %{buildroot}%{_
 install -m 0644 adapters/tokenless/openclaw/dist/index.js %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/dist/
 install -m 0644 adapters/tokenless/openclaw/openclaw.plugin.json %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/
 install -m 0644 adapters/tokenless/openclaw/package.json %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/
+
+# Install the native dsh bundle. dsh owns profile mutation; this package only
+# ships the immutable package manifest, Cordis patch, and plugin entry.
+install -m 0644 adapters/tokenless/dsh/package.json %{buildroot}%{_datadir}/anolisa/adapters/tokenless/dsh/
+install -m 0644 adapters/tokenless/dsh/cordis.patch.yml %{buildroot}%{_datadir}/anolisa/adapters/tokenless/dsh/
+install -m 0644 adapters/tokenless/dsh/dist/index.js %{buildroot}%{_datadir}/anolisa/adapters/tokenless/dsh/dist/
 
 # Install Hermes Agent plugin (Python hooks + install scripts)
 install -m 0755 adapters/tokenless/hermes/__init__.py %{buildroot}%{_datadir}/anolisa/adapters/tokenless/hermes/
@@ -237,10 +229,8 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %defattr(0644,root,root,0755)
 %attr(0755,root,root) %{_bindir}/tokenless
 %attr(0755,root,root) %{_bindir}/rtk
-%attr(0755,root,root) %{_bindir}/toon
 %dir %attr(0755,root,root) %{_libexecdir}/anolisa/tokenless
 %attr(0755,root,root) %{_libexecdir}/anolisa/tokenless/rtk
-%attr(0755,root,root) %{_libexecdir}/anolisa/tokenless/toon
 %doc %{_docdir}/tokenless/LICENSE
 %doc %{_docdir}/tokenless/response-compression.md
 %dir %{_datadir}/anolisa
@@ -254,6 +244,8 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %dir %{_datadir}/anolisa/adapters/tokenless/openclaw
 %dir %{_datadir}/anolisa/adapters/tokenless/openclaw/scripts
 %dir %{_datadir}/anolisa/adapters/tokenless/openclaw/dist
+%dir %{_datadir}/anolisa/adapters/tokenless/dsh
+%dir %{_datadir}/anolisa/adapters/tokenless/dsh/dist
 %dir %{_datadir}/anolisa/adapters/tokenless/hermes
 %dir %{_datadir}/anolisa/adapters/tokenless/hermes/scripts
 %dir %{_datadir}/anolisa/adapters/tokenless/qoder
@@ -289,6 +281,9 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/openclaw/dist/index.js
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/openclaw/openclaw.plugin.json
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/openclaw/package.json
+%attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/dsh/package.json
+%attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/dsh/cordis.patch.yml
+%attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/dsh/dist/index.js
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/hermes/__init__.py
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/hermes/plugin.yaml
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/hermes/scripts/detect.sh
@@ -475,6 +470,42 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Sat Aug 22 2026 爱鲲 <jiawa.syx@alibaba-inc.com> - 0.7.12-1
+- feat(tokenless): preserve tail items during array truncation
+- fix(tokenless): surface skipped schema compression
+- fix(tokenless): persist stats without environment overrides
+- fix(tokenless): reject invalid stats comparisons
+- fix(tokenless): compress top-level request tool schemas
+- fix(tokenless): report missing L2 retention items
+- fix(tokenless): keep plain truncation markers TOON-safe
+
+* Thu Aug 20 2026 爱鲲 <jiawa.syx@alibaba-inc.com> - 0.7.11-1
+- fix(tokenless): align TOON CLI token scoring and exit codes
+
+* Wed Aug 19 2026 爱鲲 <jiawa.syx@alibaba-inc.com> - 0.7.10-1
+- feat(tokenless): compress Gemini tool schemas
+- feat(tokenless): expose Python stats queries
+- refactor(tokenless): remove the standalone toon binary
+- fix(tokenless): declare tqdm for AgentScope 1.x
+
+* Tue Aug 18 2026 爱鲲 <jiawa.syx@alibaba-inc.com> - 0.7.9-1
+- feat(tokenless): add the framework-neutral Python SDK
+- feat(tokenless): attach full SDK lifecycles to AgentScope
+- fix(tokenless): match the Cosh-NG shell tool in the RTK hook
+
+* Tue Aug 18 2026 林生 <linyan.lin@alibaba-inc.com> - 0.7.8-1
+- feat(tokenless): skip TOON encoding for payloads under 500 chars
+- fix(tokenless): drop conflicting bin entries from npm platform packages
+
+* Mon Aug 17 2026 爱鲲 <jiawa.syx@alibaba-inc.com> - 0.7.7-1
+- feat(tokenless): expose a source-built Python runtime wheel
+- feat(tokenless): add AgentScope 1.x and 2.x response compression
+- feat(tokenless): add a native DeepSeek Harness plugin
+- fix(tokenless): retry transient Claude Code detection failures
+- fix(tokenless): accept the disabled Tool Ready no-op in Cosh-NG
+- fix(tokenless): roll back discarded no-savings stash rows
+- fix(tokenless): declare the RPM component virtual provide
+
 * Thu Aug 13 2026 爱鲲 <jiawa.syx@alibaba-inc.com> - 0.7.6-1
 - feat(tokenless): add reproducible raw and prebuilt npm packaging
 - fix(tokenless): allow trusted external data directories without unsafe fallback

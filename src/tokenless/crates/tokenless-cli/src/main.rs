@@ -11,18 +11,18 @@ use std::sync::Arc;
 use tokenless_ccr::{SqliteStore, StashStore};
 use tokenless_runtime::{
     CompressOptions, CompressionDisposition, MAX_INPUT_BYTES, compress_response_with_store,
-    retrieve_from_store,
+    compress_toon, retrieve_from_store,
 };
 use tokenless_schema::SchemaCompressor;
 use tokenless_stats::{
     CompressionMode, DiffSort, OperationType, StatsRecord, StatsRecorder, TokenlessConfig,
+    estimate_tokens,
 };
 use tokenless_stats::{
     ensure_state_dir, format_compare, format_compare_json, format_diff_report, format_list,
     format_show, format_summary, record_report, resolve_data_dir, session_report, tool_use_report,
     validate_database_path,
 };
-use tokenless_stats::{estimate_tokens, estimate_tokens_from_bytes};
 
 #[derive(Parser)]
 #[command(
@@ -80,9 +80,13 @@ enum Commands {
         /// Max string length before truncation
         #[arg(long)]
         truncate_strings_at: Option<usize>,
-        /// Max array length before truncation
+        /// Array length that triggers truncation; the first n items are
+        /// kept plus a tail window (see --array-tail-preserve)
         #[arg(long)]
         truncate_arrays_at: Option<usize>,
+        /// Items preserved from the tail of truncated arrays (default: 8)
+        #[arg(long)]
+        array_tail_preserve: Option<usize>,
         /// Max nesting depth before truncation
         #[arg(long)]
         max_depth: Option<usize>,
@@ -181,7 +185,7 @@ impl From<DiffSortArg> for DiffSort {
 enum StatsCommands {
     /// Show summary statistics with breakdown by operation
     Summary {
-        #[arg(long)]
+        #[arg(long, value_parser = parse_positive_usize)]
         limit: Option<usize>,
         /// Output machine-readable JSON
         #[arg(long)]
@@ -580,6 +584,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             tool_use_id,
             truncate_strings_at,
             truncate_arrays_at,
+            array_tail_preserve,
             max_depth,
             no_stash,
             stash_db,
@@ -603,6 +608,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 &CompressOptions {
                     truncate_strings_at,
                     truncate_arrays_at,
+                    array_tail_preserve,
                     max_depth,
                     stash_enabled: !no_stash,
                     // Preserve the existing CLI contract: stash failure is
@@ -699,6 +705,14 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         let tokenless = recorder
                             .records_by_session(tokenless_sid, limit)
                             .map_err(|e| (format!("Failed to query tokenless: {}", e), 1))?;
+                        if let Some(message) = missing_compare_sessions(
+                            baseline_sid,
+                            tokenless_sid,
+                            &baseline,
+                            &tokenless,
+                        ) {
+                            return Err((message, 1));
+                        }
                         // Warn if a session's records do not match the expected mode,
                         // i.e. the baseline run was not recorded as dry-run.
                         warn_mode_mismatch("baseline", &baseline, CompressionMode::DryRun);
@@ -855,19 +869,11 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     println!("SLS recording:   {} (via {})", sls_state, sls_source);
                 }
                 StatsCommands::Enable => {
-                    let mut config = TokenlessConfig::load();
-                    config.stats_enabled = true;
-                    config
-                        .save()
-                        .map_err(|e| (format!("Failed to save config: {}", e), 1))?;
+                    persist_stats_enabled(true)?;
                     println!("Stats recording enabled.");
                 }
                 StatsCommands::Disable => {
-                    let mut config = TokenlessConfig::load();
-                    config.stats_enabled = false;
-                    config
-                        .save()
-                        .map_err(|e| (format!("Failed to save config: {}", e), 1))?;
+                    persist_stats_enabled(false)?;
                     println!("Stats recording disabled.");
                 }
             }
@@ -879,39 +885,43 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             tool_use_id,
         } => {
             let input = read_input(&file).map_err(|e| (e, 2))?;
-            let value: serde_json::Value = serde_json::from_str(&input)
-                .map_err(|e| (format!("JSON parse error: {}", e), 2))?;
-            let output = toon_format::encode_default(&value)
-                .map_err(|e| (format!("toon encode failed: {}", e), 2))?;
-            let output = output.trim_end().to_string();
-
-            // If no token savings, output original instead of TOON result
-            let before_tokens = estimate_tokens_from_bytes(input.len());
-            let after_tokens = estimate_tokens_from_bytes(output.len());
-            let no_savings = output.is_empty() || after_tokens >= before_tokens;
-            if no_savings {
+            let config = TokenlessConfig::load();
+            let compression_on = config.is_compression_enabled();
+            // Share runtime scoring so CLI dry-run predictions match
+            // `stats summary` and the Python/SDK compress_toon path. The
+            // previous bytes/4 heuristic under-counted CJK.
+            let result = compress_toon(&input, compression_on).map_err(|error| {
+                // JSON parse, oversized input, and TOON encode keep the
+                // documented compress-command exit code 2.
+                let code = if matches!(
+                    error,
+                    tokenless_runtime::RuntimeError::InvalidJson(_)
+                        | tokenless_runtime::RuntimeError::InputTooLarge { .. }
+                        | tokenless_runtime::RuntimeError::ToonEncode(_)
+                ) {
+                    2
+                } else {
+                    1
+                };
+                (error.to_string(), code)
+            })?;
+            if result.disposition == CompressionDisposition::NoSavings {
                 eprintln!(
                     "tokenless: TOON encoding did not reduce size ({} -> {} est. tokens), outputting original JSON",
-                    before_tokens, after_tokens
+                    result.before_tokens, result.after_tokens
                 );
             }
 
-            let config = TokenlessConfig::load();
-            let compression_on = config.is_compression_enabled();
-            let mode = resolve_mode(compression_on, before_tokens, after_tokens);
-            // Active: emit the TOON result (or original if no savings).
-            // Dry-run: emit the original so context stays uncompressed, but
-            // still record the TOON result as the predicted savings below.
-            let emit_text = if compression_on && !no_savings {
-                output.clone()
-            } else {
-                input.clone()
-            };
-            println!("{}", emit_text);
+            let mode = resolve_mode(compression_on, result.before_tokens, result.after_tokens);
+            println!("{}", result.output);
 
             // Recorded `after` = the predicted TOON result (or original when
             // TOON did not reduce size), so dry-run captures the prediction.
-            let record_after = if no_savings { input.clone() } else { output };
+            let record_after = if result.disposition == CompressionDisposition::NoSavings {
+                input.clone()
+            } else {
+                result.compressed_output
+            };
             let database_paths = DatabasePathResolver::default();
             record_compression_stats(
                 &config,
@@ -978,6 +988,27 @@ fn resolve_mode(
     }
 }
 
+/// Error text when a `--compare` side has no recorded stats.
+///
+/// An empty side used to format as a successful 0% report, which hid typos
+/// and made A/B scripts look like "no savings". Fail closed like
+/// `stats diff --session` and the Python `TokenlessStats.compare` client.
+fn missing_compare_sessions(
+    baseline_sid: &str,
+    tokenless_sid: &str,
+    baseline: &[StatsRecord],
+    tokenless: &[StatsRecord],
+) -> Option<String> {
+    let mut missing = Vec::new();
+    if baseline.is_empty() {
+        missing.push(format!("baseline session {baseline_sid:?}"));
+    }
+    if tokenless.is_empty() {
+        missing.push(format!("tokenless session {tokenless_sid:?}"));
+    }
+    (!missing.is_empty()).then(|| format!("No records found for {}", missing.join(" and ")))
+}
+
 /// Warn (to stderr) when a session's records were not recorded in the expected
 /// mode, e.g. a "baseline" session that was not run with compression disabled.
 /// A non-blocking sanity hint — comparison still proceeds.
@@ -994,6 +1025,30 @@ fn warn_mode_mismatch(label: &str, records: &[StatsRecord], expected: Compressio
             expected.as_str()
         );
     }
+}
+
+/// Persist only the stats recording toggle to `config.json`.
+///
+/// Starts from the on-disk file rather than [`TokenlessConfig::load`], so a
+/// session `TOKENLESS_COMPRESSION_ENABLED` / `TOKENLESS_SLS_ENABLED` override
+/// is not copied into durable config. Runtime `stats status` still uses
+/// [`TokenlessConfig::load`] and therefore still honors those env vars.
+fn persist_stats_enabled(enabled: bool) -> Result<(), (String, i32)> {
+    let config = stats_persist_snapshot(TokenlessConfig::load_from_file(), enabled);
+    config
+        .save()
+        .map_err(|e| (format!("Failed to save config: {}", e), 1))?;
+    Ok(())
+}
+
+/// Snapshot written by `stats enable` / `stats disable`.
+///
+/// `file_config` is the on-disk document with no process-env merge. Only
+/// `stats_enabled` changes; compression and SLS stay as stored.
+fn stats_persist_snapshot(file_config: TokenlessConfig, enabled: bool) -> TokenlessConfig {
+    let mut config = file_config;
+    config.stats_enabled = enabled;
+    config
 }
 
 /// Record compression stats — fail-silent so compression output

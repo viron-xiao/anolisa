@@ -47,7 +47,7 @@ _RTK_LOCAL_SHARE = _user_path(
 )
 _RTK_LOCAL_LIB = _user_path(".local", "lib", "anolisa", "tokenless", "rtk")
 
-_TOKENLESS_HELPER_BINARIES = frozenset({"rtk", "toon"})
+_TOKENLESS_HELPER_BINARIES = frozenset({"rtk"})
 
 
 def _known_binary_paths(name: str, home: str | None = None) -> tuple[str, ...]:
@@ -408,7 +408,13 @@ def unwrap_string_json(raw: str) -> str | None:
     if isinstance(inner, str):
         inner_obj = try_parse_json(inner)
         if inner_obj is not None and isinstance(inner_obj, (dict, list)):
-            return json.dumps(inner_obj, separators=(",", ":"))
+            # ensure_ascii=False: downstream size gates count Unicode
+            # characters (code points), not \uXXXX escape sequences, so
+            # string-wrapped payloads are measured the same way as the
+            # dict/list branch and the OpenClaw adapter.
+            return json.dumps(
+                inner_obj, separators=(",", ":"), ensure_ascii=False
+            )
         return None
     return raw
 

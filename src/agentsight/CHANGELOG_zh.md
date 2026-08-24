@@ -1,5 +1,57 @@
 # 更新日志
 
+## 0.10.3
+
+### 新功能
+- 会话列表新增语义搜索。(#2733)
+- 新增 DeepSeek Harness 的 dsh 插件。
+- Agent 发现按类型分组。
+- agent-health 新增 filtered_count。
+- 新增 /api/docs 路由清单。
+- Agent 健康卡片展示 LLM latency 指标。(#2586)
+
+### 修复
+- 移除 savings 上硬编码的负号。(#2754)
+- 将 analyzer 调用归类为 internal。(#2755)
+- savings 比率以分数形式返回。(#2732)
+- 循环检测中匹配 tool 参数。(#2719)
+- 探测伴随组件以提供 dashboard 能力。(#2696)
+- graceful reap 仅作用于 worker agent。
+- dashboard 中将 no_port gateway 计为健康。(#2694)
+- 全新安装时打印 deadloop 提示。
+- SIGHUP 时重新加载配置。
+- 审计事件补齐 provider 与 session_id。
+- 将 decompress fallback 降级为 debug 日志。
+- Agent 发现中排除 sftp-server。
+- 修正 copilot cmdline 规则拼写错误。
+
+## 0.10.2
+
+### 新功能
+- 对 sqlite 存储实施大小上限。(#2644)
+- Dashboard UI 支持中英双语。(#2612)
+- 新增 raw 打包，用于不可变发布产物。(#2550)
+- 新增 LLM latency 指标 API。(#2578)
+
+### 修复
+- latency agent 匹配不区分大小写。(#2590)
+- 处理 latency 指标 CI 后续问题。(#2583)
+
+## 0.10.1
+
+### 新功能
+- 初始化 dashboard i18n，按浏览器首选语言匹配。
+- 在 agent 发现规则中新增 agentscope 框架。
+- 精简组件接入文档并澄清服务启动方式。
+
+### 修复
+- 将 pause_turn 视为正常 SSE 结束。(#2320)
+- 在 SSE continuation delta 之间保持 tool_call 名称。
+- 在 observer namespace 中报告 pid。(#2360)
+- 校验 enforcer RPM payload、保留 RPM staging 目标，并抑制重复的 enforcer 错误。
+- 将 extractor 错误包装为 JSON envelope，并按变体分类 store 错误。(#2417, #2418)
+- 去重 unavailable 状态并优化 dashboard metadata 同步。
+
 ## 0.10.0
 
 ### 新功能
@@ -11,7 +63,6 @@
 
 ### 修复
 - tool-call stop 时保持 turn 打开，并将 user_message_count 加入 turn.id bucket key。
-- 将 pause_turn 视为正常 SSE 结束。(#2320)
 - 流式解码分片 zstd SSE 响应。
 - 提升 QwenCode trace 数据准确性，并在 agentsight config 中新增 QwenCode allow rules。
 - cosh 重启后保持 session。

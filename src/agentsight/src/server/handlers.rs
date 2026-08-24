@@ -69,24 +69,15 @@ pub async fn auth_login(
 
 /// GET /api/auth/status
 ///
-/// Returns whether authentication is enabled.  Exempt from auth middleware.
+/// Returns whether authentication is enabled plus the capability list the
+/// dashboard should render (probed from installed companion components).
+/// Exempt from auth middleware.
 #[get("/status")]
 pub async fn auth_status(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(json!({
         "auth_enabled": data.auth.enabled,
         "mode": "linux",
-        "capabilities": [
-            "agent_observability",
-            "sessions",
-            "token_savings",
-            "optimization",
-            "skills",
-            "security",
-            "enforcement",
-            "atif",
-            "settings",
-            "agent_health"
-        ],
+        "capabilities": super::capabilities::app_capabilities(),
     }))
 }
 
@@ -1659,6 +1650,17 @@ mod tests {
             serde_json::from_slice(&actix_web::body::to_bytes(resp.into_body()).await.unwrap())
                 .unwrap();
         assert_eq!(body["auth_enabled"], true);
+        // Intrinsic capabilities must always be advertised; component-backed
+        // ones (security/enforcement/token_savings) depend on the host.
+        let caps = body["capabilities"].as_array().unwrap();
+        for cap in [
+            "agent_observability",
+            "sessions",
+            "agent_health",
+            "settings",
+        ] {
+            assert!(caps.iter().any(|v| v == cap), "missing capability {cap}");
+        }
     }
 
     #[actix_web::test]
@@ -2299,6 +2301,10 @@ mod tests {
         let filtered_agents = filtered_body["agents"].as_array().unwrap();
         assert_eq!(filtered_agents.len(), 1);
         assert_eq!(filtered_agents[0]["pid"], 1001);
+        assert_eq!(
+            filtered_body["filtered_count"], 2,
+            "hidden Cosh + client entries must be surfaced as filtered_count"
+        );
 
         let include_clients = awtest::call_service(
             &app,
@@ -2310,6 +2316,7 @@ mod tests {
         let include_body = service_response_json(include_clients).await;
         let agents = include_body["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 2, "Cosh should still be excluded");
+        assert_eq!(include_body["filtered_count"], 1);
 
         let deleted = awtest::call_service(
             &app,
@@ -2807,6 +2814,10 @@ pub async fn metrics(data: web::Data<AppState>) -> impl Responder {
 pub struct AgentHealthResponse {
     pub agents: Vec<AgentHealthStatus>,
     pub last_scan_time: u64,
+    /// Entries hidden by the default view (Cosh + healthy client agents).
+    /// Non-zero tells callers the empty/short list is a filter result, not
+    /// missing data; pass `?include_clients=true` to see client agents.
+    pub filtered_count: usize,
 }
 
 /// GET /api/agent-health
@@ -2822,8 +2833,9 @@ pub async fn get_agent_health(
 ) -> impl Responder {
     let include_clients = req.query_string().contains("include_clients=true");
     let store = data.health_store.read().unwrap();
-    let agents = store
-        .all_agents()
+    let all = store.all_agents();
+    let total = all.len();
+    let agents: Vec<AgentHealthStatus> = all
         .into_iter()
         .filter(|a| a.agent_name != "Cosh")
         .filter(|a| {
@@ -2832,9 +2844,11 @@ pub async fn get_agent_health(
                 || a.status == crate::health::store::AgentHealthState::Offline
         })
         .collect();
+    let filtered_count = total - agents.len();
     HttpResponse::Ok().json(AgentHealthResponse {
         agents,
         last_scan_time: store.last_scan_time,
+        filtered_count,
     })
 }
 

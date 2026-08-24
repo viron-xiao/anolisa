@@ -4,7 +4,57 @@ All notable changes to the cosh-ng project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.17.0] — Unreleased
+## [Unreleased]
+
+## [0.19.0] — 2026-08-21
+
+### Added
+- Add a local gateway control plane with durable Task scheduling, runtime leases, and crash recovery, exposed through `cosh agent task ...` commands (#2603)
+- Add direct ACP entrypoints `cosh agent doctor` and `cosh agent run` to verify and drive locally installed ACP adapters from outside the interactive Shell, with a once-only permission flow that prompts only on the local controlling terminal and records redacted evidence (#2603)
+
+### Fixed
+- Detect `system()` calls in awk programs even when whitespace or line continuations appear before the opening parenthesis (#2655)
+- Map missing precmd status markers to -1 instead of fabricating exit 0, preserving ledger integrity for interrupted or forged markers (#2709)
+
+## [0.18.0] — 2026-08-20
+
+### Added
+- Cap in-memory transcript growth in long-running interactive sessions by keeping bounded working windows while spooling full terminal output to session files (#2682)
+- Enable MCP tools that require long-running task augmentation, returning actionable errors when tasks fail or time out (#2645)
+
+### Changed
+- **BREAKING**: `/usr/bin/cosh` now forwards non-TUI invocations directly to the configured shell; `cosh --version`, `cosh --help`, and `cosh <script>` outside an interactive terminal behave like the shell rather than opening the cosh TUI (#2625)
+
+### Fixed
+- In trust approval mode under the cosh-core driver, hook-blocked shell commands can no longer execute through the staging grace window (#2125)
+- Approval decisions are now resolved correctly when an external component has already logged the initial request (#2402)
+- Approving a hook-rewritten shell command no longer fails with "could not route this approval" when another request in the same batch was refused (#2667)
+- Audit logs now include a paired cancellation resolution when a pending turn extension is superseded, instead of leaving an orphaned request entry (#2695)
+
+## [0.17.2] — 2026-08-19
+
+### Fixed
+- Cap `run_command` output at 32 MB to prevent out-of-memory kills from runaway commands such as `dd if=/dev/zero` or `yes`; when stdout or stderr exceeds the limit, the process group is killed and an `OutputTooLarge` error is returned instead of growing unbounded (#2405)
+- Make RPM `%post` /etc/shells registration idempotent by normalizing content and probing before appending, and add a `%preun` scriptlet that fails closed when users still reference `/usr/bin/cosh` as their login shell, preventing dangling shells after `rpm -e cosh-ng` (#2599)
+
+## [0.17.1] — 2026-08-18
+
+### Fixed
+- Reduce interactive echo latency from p50 20 ms to sub-millisecond and eliminate high-frequency idle CPU polling in long-running sessions by making the raw relay and SIGINT paths event-driven (#2622)
+- Keep allowed commands executing when best-effort audit storage writes fail (#2631)
+- Allow approved pipelines whose single-quoted arguments contain quoted newlines, such as multi-line jq or awk scripts (#2638)
+
+## [0.17.0] — 2026-08-17
+
+### Added
+- Interactive disambiguation panel for `/hooks enable|disable <id>` when the hook id exists in both shell and agent layers, letting users choose to toggle the shell hook, the agent hook, or both (#2400)
+
+### Changed
+- Skip redundant history processing during idle polling so long-running interactive sessions no longer repeat history-sized work while idle (#2546)
+
+### Fixed
+- Reject hook output with an explicit `"decision": null` as invalid hook output: the tool call is blocked by default, or passes through with a recorded `hook_failure` notice when the hook sets `fail_open = true`; emitting `{}` remains valid pass-through (#2529)
+- Report `cosh pkg install/remove --dry-run` success on dnf-based systems instead of returning a backend error for installable or removable packages (#2605)
 
 ## [0.16.1] — 2026-08-14
 

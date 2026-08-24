@@ -93,10 +93,10 @@ pub fn handle(args: ForgetArgs, ctx: &CliContext) -> Result<(), CliError> {
     // silently orphaning a registered plugin is worse than refusing. This guard
     // is a fast-fail and the dry-run preview; `persist_forget` re-checks
     // authoritatively under the lock. Mirrors `uninstall`, pointing at
-    // `adapter disable`.
-    if !ctx.dry_run {
-        ensure_no_adapter_claims(&store, target, &command)?;
-    }
+    // `adapter disable`. Dry-run must refuse here too — the pending-journal
+    // check above already previews execute refusals, and a success preview
+    // would tell the operator to proceed when the real forget cannot.
+    ensure_no_adapter_claims(&store, target, &command)?;
 
     if ctx.dry_run {
         let payload = ForgetPayload {
@@ -395,6 +395,14 @@ mod tests {
     use crate::context::InstallMode;
 
     fn ctx(prefix: PathBuf, install_mode: InstallMode, dry_run: bool) -> CliContext {
+        // Identity resolution consults the component index for names absent
+        // from state; a seeded local index keeps fixture names supported.
+        if install_mode == InstallMode::System {
+            crate::commands::tier1::install::tests::seed_repo_config_with_index(
+                &anolisa_platform::fs_layout::FsLayout::system(Some(prefix.clone())),
+                crate::commands::tier1::install::tests::TEST_INDEX_COMPONENTS,
+            );
+        }
         crate::test_support::context_for_root(
             &prefix,
             install_mode,
@@ -659,9 +667,29 @@ mod tests {
         );
     }
 
-    /// Forgetting an absent component routes to NOT_INSTALLED (exit 2).
+    /// Forgetting an absent but index-supported component routes to
+    /// NOT_INSTALLED (exit 2).
     #[test]
-    fn forget_unknown_component_routes_to_not_installed() {
+    fn forget_absent_supported_component_routes_to_not_installed() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let c = ctx(tmp.path().to_path_buf(), InstallMode::System, false);
+        let err = handle(
+            ForgetArgs {
+                component: "agentsight".to_string(),
+            },
+            &c,
+        )
+        .expect_err("absent component must error");
+        assert_eq!(err.code(), "NOT_INSTALLED");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.reason().contains("not installed"));
+    }
+
+    /// A name neither state nor the component index knows is rejected as an
+    /// unsupported component, not reported as merely not installed
+    /// (issue #2630).
+    #[test]
+    fn forget_unsupported_component_is_rejected() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let c = ctx(tmp.path().to_path_buf(), InstallMode::System, false);
         let err = handle(
@@ -670,10 +698,13 @@ mod tests {
             },
             &c,
         )
-        .expect_err("absent component must error");
-        assert_eq!(err.code(), "NOT_INSTALLED");
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.reason().contains("not installed"));
+        .expect_err("unsupported component must error");
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(
+            err.reason().contains("unsupported component 'ghost'"),
+            "got: {}",
+            err.reason()
+        );
     }
 
     /// A component with an adapter receipt is refused until the adapter is
@@ -709,6 +740,89 @@ mod tests {
             load_store(&c)
                 .find(ObjectKind::Component, "copilot-shell")
                 .is_some(),
+        );
+    }
+
+    /// Dry-run must preview the same adapter-claim refusal as a real run.
+    /// A success preview would tell the operator the drop is clear, then the
+    /// real forget would fail and leave adapters still claiming the record.
+    #[test]
+    fn forget_dry_run_refuses_with_enabled_adapter_claim() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let c = ctx(tmp.path().to_path_buf(), InstallMode::System, true);
+        seed(
+            &c,
+            vec![rpm_observed_object(
+                "copilot-shell",
+                "copilot-shell",
+                "2.2.0-1.al8",
+            )],
+            vec![sample_claim("copilot-shell", "openclaw")],
+        );
+        let snapshot_dir = seed_manifest_snapshot(&c, "copilot-shell");
+        let err = handle(
+            ForgetArgs {
+                component: "copilot-shell".to_string(),
+            },
+            &c,
+        )
+        .expect_err("dry-run must preview the same adapter refusal as execute");
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.reason().contains("adapter disable"),
+            "reason must point at adapter disable: {}",
+            err.reason()
+        );
+        assert!(
+            err.reason().contains("openclaw"),
+            "reason must name the blocking framework: {}",
+            err.reason()
+        );
+        assert!(
+            load_store(&c)
+                .find(ObjectKind::Component, "copilot-shell")
+                .is_some(),
+            "dry-run refusal must leave the state record",
+        );
+        assert!(
+            snapshot_dir.exists(),
+            "dry-run refusal must leave the manifest snapshot",
+        );
+    }
+
+    /// A receipt on a different component must not block this forget, including
+    /// on dry-run. The preview still succeeds and still leaves this record.
+    #[test]
+    fn forget_dry_run_ignores_unrelated_adapter_claim() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let c = ctx(tmp.path().to_path_buf(), InstallMode::System, true);
+        seed(
+            &c,
+            vec![
+                rpm_observed_object("copilot-shell", "copilot-shell", "2.2.0-1.al8"),
+                rpm_observed_object("tokenless", "tokenless", "1.0.0-1.al8"),
+            ],
+            vec![sample_claim("tokenless", "openclaw")],
+        );
+        handle(
+            ForgetArgs {
+                component: "copilot-shell".to_string(),
+            },
+            &c,
+        )
+        .expect("unrelated adapter receipt must not block this dry-run");
+        assert!(
+            load_store(&c)
+                .find(ObjectKind::Component, "copilot-shell")
+                .is_some(),
+            "dry-run must not drop the targeted record",
+        );
+        assert!(
+            load_store(&c)
+                .find(ObjectKind::Component, "tokenless")
+                .is_some(),
+            "dry-run must not touch the unrelated record",
         );
     }
 

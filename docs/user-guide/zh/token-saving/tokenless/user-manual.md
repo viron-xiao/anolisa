@@ -17,7 +17,7 @@ cargo build --release --locked -p tokenless-cli
 ./target/release/tokenless --version
 ```
 
-这条路径只生成独立的 `tokenless` CLI，不会安装 `rtk`、`toon` 或 Agent 接入资源。需要在 Agent 中使用完整能力时，请按照[快速开始](QUICKSTART.md)通过 anolisa CLI 安装。
+这条路径只生成独立的 `tokenless` CLI，不会安装 `rtk` 或 Agent 接入资源。需要在 Agent 中使用完整能力时，请按照[快速开始](QUICKSTART.md)通过 anolisa CLI 安装。
 
 ## 从源码构建 Python Runtime
 
@@ -69,7 +69,7 @@ Python API 默认采用可逆 fail-open 策略：请求使用 Stash，但数据�
 
 | 能力 | 当前代码实际执行的行为 | 重要边界 |
 |------|------------------------|----------|
-| Schema 压缩 | 移除 `title` 和 `examples`，删除描述中的围栏代码和行内代码，合并空白并截断描述 | 只有 cosh 和 Qwen Code 注册了 Schema Hook；其他场景可直接调用 CLI |
+| Schema 压缩 | 移除 `title` 和 `examples`，删除描述中的围栏代码和行内代码，合并空白并截断描述 | 通过 cosh/Cosh-NG 的 `BeforeModel` Hook 和 OpenCode 的逐工具定义 Hook 运行（Qwen Code 清单中的条目会被当前宿主跳过）；其他场景可直接调用 CLI |
 | 响应压缩 | 移除名称完全匹配且区分大小写的调试字段、`null`、空字符串/数组/对象，并按配置阈值截断 | 输入必须是 JSON；Adapter 会主动跳过内容读取类工具 |
 | TOON 编码 | 编码 JSON；估算 Token 没有下降时保留 JSON 输入 | TOON 是替换原文还是与原文并存，取决于 Adapter |
 | 命令重写 | 有匹配规则时调用 `rtk rewrite`，再向框架提交改写后的 Shell 输入 | 真正提交给 Shell 的命令会变化；无规则或被拒绝时透传 |
@@ -88,7 +88,7 @@ Python API 默认采用可逆 fail-open 策略：请求使用 Stash，但数据�
 模型调用前：Schema 压缩
 ```
 
-这是能力示意，不是所有框架都会完整执行的固定流水线。例如 OpenClaw 默认关闭 TOON，Codex 追加压缩上下文而不替换原始工具结果，只有 cosh 和 Qwen Code 注册 Schema 压缩。具体见[框架集成](framework-integration.md)。
+这是能力示意，不是所有框架都会完整执行的固定流水线。例如 OpenClaw 默认关闭 TOON，Codex 追加压缩上下文而不替换原始工具结果，Schema 压缩只在 cosh/Cosh-NG（`BeforeModel` Hook）和 OpenCode（逐工具定义）上运行。具体见[框架集成](framework-integration.md)。
 
 ## 需要特别理解的行为
 
@@ -168,6 +168,7 @@ Stash 并不能让所有压缩都可逆。被移除的 `debug`/`trace` 字段、
 | 查看节省或内容变化、做双跑对比 | [效果度量](measuring-savings.md) |
 | 修改配置或了解本地数据 | [配置与数据隐私](configuration-and-privacy.md) |
 | 解决无统计、Adapter 或 Stash 问题 | [故障排查](troubleshooting.md) |
+| 排查 Schema 压缩没有记录 | [故障排查 · Schema 压缩没有统计记录](troubleshooting.md#schema-压缩没有统计记录) |
 | 升级或卸载 | [故障排查 · 升级与卸载](troubleshooting.md#升级与卸载) |
 
 ## 推荐的上线顺序

@@ -63,6 +63,70 @@ impl TempDbGuard {
     }
 }
 
+struct PersistConfigGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    prev_stats: Option<std::ffi::OsString>,
+    prev_sls: Option<std::ffi::OsString>,
+    prev_compression: Option<std::ffi::OsString>,
+}
+
+impl PersistConfigGuard {
+    fn with_file_and_env(
+        file_json: &str,
+        stats_env: &str,
+        sls_env: &str,
+        compression_env: &str,
+    ) -> Self {
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, file_json).unwrap();
+        TokenlessConfig::override_config_path_for_tests(Some(path.clone()));
+        let prev_stats = std::env::var_os("TOKENLESS_STATS_ENABLED");
+        let prev_sls = std::env::var_os("TOKENLESS_SLS_ENABLED");
+        let prev_compression = std::env::var_os("TOKENLESS_COMPRESSION_ENABLED");
+        unsafe {
+            std::env::set_var("TOKENLESS_STATS_ENABLED", stats_env);
+            std::env::set_var("TOKENLESS_SLS_ENABLED", sls_env);
+            std::env::set_var("TOKENLESS_COMPRESSION_ENABLED", compression_env);
+        }
+        Self {
+            _lock: lock,
+            _dir: dir,
+            path,
+            prev_stats,
+            prev_sls,
+            prev_compression,
+        }
+    }
+
+    fn read_persisted(&self) -> TokenlessConfig {
+        serde_json::from_str(&std::fs::read_to_string(&self.path).unwrap()).unwrap()
+    }
+}
+
+impl Drop for PersistConfigGuard {
+    fn drop(&mut self) {
+        TokenlessConfig::override_config_path_for_tests(None);
+        unsafe {
+            match &self.prev_stats {
+                Some(v) => std::env::set_var("TOKENLESS_STATS_ENABLED", v),
+                None => std::env::remove_var("TOKENLESS_STATS_ENABLED"),
+            }
+            match &self.prev_sls {
+                Some(v) => std::env::set_var("TOKENLESS_SLS_ENABLED", v),
+                None => std::env::remove_var("TOKENLESS_SLS_ENABLED"),
+            }
+            match &self.prev_compression {
+                Some(v) => std::env::set_var("TOKENLESS_COMPRESSION_ENABLED", v),
+                None => std::env::remove_var("TOKENLESS_COMPRESSION_ENABLED"),
+            }
+        }
+    }
+}
+
 impl Drop for TempDbGuard {
     fn drop(&mut self) {
         unsafe {
@@ -593,6 +657,7 @@ fn run_command_compress_response_from_file() {
         tool_use_id: Some("tool-1".to_string()),
         truncate_strings_at: Some(100),
         truncate_arrays_at: Some(5),
+        array_tail_preserve: None,
         max_depth: Some(10),
         no_stash: true,
         stash_db: None,
@@ -614,6 +679,7 @@ fn run_command_compress_response_no_stash() {
         tool_use_id: None,
         truncate_strings_at: None,
         truncate_arrays_at: None,
+        array_tail_preserve: None,
         max_depth: None,
         no_stash: true,
         stash_db: None,
@@ -634,6 +700,7 @@ fn run_command_compress_response_with_stash() {
         tool_use_id: None,
         truncate_strings_at: None,
         truncate_arrays_at: None,
+        array_tail_preserve: None,
         max_depth: None,
         no_stash: false,
         stash_db: None,
@@ -921,6 +988,38 @@ fn stats_diff_cli_validates_scope_and_limit() {
 }
 
 #[test]
+fn stats_summary_cli_rejects_zero_limit() {
+    let zero = match Cli::try_parse_from(["tokenless", "stats", "summary", "--limit", "0"]) {
+        Err(error) => error,
+        Ok(_) => panic!("summary --limit 0 must fail at parse time"),
+    };
+    assert!(zero.to_string().contains("greater than zero"));
+
+    let compare_zero = match Cli::try_parse_from([
+        "tokenless",
+        "stats",
+        "summary",
+        "--limit",
+        "0",
+        "--compare",
+        "baseline-run",
+        "active-run",
+    ]) {
+        Err(error) => error,
+        Ok(_) => panic!("compare --limit 0 must fail at parse time"),
+    };
+    assert!(compare_zero.to_string().contains("greater than zero"));
+
+    let parsed = Cli::try_parse_from(["tokenless", "stats", "summary", "--limit", "1"]).unwrap();
+    match parsed.command {
+        Commands::Stats(StatsCommands::Summary { limit, .. }) => {
+            assert_eq!(limit, Some(1));
+        }
+        _ => panic!("expected stats summary"),
+    }
+}
+
+#[test]
 fn run_command_compress_response_large_with_truncation() {
     let _guard = TempDbGuard::new();
 
@@ -936,6 +1035,7 @@ fn run_command_compress_response_large_with_truncation() {
         tool_use_id: Some("tool-trunc".to_string()),
         truncate_strings_at: Some(50),
         truncate_arrays_at: Some(3),
+        array_tail_preserve: None,
         max_depth: Some(5),
         no_stash: true,
         stash_db: None,
@@ -1073,25 +1173,234 @@ fn run_command_stats_status() {
 }
 
 #[test]
+fn stats_persist_snapshot_enable_keeps_file_compression_and_sls() {
+    // A/B dry-run sets TOKENLESS_COMPRESSION_ENABLED=0 in the process, but
+    // `stats enable` must write the on-disk compression/SLS values, not the
+    // session overrides.
+    let file = TokenlessConfig {
+        stats_enabled: false,
+        sls_enabled: true,
+        compression_enabled: true,
+    };
+    let persisted = stats_persist_snapshot(file, true);
+    assert!(persisted.stats_enabled);
+    assert!(persisted.sls_enabled);
+    assert!(persisted.compression_enabled);
+}
+
+#[test]
+fn stats_persist_snapshot_disable_keeps_file_compression_and_sls() {
+    let file = TokenlessConfig {
+        stats_enabled: true,
+        sls_enabled: false,
+        compression_enabled: false,
+    };
+    let persisted = stats_persist_snapshot(file, false);
+    assert!(!persisted.stats_enabled);
+    assert!(!persisted.sls_enabled);
+    assert!(!persisted.compression_enabled);
+}
+
+#[test]
+fn run_command_stats_enable_does_not_persist_env_overrides() {
+    // Drive the production Enable arm (load_from_file + save). Replacing
+    // load_from_file() with load() would write the session env values.
+    let guard = PersistConfigGuard::with_file_and_env(
+        "{\"stats_enabled\":false,\"sls_enabled\":true,\"compression_enabled\":true}",
+        "0",
+        "0",
+        "0",
+    );
+    run_command(Commands::Stats(StatsCommands::Enable)).unwrap();
+    let persisted = guard.read_persisted();
+    assert!(persisted.stats_enabled);
+    assert!(persisted.sls_enabled);
+    assert!(persisted.compression_enabled);
+}
+
+#[test]
+fn run_command_stats_disable_does_not_persist_env_overrides() {
+    let guard = PersistConfigGuard::with_file_and_env(
+        "{\"stats_enabled\":true,\"sls_enabled\":false,\"compression_enabled\":false}",
+        "1",
+        "1",
+        "1",
+    );
+    run_command(Commands::Stats(StatsCommands::Disable)).unwrap();
+    let persisted = guard.read_persisted();
+    assert!(!persisted.stats_enabled);
+    assert!(!persisted.sls_enabled);
+    assert!(!persisted.compression_enabled);
+}
+
+#[test]
+fn missing_compare_sessions_reports_each_empty_side() {
+    let record = StatsRecord::new(
+        OperationType::CompressSchema,
+        "cli".to_string(),
+        100,
+        40,
+        50,
+        20,
+    );
+    assert!(
+        missing_compare_sessions(
+            "b",
+            "t",
+            std::slice::from_ref(&record),
+            std::slice::from_ref(&record)
+        )
+        .is_none()
+    );
+
+    let both = missing_compare_sessions("b", "t", &[], &[]).unwrap();
+    assert!(both.starts_with("No records found for "));
+    assert!(both.contains("baseline session \"b\""));
+    assert!(both.contains("tokenless session \"t\""));
+    assert!(both.contains(" and "));
+
+    let baseline_only =
+        missing_compare_sessions("b", "t", &[], std::slice::from_ref(&record)).unwrap();
+    assert!(baseline_only.contains("baseline session \"b\""));
+    assert!(!baseline_only.contains("tokenless session"));
+
+    let tokenless_only = missing_compare_sessions("b", "t", &[record], &[]).unwrap();
+    assert!(tokenless_only.contains("tokenless session \"t\""));
+    assert!(!tokenless_only.contains("baseline session"));
+}
+
+#[test]
+fn missing_compare_sessions_debug_escapes_control_chars() {
+    let message = missing_compare_sessions(
+        "base\u{1b}]0;INJECTED\u{7}",
+        "tls\u{1b}]52;c;INJECTED\u{7}",
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(!message.contains('\u{1b}'));
+    assert!(!message.contains('\u{7}'));
+    assert!(message.contains("INJECTED"));
+}
+
+fn seed_compare_record(session_id: &str, mode: CompressionMode, before: usize, after: usize) {
+    let recorder = open_recorder().expect("open recorder");
+    recorder
+        .record(
+            &StatsRecord::new(
+                OperationType::CompressResponse,
+                "cli".to_string(),
+                before * 4,
+                before,
+                after * 4,
+                after,
+            )
+            .with_session_id(session_id)
+            .with_mode(mode),
+        )
+        .expect("seed compare record");
+}
+
+#[test]
 fn run_command_stats_compare() {
-    let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
+    let _guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
     let result = run_command(Commands::Stats(StatsCommands::Summary {
         limit: None,
         json: false,
-        compare: Some(vec!["baseline-sess".to_string(), "tokenless-sess".to_string()]),
+        compare: Some(vec![
+            "baseline-sess".to_string(),
+            "tokenless-sess".to_string(),
+        ]),
     }));
-    assert!(result.is_ok());
+    let err = result.expect_err("empty compare sessions must fail closed");
+    assert_eq!(err.1, 1);
+    assert!(err.0.contains("No records found"));
+    assert!(err.0.contains("baseline session \"baseline-sess\""));
+    assert!(err.0.contains("tokenless session \"tokenless-sess\""));
 }
 
 #[test]
 fn run_command_stats_compare_json() {
-    let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
+    let _guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
     let result = run_command(Commands::Stats(StatsCommands::Summary {
         limit: None,
         json: true,
-        compare: Some(vec!["baseline-sess".to_string(), "tokenless-sess".to_string()]),
+        compare: Some(vec![
+            "baseline-sess".to_string(),
+            "tokenless-sess".to_string(),
+        ]),
+    }));
+    let err = result.expect_err("empty JSON compare must not emit a 0% report");
+    assert_eq!(err.1, 1);
+    assert!(err.0.contains("No records found"));
+}
+
+#[test]
+fn run_command_stats_compare_one_side_missing() {
+    let _guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
+    seed_compare_record("tokenless-sess", CompressionMode::Active, 400, 200);
+    let baseline_missing = run_command(Commands::Stats(StatsCommands::Summary {
+        limit: None,
+        json: false,
+        compare: Some(vec![
+            "baseline-sess".to_string(),
+            "tokenless-sess".to_string(),
+        ]),
+    }))
+    .expect_err("missing baseline must fail");
+    assert!(baseline_missing.0.contains("baseline session \"baseline-sess\""));
+    assert!(!baseline_missing.0.contains("tokenless session"));
+
+    seed_compare_record("baseline-sess", CompressionMode::DryRun, 400, 200);
+    let tokenless_missing = run_command(Commands::Stats(StatsCommands::Summary {
+        limit: None,
+        json: true,
+        compare: Some(vec![
+            "baseline-sess".to_string(),
+            "absent-tokenless".to_string(),
+        ]),
+    }))
+    .expect_err("missing tokenless side must fail");
+    assert!(tokenless_missing.0.contains("tokenless session \"absent-tokenless\""));
+    assert!(!tokenless_missing.0.contains("baseline session"));
+}
+
+#[test]
+fn run_command_stats_compare_populated_sessions() {
+    let _guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
+    seed_compare_record("baseline-sess", CompressionMode::DryRun, 400, 200);
+    seed_compare_record("tokenless-sess", CompressionMode::Active, 400, 200);
+    let result = run_command(Commands::Stats(StatsCommands::Summary {
+        limit: None,
+        json: false,
+        compare: Some(vec![
+            "baseline-sess".to_string(),
+            "tokenless-sess".to_string(),
+        ]),
     }));
     assert!(result.is_ok());
+
+    let json = run_command(Commands::Stats(StatsCommands::Summary {
+        limit: None,
+        json: true,
+        compare: Some(vec![
+            "baseline-sess".to_string(),
+            "tokenless-sess".to_string(),
+        ]),
+    }));
+    assert!(json.is_ok());
 }
 
 #[test]
@@ -1167,6 +1476,7 @@ fn run_command_compress_response_file_not_found() {
         tool_use_id: None,
         truncate_strings_at: None,
         truncate_arrays_at: None,
+        array_tail_preserve: None,
         max_depth: None,
         no_stash: true,
         stash_db: None,
@@ -1266,6 +1576,7 @@ fn run_command_compress_response_no_agent_id() {
         tool_use_id: None,
         truncate_strings_at: None,
         truncate_arrays_at: None,
+        array_tail_preserve: None,
         max_depth: None,
         no_stash: true,
         stash_db: None,
@@ -1355,6 +1666,7 @@ fn run_command_compress_response_with_stash_truncation() {
         tool_use_id: None,
         truncate_strings_at: Some(10),
         truncate_arrays_at: Some(3),
+        array_tail_preserve: None,
         max_depth: Some(3),
         no_stash: false,
         stash_db: None,

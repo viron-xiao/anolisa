@@ -8,14 +8,36 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from agent_sec_cli.capabilities import view as capability_view
 from agent_sec_cli.capabilities.view import (
+    AGENTS,
     CapabilityViewError,
     query_capabilities,
     render_json,
     render_table,
 )
+from agent_sec_cli.prompt_scanner.cli import _resolve_l2_model
+from standalone_hook_test_loader import (
+    load_package_from_path,
+    load_standalone_hook,
+)
 
 _SEC_CORE_ROOT = Path(__file__).resolve().parents[3]
+_L2_MODEL_ENV = "PROMPT_SCANNER_L2_MODEL"
+_QWEN3_GUARD = "modelscope.cn/ANOLISA/Qwen3Guard-Gen-0.6B-GGUF"
+_WARDEN_GEN = "modelscope.cn/ANOLISA/Warden-Gen-0.6B-GGUF"
+_STUB_ENGINE_BACKENDS = (
+    _QWEN3_GUARD,
+    frozenset({_QWEN3_GUARD.lower(), _WARDEN_GEN.lower()}),
+)
+
+
+@pytest.fixture
+def stub_engine_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the engine-derived L2 metadata so cases do not need the extension."""
+    monkeypatch.setattr(
+        capability_view, "_engine_l2_backends", lambda: _STUB_ENGINE_BACKENDS
+    )
 
 
 _PYTHON_HOOK_HELPERS = [
@@ -27,6 +49,23 @@ _PYTHON_HOOK_HELPERS = [
     ),
     ("cosh", _SEC_CORE_ROOT / "cosh-extension" / "hooks" / "hook_config.py"),
     ("hermes", _SEC_CORE_ROOT / "hermes-plugin" / "src" / "hook_config.py"),
+]
+
+_PYTHON_OBSERVABILITY_HOOKS = [
+    ("qoder", _SEC_CORE_ROOT / "qoder-plugin" / "hooks" / "observability_hook.py"),
+    (
+        "qwen",
+        _SEC_CORE_ROOT / "qwen-code-extension" / "hooks" / "observability_hook.py",
+    ),
+    (
+        "codex",
+        _SEC_CORE_ROOT
+        / "codex-plugin"
+        / "hooks-plugin"
+        / "hooks"
+        / "observability_hook.py",
+    ),
+    ("cosh", _SEC_CORE_ROOT / "cosh-extension" / "hooks" / "observability_hook.py"),
 ]
 
 
@@ -250,15 +289,123 @@ def test_timeout_parsing_matches_agent_specific_runtime_rules() -> None:
     assert "SKILL_LEDGER_TIMEOUT" not in qwen_skill.env
 
 
+@pytest.mark.parametrize(
+    ("value", "expected", "has_diagnostic"),
+    [
+        (None, "5", False),
+        ("", "5", True),
+        ("invalid", "5", True),
+        ("1.5", "5", True),
+        ("0", "5", True),
+        ("-1", "5", True),
+        ("3", "3", False),
+        ("5", "5", False),
+        ("7", "5", False),
+        ("999999", "5", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "agent", ("qoder", "qwen", "codex", "cosh", "openclaw", "hermes")
+)
+def test_observability_timeout_matches_shared_runtime_rules(
+    agent: str,
+    value: str | None,
+    expected: str,
+    has_diagnostic: bool,
+) -> None:
+    env = {} if value is None else {"OBSERVABILITY_TIMEOUT": value}
+    record = _single_record(agent, "observability", env)
+
+    assert record.timeout == expected
+    assert record.env["OBSERVABILITY_TIMEOUT"] == {
+        "raw": value,
+        "effective": expected,
+        "default": "5",
+    }
+    assert any("OBSERVABILITY_TIMEOUT" in item for item in record.diagnostics) is (
+        has_diagnostic
+    )
+
+
+@pytest.mark.parametrize(("agent", "hook_path"), _PYTHON_OBSERVABILITY_HOOKS)
+def test_observability_timeout_matches_python_hook_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    agent: str,
+    hook_path: Path,
+) -> None:
+    hook = load_standalone_hook(f"{agent}_observability_hook_for_caps", hook_path)
+
+    for value in (None, "", "invalid", "1.5", "0", "-1", "3", "5", "7", "999999"):
+        if value is None:
+            monkeypatch.delenv("OBSERVABILITY_TIMEOUT", raising=False)
+            env = {}
+        else:
+            monkeypatch.setenv("OBSERVABILITY_TIMEOUT", value)
+            env = {"OBSERVABILITY_TIMEOUT": value}
+
+        hook_timeout = hook._read_cli_timeout_seconds()
+        record = _single_record(agent, "observability", env)
+
+        assert record.timeout == str(hook_timeout)
+
+
+def test_observability_timeout_matches_hermes_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = "hermes_plugin_for_capability_view"
+    load_package_from_path(package_name, _SEC_CORE_ROOT / "hermes-plugin" / "src")
+    observability = sys.modules[f"{package_name}.capabilities.observability"]
+
+    for value in (None, "", "invalid", "1.5", "0", "-1", "3", "5", "7", "999999"):
+        if value is None:
+            monkeypatch.delenv("OBSERVABILITY_TIMEOUT", raising=False)
+            env = {}
+        else:
+            monkeypatch.setenv("OBSERVABILITY_TIMEOUT", value)
+            env = {"OBSERVABILITY_TIMEOUT": value}
+
+        hook_timeout = observability._read_observability_timeout(5.0)
+        record = _single_record("hermes", "observability", env)
+
+        assert float(record.timeout) == hook_timeout
+
+
 def test_static_timeout_defaults_match_runtime_constants() -> None:
-    assert _single_record("qoder", "observability").timeout == "3"
-    assert _single_record("qwen", "observability").timeout == "3"
-    assert _single_record("codex", "observability").timeout == "3"
+    for agent in ("qoder", "qwen", "codex", "cosh", "openclaw", "hermes"):
+        assert _single_record(agent, "observability").timeout == "5"
     assert _single_record("cosh", "code-scan").timeout == "10"
-    assert _single_record("cosh", "observability").timeout == "3"
-    assert _single_record("openclaw", "observability").timeout == "5"
     assert _single_record("hermes", "prompt-scan").timeout == "15"
-    assert _single_record("hermes", "observability").timeout == "5"
+
+
+def test_hermes_hooks_do_not_advertise_synthetic_warning_delivery() -> None:
+    prompt = _single_record("hermes", "prompt-scan")
+    pii = _single_record("hermes", "pii-check")
+    skill = _single_record("hermes", "skill-ledger")
+
+    assert prompt.hooks == ["pre_llm_call"]
+    assert pii.hooks == [
+        "pre_llm_call",
+        "pre_tool_call",
+        "post_tool_call",
+        "post_llm_call",
+    ]
+    assert skill.hooks == ["pre_tool_call"]
+    assert skill.mode == "observe"
+
+
+@pytest.mark.parametrize("capability", ["pii-check", "skill-ledger"])
+@pytest.mark.parametrize("mode", ["warn", "ask"])
+def test_hermes_unsupported_advisory_modes_fall_back_to_observe(
+    capability: str,
+    mode: str,
+) -> None:
+    env_name = "PII_CHECKER_MODE" if capability == "pii-check" else "SKILL_LEDGER_MODE"
+
+    record = _single_record("hermes", capability, {env_name: mode})
+
+    assert record.mode == "observe"
+    assert record.env[env_name]["effective"] == "observe"
+    assert any(env_name in diagnostic for diagnostic in record.diagnostics)
 
 
 def test_pii_include_low_confidence_is_only_exposed_for_supported_hooks() -> None:
@@ -318,6 +465,126 @@ def test_cosh_prompt_scan_scan_mode_does_not_change_interaction_mode() -> None:
     assert record.timeout == "10"
     assert "PROMPT_SCANNER_MODE" not in record.env
     assert record.env["PROMPT_SCANNER_SCAN_MODE"]["effective"] == "strict"
+    assert record.env[_L2_MODEL_ENV]["effective"] == (
+        record.env[_L2_MODEL_ENV]["default"]
+    )
+
+
+@pytest.mark.parametrize("agent", AGENTS)
+@pytest.mark.usefixtures("stub_engine_backends")
+def test_prompt_scan_reports_l2_model_override_for_every_agent(agent: str) -> None:
+    default_record = _single_record(agent, "prompt-scan", {})
+    override_record = _single_record(agent, "prompt-scan", {_L2_MODEL_ENV: _WARDEN_GEN})
+
+    assert default_record.env[_L2_MODEL_ENV] == {
+        "raw": None,
+        "effective": _QWEN3_GUARD,
+        "default": _QWEN3_GUARD,
+    }
+    assert override_record.env[_L2_MODEL_ENV]["effective"] == _WARDEN_GEN
+    assert override_record.env[_L2_MODEL_ENV]["default"] == _QWEN3_GUARD
+    assert override_record.diagnostics == []
+
+
+@pytest.mark.parametrize(
+    "capability", ["code-scan", "pii-check", "skill-ledger", "observability"]
+)
+def test_l2_model_is_scoped_to_prompt_scan(capability: str) -> None:
+    record = _single_record("qoder", capability, {_L2_MODEL_ENV: _WARDEN_GEN})
+
+    assert _L2_MODEL_ENV not in record.env
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _WARDEN_GEN,
+        f"  {_WARDEN_GEN}  ",
+        _WARDEN_GEN.upper(),
+        _QWEN3_GUARD,
+        "",
+        "   ",
+    ],
+)
+@pytest.mark.usefixtures("stub_engine_backends")
+def test_l2_model_view_semantics_match_scan_prompt_resolution(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv(_L2_MODEL_ENV, raw)
+
+    record = _single_record("qoder", "prompt-scan", {_L2_MODEL_ENV: raw})
+
+    # ``scan-prompt`` returns ``None`` for "not set" and lets the engine pick
+    # its default, which is what the view reports in that case.
+    assert record.env[_L2_MODEL_ENV]["effective"] == (
+        _resolve_l2_model() or _QWEN3_GUARD
+    )
+    assert record.diagnostics == []
+
+
+@pytest.mark.usefixtures("stub_engine_backends")
+def test_unsupported_l2_model_is_reported_with_a_diagnostic() -> None:
+    configured = f"{_WARDEN_GEN}-3Domain:q4_K_M"
+
+    record = _single_record("qoder", "prompt-scan", {_L2_MODEL_ENV: configured})
+
+    # The engine rejects the name at construction, so the operator must see the
+    # configured value instead of a default that will never run.
+    assert record.env[_L2_MODEL_ENV]["effective"] == configured
+    assert record.diagnostics == [
+        f"{_L2_MODEL_ENV} is not a supported L2 backend; prompt scans will fail"
+    ]
+    assert configured not in record.diagnostics[0]
+
+
+def test_l2_model_degrades_when_engine_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        capability_view, "_engine_l2_backends", lambda: ("", frozenset())
+    )
+
+    unset_record = _single_record("qoder", "prompt-scan", {})
+    unknown_record = _single_record("qoder", "prompt-scan", {_L2_MODEL_ENV: "nope"})
+
+    assert unset_record.env[_L2_MODEL_ENV]["effective"] == ""
+    assert unset_record.env[_L2_MODEL_ENV]["default"] == ""
+    assert unknown_record.env[_L2_MODEL_ENV]["effective"] == "nope"
+    assert unknown_record.diagnostics == []
+
+
+def test_l2_model_metadata_tracks_the_native_engine() -> None:
+    """The reported default and backend list must come from the engine itself.
+
+    Runs wherever the extension is importable so a renamed or added backend
+    cannot drift away from what the view reports.
+    """
+    native = pytest.importorskip(
+        "agent_sec_cli._native",
+        reason="native extension not built; the drift check runs where it is",
+    )
+    info = json.loads(native.scanner_engine_info())
+
+    capability_view._engine_l2_backends.cache_clear()
+    default, known = capability_view._engine_l2_backends()
+
+    assert default == info["l2_model"]
+    assert known == frozenset(model.lower() for model in info["l2_models"])
+
+
+def test_l2_model_never_reaches_output_unescaped() -> None:
+    records = query_capabilities(
+        agent="hermes",
+        capability="prompt-scan",
+        env={_L2_MODEL_ENV: "model\x1b[31m\n" + "x" * 120},
+    )
+
+    effective = json.loads(render_json(records))[0]["env"][_L2_MODEL_ENV]["effective"]
+
+    assert "\x1b" not in effective
+    assert "\n" not in effective
+    assert effective.startswith("model\\x1b[31m\\x0a")
+    assert len(effective) <= 80
 
 
 def test_agent_home_and_config_files_do_not_affect_environment_view(

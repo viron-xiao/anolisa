@@ -16,6 +16,7 @@ mkdir -p \
     "$ADAPTERS/common/hooks" \
     "$ADAPTERS/common/commands" \
     "$ADAPTERS/openclaw/dist" \
+    "$ADAPTERS/dsh/dist" \
     "$ADAPTERS/hermes" \
     "$ADAPTERS/qoder/.qoder-plugin" \
     "$ADAPTERS/claude-code/.claude-plugin" \
@@ -44,6 +45,7 @@ write_json_version() {
 write_json_version "$ADAPTERS/manifest.json"
 write_json_version "$ADAPTERS/openclaw/package.json"
 write_json_version "$ADAPTERS/openclaw/openclaw.plugin.json"
+write_json_version "$ADAPTERS/dsh/package.json"
 write_json_version "$ADAPTERS/qoder/.qoder-plugin/plugin.json"
 write_json_version "$ADAPTERS/claude-code/.claude-plugin/plugin.json"
 write_json_version "$ADAPTERS/codex/.codex-plugin/plugin.json"
@@ -52,6 +54,9 @@ printf '{"name":"anolisa-tokenless"}\n' \
     > "$ADAPTERS/claude-code/.claude-plugin/marketplace.json"
 printf 'version: "%s"\n' "$VERSION" > "$ADAPTERS/hermes/plugin.yaml"
 printf 'export default {};\n' > "$ADAPTERS/openclaw/dist/index.js"
+printf '%s\n' '- insert:' '    - id: anolisa-tokenless' "      name: '@anolisa/dsh-tokenless'" \
+    > "$ADAPTERS/dsh/cordis.patch.yml"
+printf 'export function apply() {}\n' > "$ADAPTERS/dsh/dist/index.js"
 printf '{"name":"tokenless","version":"%s"}\n' "$VERSION" \
     > "$ADAPTERS/common/cosh-extension.json"
 printf '{}\n' > "$ADAPTERS/common/tool-ready-spec.json"
@@ -96,10 +101,10 @@ if os_name == "linux":
 else:
     cpu = {"aarch64": 0x0100000C}[arch]
     content = struct.pack("<IiiIIIII", 0xFEEDFACF, cpu, 0, 2, 0, 0, 0, 0)
-for name in ("tokenless", "rtk", "toon"):
+for name in ("tokenless", "rtk"):
     (root / name).write_bytes(content)
 PY
-    chmod 0755 "$destination/tokenless" "$destination/rtk" "$destination/toon"
+    chmod 0755 "$destination/tokenless" "$destination/rtk"
 }
 
 LINUX_X64="$TMP/bin-linux-x64"
@@ -152,7 +157,6 @@ tar -xzf "$OUT_ONE/$LINUX_ARTIFACT" -C "$EXTRACTED"
 cmp "$CONTRACT" "$EXTRACTED/.anolisa/component.toml"
 cmp "$LINUX_X64/tokenless" "$EXTRACTED/bin/tokenless"
 cmp "$LINUX_X64/rtk" "$EXTRACTED/libexec/anolisa/tokenless/rtk"
-cmp "$LINUX_X64/toon" "$EXTRACTED/libexec/anolisa/tokenless/toon"
 
 for relative in \
     adapters/claude-code/hooks/run-hook.sh \
@@ -161,6 +165,9 @@ for relative in \
     test ! -L "$EXTRACTED/$relative"
     cmp "$ADAPTERS/common/hooks/run-hook.sh" "$EXTRACTED/$relative"
 done
+test -f "$EXTRACTED/adapters/dsh/package.json"
+test -f "$EXTRACTED/adapters/dsh/cordis.patch.yml"
+test -f "$EXTRACTED/adapters/dsh/dist/index.js"
 test -f "$EXTRACTED/extensions/tokenless/cosh-extension.json"
 test -f "$EXTRACTED/extensions/tokenless/hooks/run-hook.sh"
 test ! -e "$EXTRACTED/adapters/agentscope"

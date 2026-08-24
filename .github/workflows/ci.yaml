@@ -233,6 +233,15 @@ jobs:
       - name: Regression test tokenless catalog version mismatch detection
         run: bash tests/test-check-component-versions.sh
 
+  check-build-runtime-deps:
+    name: Check build runtime dependencies
+    runs-on: anolisa-k8s-general-ci-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test aggregated runtime dependency preflight
+        run: bash tests/test-build-all-runtime-deps.sh
+
   # =========================================================================
   # Step 3: Build & Lint copilot-shell
   # =========================================================================
@@ -703,6 +712,10 @@ jobs:
           cd src/agentsight
           cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Test raw packaging
+        working-directory: src/agentsight
+        run: uv run --python 3.11.6 --no-project make test-raw-package
+
       - name: Run tests with coverage
         run: |
           cd src/agentsight
@@ -876,7 +889,14 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
+      - uses: extractions/setup-just@v2
+
+      - name: Install RTK Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal
+
       - name: Build and test Tokenless Python packages
+        env:
+          RUSTUP_TOOLCHAIN: '1.91.0'
         run: |
           make -C src/tokenless \
             test-python-runtime test-agentscope-integration
@@ -885,21 +905,17 @@ jobs:
         with:
           node-version: '20'
 
-      - uses: extractions/setup-just@v2
-
       - name: npm packaging smoke test (native Linux)
         # rtk v0.43.0 declares rust-version = "1.91", above the 1.89.0 pin
-        # used by the workspace MSRV checks earlier in this job. Only this
-        # packaging step builds rtk, so it runs on its own 1.91 toolchain
-        # via RUSTUP_TOOLCHAIN while the MSRV pin stays intact.
+        # used by the workspace MSRV checks earlier in this job. Packaging
+        # runs on its own 1.91 toolchain while the MSRV pin stays intact.
         env:
           RUSTUP_TOOLCHAIN: '1.91.0'
         run: |
           set -euo pipefail
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           make -C src/tokenless npm-package
           # Install root + platform tarballs into a scratch project and verify
-          # all three binaries actually run. The root install omits registry
+          # both binaries actually run. The root install omits registry
           # optional deps (unpublished during CI); the platform tarball
           # installed in step 1 satisfies the platform lookup instead.
           DIST="$GITHUB_WORKSPACE/src/tokenless/npm/dist"
@@ -907,10 +923,10 @@ jobs:
           cd "$SMOKE"
           npm init -y >/dev/null
           npm install --no-audit --no-fund "$DIST"/tokenless-linux-x64/*.tgz
-          npm install --no-audit --no-fund --omit=optional "$DIST"/tokenless/*.tgz
+          npm install --no-audit --no-fund --omit=optional \
+            --install-strategy=nested "$DIST"/tokenless/*.tgz
           ./node_modules/.bin/tokenless --version
           ./node_modules/.bin/rtk --version
-          ./node_modules/.bin/toon --version
           # Verify the bundled OpenClaw adapter was built and packaged
           test -f ./node_modules/anolisa-tokenless/adapters/tokenless/openclaw/dist/index.js
           # Verify adapter install scripts are executable
@@ -927,7 +943,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: 'rustfmt, clippy'
 
@@ -958,7 +974,7 @@ jobs:
       # ── Rust coverage gate ──────────────────────────────────────────────
       - name: Rust coverage gate (≥45%)
         run: |
-          cargo install cargo-tarpaulin --locked
+          cargo install cargo-tarpaulin --version 0.37.2 --locked
           cd src/ws-ckpt/src
           cargo tarpaulin --workspace --out Stdout --fail-under 45
 
@@ -1193,10 +1209,13 @@ jobs:
     if: needs.detect-changes.outputs.cosh_ng == 'true'
     runs-on: anolisa-k8s-general-ci-x64
     timeout-minutes: 15
+    env:
+      # This override takes precedence over the workspace's `stable` channel.
+      RUSTUP_TOOLCHAIN: '1.88.0'
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.88.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1221,6 +1240,9 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.cosh_ng == 'true'
     runs-on: anolisa-k8s-general-ci-x64
+    env:
+      # Keep lint upgrades explicit; this overrides the workspace's `stable` channel.
+      RUSTUP_TOOLCHAIN: '1.97.1'
     steps:
       - uses: actions/checkout@v4
 
@@ -1228,7 +1250,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: 'rustfmt, clippy'
 
@@ -1269,10 +1291,12 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.cosh_ng == 'true'
     runs-on: anolisa-k8s-general-ci-x64
+    env:
+      RUSTUP_TOOLCHAIN: '1.88.0'
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.88.0
 
       - uses: Swatinem/rust-cache@v2
         with:

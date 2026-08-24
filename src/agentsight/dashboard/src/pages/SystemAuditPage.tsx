@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useI18n, useLocaleTag } from '../i18n';
+import type { MessageKey } from '../i18n';
 import { ContainmentDialog } from '../components/ContainmentDialog';
 import { ContainmentLifecycleCard } from '../components/ContainmentLifecycleCard';
 import { Pagination as PaginationNew } from '../components/Pagination';
@@ -26,11 +28,11 @@ const CASE_PAGE_SIZE = 20;
 const SESSION_PAGE_SIZE = 20;
 const EVENT_PAGE_SIZE = 50;
 
-const tabs: Array<{ key: AuditTab; label: string }> = [
-  { key: 'overview', label: '审计总览' },
-  { key: 'sessions', label: '会话审计' },
-  { key: 'cases', label: '风险案件' },
-  { key: 'events', label: '事件检索' },
+const tabs: Array<{ key: AuditTab; labelKey: MessageKey }> = [
+  { key: 'overview', labelKey: 'audit.tab.overview' },
+  { key: 'sessions', labelKey: 'audit.tab.sessions' },
+  { key: 'cases', labelKey: 'audit.tab.cases' },
+  { key: 'events', labelKey: 'audit.tab.events' },
 ];
 
 const severityStyle: Record<SecurityRiskCase['severity'], string> = {
@@ -40,12 +42,12 @@ const severityStyle: Record<SecurityRiskCase['severity'], string> = {
   critical: 'bg-red-100 text-red-700',
 };
 
-const statusLabel: Record<SecurityRiskCase['status'], string> = {
-  open: '待研判',
-  confirmed: '已确认',
-  false_positive: '误报',
-  accepted_risk: '已接受',
-  resolved: '已处置',
+const statusLabel: Record<SecurityRiskCase['status'], MessageKey> = {
+  open: 'audit.status.open',
+  confirmed: 'audit.status.confirmed',
+  false_positive: 'audit.status.falsePositive',
+  accepted_risk: 'audit.status.acceptedRisk',
+  resolved: 'audit.status.resolved',
 };
 
 // 处置动作二次确认文案
@@ -56,12 +58,12 @@ const reviewConfirmText: Record<'confirmed' | 'false_positive' | 'accepted_risk'
   resolved: '确认将该案件标记为「已处置」？',
 };
 
-const eventLabel: Record<string, string> = {
-  file_action: '文件读取',
-  taint_transition: '标签传递',
-  network_action: '网络连接',
-  policy_decision: '策略判定',
-  enforcement_state: '执行状态',
+const eventLabel: Record<string, MessageKey> = {
+  file_action: 'audit.event.fileAction',
+  taint_transition: 'audit.event.taintTransition',
+  network_action: 'audit.event.networkAction',
+  policy_decision: 'audit.event.policyDecision',
+  enforcement_state: 'audit.event.enforcementState',
 };
 
 // Risk conclusions come from the policy DSL `because` clause, which is authored
@@ -91,10 +93,10 @@ interface ProcessTreeNode {
 // Reconstructs the pid -> ppid hierarchy for one case from its evidence events.
 //
 // Primary parent source: `identity.ppid`, captured by the enforcer on the real
-// ActPlane path. Fallback: when a real ppid is unavailable (e.g. mock/dev data
-// or the source event whose ppid is intentionally omitted), parent edges are
-// derived from taint *inheritance* events, where a child process inherits a
-// label from its parent (source_pid -> target_pid). A process referenced only
+// enforcement path. Fallback: when a real ppid is unavailable (e.g. mock/dev
+// data or the source event whose ppid is intentionally omitted), parent edges
+// are derived from taint *inheritance* events, where a child process inherits
+// a label from its parent (source_pid -> target_pid). A process referenced only
 // as a parent (no evidence of its own, or whose ppid is outside the set) becomes
 // the tree entry (root).
 function buildProcessTree(evidence: SecurityEvidenceEvent[]): {
@@ -181,9 +183,9 @@ function flattenProcessTree(
   }
 }
 
-function formatTime(timestampNs: number): string {
+function formatTime(timestampNs: number, localeTag: string): string {
   if (!timestampNs) return '—';
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(localeTag, {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -192,32 +194,28 @@ function formatTime(timestampNs: number): string {
   }).format(timestampNs / 1_000_000);
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : '系统审计数据加载失败';
+function errorText(error: unknown, t: (key: MessageKey) => string): string {
+  return error instanceof Error ? error.message : t('audit.error.loadFailed');
 }
 
-function decisionText(detail: SecurityRiskCaseDetail): string {
+function decisionText(detail: SecurityRiskCaseDetail, t: (key: MessageKey) => string): string {
   const decision = detail.evidence.find((item) => item.event_type === 'policy_decision');
-  const mode = decision?.event.mode;
   const blocked = decision?.event.blocked === true || detail.blocked;
-  if (blocked) return '内核已拦截';
-  if (mode === 'enforce') return '请求拦截，但未确认内核阻断';
-  if (mode === 'audit') return '规则命中，已放行';
-  return '仅观测，未执行拦截';
+  return blocked ? t('audit.case.blocked') : t('audit.case.notBlocked');
 }
 
-function evidenceSummary(item: SecurityEvidenceEvent): string {
+function evidenceSummary(item: SecurityEvidenceEvent, t: (key: MessageKey) => string): string {
   switch (item.event_type) {
     case 'file_action':
-      return String(item.event.path ?? item.event.operation ?? '敏感文件访问');
+      return String(item.event.path ?? item.event.operation ?? t('audit.evidence.fileFallback'));
     case 'taint_transition':
       return `${String(item.event.label ?? 'SENSITIVE')} · ${String(item.event.transition ?? 'add')}`;
     case 'network_action':
-      return String(item.event.destination ?? '未知网络目标');
+      return String(item.event.destination ?? t('audit.evidence.networkFallback'));
     case 'policy_decision':
-      return String(item.event.reason ?? item.event.mode ?? '策略完成判定');
+      return String(item.event.reason ?? item.event.mode ?? t('audit.evidence.policyFallback'));
     default:
-      return String(item.event.message ?? '系统事件');
+      return String(item.event.message ?? t('audit.evidence.systemEventFallback'));
   }
 }
 
@@ -229,12 +227,13 @@ function containmentEligible(riskCase: SecurityRiskCase): boolean {
 }
 
 const StatCard: React.FC<{
-  label: string;
+  labelKey: MessageKey;
   value: React.ReactNode;
-  hint: string;
+  hintKey: MessageKey;
   onClick?: () => void;
   active?: boolean;
-}> = ({ label, value, hint, onClick, active }) => {
+}> = ({ labelKey, value, hintKey, onClick, active }) => {
+  const { t } = useI18n();
   const interactive = typeof onClick === 'function';
   return (
     <div
@@ -251,9 +250,9 @@ const StatCard: React.FC<{
         interactive ? 'cursor-pointer transition hover:border-blue-300 hover:shadow-md' : ''
       } ${active ? 'border-blue-400 ring-1 ring-blue-200' : 'border-gray-200'}`}
     >
-      <p className="text-sm text-gray-500">{label}</p>
+      <p className="text-sm text-gray-500">{t(labelKey)}</p>
       <p className="mt-2 text-2xl font-semibold text-gray-900">{value}</p>
-      <p className="mt-1 text-xs text-gray-400">{hint}</p>
+      <p className="mt-1 text-xs text-gray-400">{t(hintKey)}</p>
     </div>
   );
 };
@@ -267,6 +266,7 @@ const Pagination: React.FC<{
 }> = ({ offset, pageSize, total, loading, onChange }) => {
   const page = Math.floor(offset / pageSize) + 1;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const { t } = useI18n();
   return (
     <div className="flex items-center justify-between border-t border-gray-200 px-5 py-3 text-xs text-gray-500">
       <span>{offset + 1}–{Math.min(offset + pageSize, total)} / {total}</span>
@@ -277,7 +277,7 @@ const Pagination: React.FC<{
           onClick={() => onChange(Math.max(0, offset - pageSize))}
           className="rounded border px-2 py-1 disabled:text-gray-300"
         >
-          上一页
+          {t('common.prev')}
         </button>
         <span>{page}/{pageCount}</span>
         <button
@@ -286,7 +286,7 @@ const Pagination: React.FC<{
           onClick={() => onChange(offset + pageSize)}
           className="rounded border px-2 py-1 disabled:text-gray-300"
         >
-          下一页
+          {t('common.next')}
         </button>
       </div>
     </div>
@@ -296,6 +296,8 @@ const Pagination: React.FC<{
 export const SystemAuditPage: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const { t } = useI18n();
+  const localeTag = useLocaleTag();
   const [activeTab, setActiveTab] = useState<AuditTab>('overview');
   const [summary, setSummary] = useState<SecuritySummary | null>(null);
   const [cases, setCases] = useState<SecurityRiskCase[]>([]);
@@ -354,9 +356,9 @@ export const SystemAuditPage: React.FC = () => {
     if (results[4].status === 'fulfilled') {
       setBindings(results[4].value.bindings);
     }
-    setError(failures.length ? errorText((failures[0] as PromiseRejectedResult).reason) : '');
+    setError(failures.length ? errorText((failures[0] as PromiseRejectedResult).reason, t) : '');
     setLoading(false);
-  }, [caseOffset, eventOffset, sessionOffset]);
+  }, [caseOffset, eventOffset, sessionOffset, t]);
 
   useEffect(() => {
     void load();
@@ -376,7 +378,7 @@ export const SystemAuditPage: React.FC = () => {
       if (caseRequestVersion.current !== version) return;
       setSelectedCase(response.data);
     } catch (nextError) {
-      if (caseRequestVersion.current === version) setError(errorText(nextError));
+      if (caseRequestVersion.current === version) setError(errorText(nextError, t));
     } finally {
       if (caseRequestVersion.current === version) setDetailLoading(false);
     }
@@ -418,7 +420,7 @@ export const SystemAuditPage: React.FC = () => {
       if (
         reviewRequestVersion.current === reviewVersion
         && caseRequestVersion.current === caseVersion
-      ) setError(errorText(nextError));
+      ) setError(errorText(nextError, t));
     } finally {
       if (
         reviewRequestVersion.current === reviewVersion
@@ -486,7 +488,7 @@ export const SystemAuditPage: React.FC = () => {
       setEventTotal(result.data.total);
       setEventNextOffset(result.data.next_offset ?? null);
     } catch (e) {
-      setError(errorText(e));
+      setError(errorText(e, t));
     } finally {
       setLoadingMore(false);
     }
@@ -504,13 +506,13 @@ export const SystemAuditPage: React.FC = () => {
       <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold text-gray-900">系统审计</h1>
+            <h1 className="text-2xl font-bold text-gray-900">{t('audit.title')}</h1>
             <span className="rounded-full bg-blue-100 px-2.5 py-1 text-xs font-semibold text-blue-700">
-              AgentSight 本地数据
+              {t('audit.badge.localData')}
             </span>
           </div>
           <p className="mt-1 text-sm text-gray-500">
-            从 Agent 会话出发，关联工具调用、进程、文件、网络和策略判定，形成可追溯证据链。
+            {t('audit.description')}
           </p>
         </div>
         <div className="flex gap-2">
@@ -519,7 +521,7 @@ export const SystemAuditPage: React.FC = () => {
             onClick={() => navigate('/security')}
             className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-700"
           >
-            查看原始事件
+            {t('audit.button.viewRawEvents')}
           </button>
           <button
             type="button"
@@ -527,7 +529,7 @@ export const SystemAuditPage: React.FC = () => {
             disabled={loading}
             className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white disabled:bg-blue-300"
           >
-            {loading ? '刷新中...' : '刷新'}
+            {loading ? t('common.loading') : t('common.refresh')}
           </button>
         </div>
       </header>
@@ -539,20 +541,20 @@ export const SystemAuditPage: React.FC = () => {
       )}
 
       <section className="grid grid-cols-2 gap-4 lg:grid-cols-5">
-        <StatCard label="审计事件" value={summary?.total ?? 0} hint="文件 / 标签 / 网络 / 判定" />
-        <StatCard label="关联会话" value={summary?.affected_sessions ?? sessions.length} hint="具备系统行为证据" />
-        <StatCard label="风险案件" value={totalCases} hint="规则关联后形成案件" />
+        <StatCard labelKey="audit.stats.totalEvents.label" value={summary?.total ?? 0} hintKey="audit.stats.totalEvents.hint" />
+        <StatCard labelKey="audit.stats.sessions.label" value={summary?.affected_sessions ?? sessions.length} hintKey="audit.stats.sessions.hint" />
+        <StatCard labelKey="audit.stats.cases.label" value={totalCases} hintKey="audit.stats.cases.hint" />
         <StatCard
-          label="待研判"
+          labelKey="audit.stats.open.label"
           value={openCases}
-          hint="点击筛选待研判案件"
+          hintKey="audit.stats.open.hint"
           onClick={() => { setActiveTab('cases'); setCaseBlockedOnly(false); setCaseStatusFilter('open'); }}
           active={activeTab === 'cases' && caseStatusFilter === 'open' && !caseBlockedOnly}
         />
         <StatCard
-          label="确认拦截"
+          labelKey="audit.stats.blocked.label"
           value={blockedCases}
-          hint="点击筛选已拦截案件"
+          hintKey="audit.stats.blocked.hint"
           onClick={() => { setActiveTab('cases'); setCaseStatusFilter('all'); setCaseBlockedOnly(true); }}
           active={activeTab === 'cases' && caseBlockedOnly}
         />
@@ -568,7 +570,7 @@ export const SystemAuditPage: React.FC = () => {
               activeTab === tab.key ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-50'
             }`}
           >
-            {tab.label}
+            {tab.labelKey ? t(tab.labelKey) : tab.key}
           </button>
         ))}
       </div>
@@ -577,8 +579,8 @@ export const SystemAuditPage: React.FC = () => {
         <section className="grid min-h-[520px] grid-cols-1 gap-5 xl:grid-cols-[minmax(360px,0.85fr)_minmax(0,1.65fr)]">
           <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
             <div className="border-b border-gray-200 px-5 py-4">
-              <h2 className="font-semibold text-gray-900">风险案件</h2>
-              <p className="mt-1 text-xs text-gray-500">选择案件查看完整、按时序排列的原始证据。</p>
+              <h2 className="font-semibold text-gray-900">{t('audit.tab.cases')}</h2>
+              <p className="mt-1 text-xs text-gray-500">{t('audit.cases.description')}</p>
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
                 <select
                   value={caseStatusFilter}
@@ -624,7 +626,7 @@ export const SystemAuditPage: React.FC = () => {
             <div className="divide-y divide-gray-100">
               {displayedCases.length === 0 ? (
                 <p className="px-5 py-12 text-center text-sm text-gray-400">
-                  {cases.length === 0 ? '暂无风险案件' : '当前筛选条件下暂无案件'}
+                  {cases.length === 0 ? t('audit.cases.empty') : '当前筛选条件下暂无案件'}
                 </p>
               ) : displayedCases.map((item) => (
                 <button
@@ -639,7 +641,7 @@ export const SystemAuditPage: React.FC = () => {
                     <div>
                       <p className="font-medium text-gray-900">{translateRuleReason(item.summary)}</p>
                       <p className="mt-1 text-xs text-gray-500">
-                        {item.agent_id} · {item.session_id || '无会话'} · {formatTime(item.updated_at_ns)}
+                        {item.agent_id} · {item.session_id || t('audit.case.noSession')} · {formatTime(item.updated_at_ns, localeTag)}
                       </p>
                     </div>
                     <span className={`rounded-full px-2 py-1 text-xs font-semibold ${severityStyle[item.severity]}`}>
@@ -647,9 +649,9 @@ export const SystemAuditPage: React.FC = () => {
                     </span>
                   </div>
                   <div className="mt-3 flex items-center gap-2 text-xs">
-                    <span className="rounded bg-gray-100 px-2 py-1 text-gray-600">{statusLabel[item.status]}</span>
+                    <span className="rounded bg-gray-100 px-2 py-1 text-gray-600">{statusLabel[item.status] ? t(statusLabel[item.status]) : item.status}</span>
                     <span className={item.blocked ? 'text-red-600' : 'text-amber-600'}>
-                      {item.blocked ? '内核已拦截' : '未确认阻断'}
+                      {item.blocked ? t('audit.case.blocked') : t('audit.case.notBlocked')}
                     </span>
                   </div>
                 </button>
@@ -668,14 +670,14 @@ export const SystemAuditPage: React.FC = () => {
           <div className="rounded-xl border border-gray-200 bg-white shadow-sm">
             {!selectedCase ? (
               <div className="flex h-full min-h-[420px] items-center justify-center text-sm text-gray-400">
-                {detailLoading ? '正在加载证据链...' : '请选择一个风险案件'}
+                {detailLoading ? t('audit.evidence.loading') : t('audit.evidence.selectCasePlaceholder')}
               </div>
             ) : (
               <div>
                 <div className="border-b border-gray-200 p-5">
                   <div className="flex flex-wrap items-start justify-between gap-4">
                     <div>
-                      <p className="text-xs font-medium text-gray-500">风险结论</p>
+                      <p className="text-xs font-medium text-gray-500">{t('audit.case.summaryTitle')}</p>
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <h2 className="text-xl font-semibold text-gray-900">{translateRuleReason(selectedCase.summary)}</h2>
                         {caseProtection === 'enforce' ? (
@@ -687,7 +689,7 @@ export const SystemAuditPage: React.FC = () => {
                         )}
                       </div>
                       <p className="mt-2 text-sm text-gray-600">
-                        {decisionText(selectedCase)} · 风险分 {selectedCase.risk_score} · 策略修订 #{selectedCase.policy_revision}
+                        {t('audit.case.summaryLine', { decision: decisionText(selectedCase, t), riskScore: selectedCase.risk_score, policyRevision: selectedCase.policy_revision })}
                       </p>
                     </div>
                     <button
@@ -696,14 +698,14 @@ export const SystemAuditPage: React.FC = () => {
                       onClick={() => void review('confirmed')}
                       className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white disabled:bg-gray-300"
                     >
-                      确认风险
+                      {t('audit.button.confirmRisk')}
                     </button>
                   </div>
                   <div className="mt-4 flex flex-wrap gap-2 text-xs">
-                    <button type="button" disabled={reviewing} onClick={() => void review('false_positive')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">标记误报</button>
-                    <button type="button" disabled={reviewing} onClick={() => void review('accepted_risk')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">接受风险</button>
+                    <button type="button" disabled={reviewing} onClick={() => void review('false_positive')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">{t('audit.button.markFalsePositive')}</button>
+                    <button type="button" disabled={reviewing} onClick={() => void review('accepted_risk')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">{t('audit.button.acceptRisk')}</button>
                     {!selectedCase.containment && (
-                      <button type="button" disabled={reviewing} onClick={() => void review('resolved')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">标记已处置</button>
+                      <button type="button" disabled={reviewing} onClick={() => void review('resolved')} className="rounded border px-3 py-1.5 text-gray-600 disabled:opacity-40">{t('audit.button.markResolved')}</button>
                     )}
                     <button type="button" onClick={() => navigate(`/enforcement?highlight_binding=${selectedCase.containment?.binding_id || ''}&policy_id=${selectedCase.policy_id || ''}`)} className="rounded border border-blue-200 px-3 py-1.5 text-blue-700">查看拦截策略</button>
                   </div>
@@ -772,7 +774,7 @@ export const SystemAuditPage: React.FC = () => {
                   </div>
                 )}
                 <div className="p-5">
-                  <h3 className="font-semibold text-gray-900">完整证据链</h3>
+                  <h3 className="font-semibold text-gray-900">{t('audit.evidence.fullChainTitle')}</h3>
                   <div className="mt-4 space-y-1">
                     {sortedEvidence.map((item, index) => (
                       <div key={item.event_id} className="relative flex gap-4 pb-5">
@@ -782,10 +784,10 @@ export const SystemAuditPage: React.FC = () => {
                         }`} />
                         <div className="min-w-0 flex-1 rounded-lg border border-gray-200 px-4 py-3">
                           <div className="flex items-center justify-between gap-3">
-                            <p className="font-medium text-gray-900">{eventLabel[item.event_type] || item.event_type}</p>
+                            <p className="font-medium text-gray-900">{eventLabel[item.event_type] ? t(eventLabel[item.event_type]) : item.event_type}</p>
                             <span className="text-xs text-gray-400">PID {item.identity.pid}</span>
                           </div>
-                          <p className="mt-1 break-all text-sm text-gray-600">{evidenceSummary(item)}</p>
+                          <p className="mt-1 break-all text-sm text-gray-600">{evidenceSummary(item, t)}</p>
                         </div>
                       </div>
                     ))}
@@ -799,16 +801,27 @@ export const SystemAuditPage: React.FC = () => {
 
       {activeTab === 'sessions' && (
         <section className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
-          <div className="border-b px-5 py-4"><h2 className="font-semibold">会话审计</h2></div>
+          <div className="border-b px-5 py-4">
+            <h2 className="font-semibold">{t('audit.tab.sessions')}</h2>
+          </div>
           <table className="w-full text-left text-sm">
-            <thead className="bg-gray-50 text-xs text-gray-500"><tr><th className="px-5 py-3">会话</th><th>系统事件</th><th>时间范围</th><th>入口</th></tr></thead>
+            <thead className="bg-gray-50 text-xs text-gray-500">
+              <tr>
+                <th className="px-5 py-3">{t('common.session')}</th>
+                <th>{t('audit.sessions.systemEvents')}</th>
+                <th>{t('audit.sessions.timeRange')}</th>
+                <th>{t('audit.sessions.entryPoint')}</th>
+              </tr>
+            </thead>
             <tbody className="divide-y">
-              {sessions.map((session) => <tr key={session.session_id}>
-                <td className="px-5 py-4 font-mono text-xs">{session.session_id}</td>
-                <td>{session.security_event_count ?? 0}</td>
-                <td>{formatTime(session.first_seen_ns ?? 0)} ～ {formatTime(session.last_seen_ns ?? 0)}</td>
-                <td><button type="button" onClick={() => navigate('/security')} className="text-blue-600">查看时间线</button></td>
-              </tr>)}
+              {sessions.map((session) => (
+                <tr key={session.session_id}>
+                  <td className="px-5 py-4 font-mono text-xs">{session.session_id}</td>
+                  <td>{session.security_event_count ?? 0}</td>
+                  <td>{formatTime(session.first_seen_ns ?? 0, localeTag)} ～ {formatTime(session.last_seen_ns ?? 0, localeTag)}</td>
+                  <td><button type="button" onClick={() => navigate('/security')} className="text-blue-600">{t('audit.sessions.viewTimeline')}</button></td>
+                </tr>
+              ))}
             </tbody>
           </table>
           {sessionTotal > SESSION_PAGE_SIZE && (
@@ -826,18 +839,27 @@ export const SystemAuditPage: React.FC = () => {
       {activeTab === 'events' && (
         <section className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
           <div className="flex items-center justify-between border-b px-5 py-4">
-            <h2 className="font-semibold">事件检索</h2>
-            <button type="button" onClick={() => navigate('/security')} className="text-sm text-blue-600">进入安全可观测</button>
+            <h2 className="font-semibold">{t('audit.tab.events')}</h2>
+            <button type="button" onClick={() => navigate('/security')} className="text-sm text-blue-600">{t('nav.securityObservability')}</button>
           </div>
           <table className="w-full text-left text-sm">
-            <thead className="bg-gray-50 text-xs text-gray-500"><tr><th className="px-5 py-3">类型</th><th>会话</th><th>PID</th><th>结果</th></tr></thead>
+            <thead className="bg-gray-50 text-xs text-gray-500">
+              <tr>
+                <th className="px-5 py-3">{t('sec.eventType')}</th>
+                <th>{t('common.session')}</th>
+                <th>PID</th>
+                <th>{t('audit.events.result')}</th>
+              </tr>
+            </thead>
             <tbody className="divide-y">
-              {events.map((event) => <tr key={event.event_id}>
-                <td className="px-5 py-4">{eventLabel[String(event.event_type)] || event.event_type || '系统事件'}</td>
-                <td className="font-mono text-xs">{event.session_id || '—'}</td>
-                <td>{event.pid ?? '—'}</td>
-                <td>{event.result || '—'}</td>
-              </tr>)}
+              {events.map((event) => (
+                <tr key={event.event_id}>
+                  <td className="px-5 py-4">{eventLabel[String(event.event_type)] ? t(eventLabel[String(event.event_type)]) : (event.event_type || t('audit.event.fallback'))}</td>
+                  <td className="font-mono text-xs">{event.session_id || '—'}</td>
+                  <td>{event.pid ?? '—'}</td>
+                  <td>{event.result || '—'}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
           {eventTotal > EVENT_PAGE_SIZE && (

@@ -44,13 +44,15 @@ fn array_truncation_default_limit_is_32() {
     let compressor = ResponseCompressor::new();
     let arr: Vec<i32> = (1..=50).collect();
     let out = compressor.compress(&json!(arr));
-    // 32 kept items + 1 truncation marker.
-    assert_eq!(out.as_array().unwrap().len(), 33);
+    // 32 head items + 1 marker + 8 tail items (default preserve).
+    assert_eq!(out.as_array().unwrap().len(), 41);
 }
 
 #[test]
 fn array_truncation_custom_limit() {
-    let compressor = ResponseCompressor::new().with_truncate_arrays_at(3);
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0);
     let arr: Vec<i32> = (1..=10).collect();
     let out = compressor.compress(&json!(arr));
     let a = out.as_array().unwrap();
@@ -128,6 +130,7 @@ fn stash_round_trip_recovers_dropped_items_verbatim() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!(["a", "b", "c", "d", "e"]);
     let out = compressor.compress(&arr);
@@ -146,6 +149,7 @@ fn stashed_items_keep_fields_the_compressor_would_strip() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(1)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!([
         { "id": 1, "debug": "stripped in kept item" },

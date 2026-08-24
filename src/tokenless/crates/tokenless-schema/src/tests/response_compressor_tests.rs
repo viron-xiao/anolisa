@@ -51,7 +51,9 @@ fn test_string_truncation_4096_default() {
 
 #[test]
 fn test_array_truncation() {
-    let compressor = ResponseCompressor::new().with_truncate_arrays_at(3);
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0);
 
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
@@ -70,8 +72,13 @@ fn test_array_truncation_32_default() {
     let result = compressor.compress(&json!(arr));
 
     let arr_result = result.as_array().unwrap();
-    // 32 items + 1 truncation marker = 33
-    assert_eq!(arr_result.len(), 33);
+    // 32 head items + 1 truncation marker + 8 tail items (default preserve)
+    // = 41. Tail items are 43..=50.
+    assert_eq!(arr_result.len(), 41);
+    // Marker sits between head and tail.
+    assert!(arr_result[32].as_str().unwrap().contains("truncated"));
+    // First tail item follows the marker.
+    assert_eq!(arr_result[33].as_i64().unwrap(), 43);
 }
 
 #[test]
@@ -229,6 +236,7 @@ fn test_nested_object_recursive_compression() {
 fn test_array_with_objects() {
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_drop_nulls(true);
 
     let arr = json!([
@@ -276,7 +284,9 @@ fn test_utf8_safe_truncation() {
 #[test]
 fn test_array_truncation_without_stash_is_lossy() {
     // No stash attached: original lossy marker, no retrievable hash.
-    let compressor = ResponseCompressor::new().with_truncate_arrays_at(3);
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0);
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let arr_result = result.as_array().unwrap();
@@ -286,7 +296,7 @@ fn test_array_truncation_without_stash_is_lossy() {
     assert_eq!(arr_result[1], json!(2));
     assert_eq!(arr_result[2], json!(3));
     let marker = arr_result[3].as_str().unwrap();
-    assert!(marker.contains("more items truncated"));
+    assert!(marker.contains("more items truncated, not stashed"));
     assert!(marker.contains("7")); // 10 - 3 dropped
     assert!(!marker.contains("tokenless:"));
 }
@@ -299,6 +309,7 @@ fn test_array_truncation_with_stash_round_trip() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
@@ -339,6 +350,7 @@ fn test_stash_writes_counter_resets_per_compress() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0)
         .with_stash_store(store);
     let arr: Vec<i32> = (1..=10).collect();
     compressor.compress(&json!(arr));
@@ -359,6 +371,7 @@ fn test_rollback_stash_writes_removes_created_entries() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr: Vec<i32> = (1..=5).collect();
     let _ = compressor.compress(&json!(arr));
@@ -384,6 +397,7 @@ fn test_rollback_preserves_preexisting_same_payload_entry() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!([1, 2, 3, 4, 5]);
     let first = compressor.compress(&arr);
@@ -413,9 +427,11 @@ fn test_rollback_does_not_delete_key_adopted_by_another_compressor() {
     let store = Arc::new(InMemoryStore::new());
     let a = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let b = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!([1, 2, 3, 4, 5]);
     let _ = a.compress(&arr);
@@ -441,6 +457,7 @@ fn test_rollback_updates_generation_after_in_compress_refresh() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let value = json!({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]});
     let _ = compressor.compress(&value);
@@ -499,6 +516,7 @@ fn test_rollback_does_not_re_adopt_after_intervening_foreign_refresh() {
     });
     let a = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(wrapped);
     let value = json!({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]});
     let compressed = a.compress(&value);
@@ -531,12 +549,13 @@ fn test_array_truncation_with_failing_stash_falls_back_to_lossy() {
     // degrades to the plain lossy form.
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0)
         .with_stash_store(Arc::new(AlwaysFail));
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let marker = result.as_array().unwrap().last().unwrap();
     let s = marker.as_str().unwrap();
-    assert!(s.contains("more items truncated"));
+    assert!(s.contains("more items truncated, not stashed"));
     assert!(!s.contains("tokenless:"));
     // The failed write is surfaced via the error counter so a persistent
     // backend failure isn't invisible.
@@ -601,6 +620,7 @@ fn test_stash_round_trip_with_cjk_items() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!(["你好世界", "第二个条目", "第三个条目", "第四个条目"]);
     let result = compressor.compress(&arr);
@@ -628,6 +648,7 @@ fn test_stash_round_trip_with_object_array() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(1)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!([
         {"id": 1, "status": "ok", "debug": "should be stripped"},
@@ -809,4 +830,103 @@ fn test_stash_dropped_empty_not_engaged() {
     let result = compressor.compress(&arr);
     assert_eq!(result.as_array().unwrap().len(), 3);
     assert_eq!(store.len(), 0);
+}
+
+#[test]
+fn test_array_tail_preserve_keeps_tail_items() {
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(2);
+    // 10 elements: head=3, tail=2, dropped=5 (middle)
+    let arr: Vec<i32> = (1..=10).collect();
+    let result = compressor.compress(&json!(arr));
+    let r = result.as_array().unwrap();
+    // 3 head + 1 marker + 2 tail = 6
+    assert_eq!(r.len(), 6);
+    assert_eq!(r[0].as_i64().unwrap(), 1);
+    assert_eq!(r[2].as_i64().unwrap(), 3);
+    assert!(r[3].as_str().unwrap().contains("5 more items truncated"));
+    assert_eq!(r[4].as_i64().unwrap(), 9);
+    assert_eq!(r[5].as_i64().unwrap(), 10);
+}
+
+#[test]
+fn test_array_tail_preserve_bounded_when_head_plus_tail_covers_array() {
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(5)
+        .with_array_tail_preserve(3);
+    // 8 elements: head=5, tail=8-5=3 (bounded), no items dropped.
+    let arr: Vec<i32> = (1..=8).collect();
+    let result = compressor.compress(&json!(arr));
+    let r = result.as_array().unwrap();
+    // 5 head + 3 tail, no marker — head+tail covers the full array.
+    assert_eq!(r.len(), 8, "all items preserved when head+tail covers array");
+    assert!(r.iter().all(|v| v.is_number()), "no marker inserted");
+    assert_eq!(r[4].as_i64().unwrap(), 5);
+    assert_eq!(r[5].as_i64().unwrap(), 6);
+    assert_eq!(r[7].as_i64().unwrap(), 8);
+}
+
+#[test]
+fn test_array_tail_preserve_zero_is_head_only() {
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(0);
+    let arr: Vec<i32> = (1..=10).collect();
+    let result = compressor.compress(&json!(arr));
+    let r = result.as_array().unwrap();
+    // 3 head + 1 marker = 4, no tail
+    assert_eq!(r.len(), 4);
+    assert!(r[3].as_str().unwrap().contains("7 more items truncated"));
+}
+
+#[test]
+fn test_array_tail_preserve_stash_covers_middle_only() {
+    use tokenless_ccr::InMemoryStore;
+    let store = Arc::new(InMemoryStore::new());
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_array_tail_preserve(2)
+        .with_stash_store(store.clone());
+    let arr: Vec<i32> = (1..=10).collect();
+    let result = compressor.compress(&json!(arr));
+    // One stash write for the middle (items 4..8)
+    assert_eq!(store.len(), 1);
+    let r = result.as_array().unwrap();
+    assert_eq!(r.len(), 6);
+    // Tail items are NOT stashed — they appear directly in the output.
+    assert_eq!(r[4].as_i64().unwrap(), 9);
+    assert_eq!(r[5].as_i64().unwrap(), 10);
+    // Marker references the stash (reversible for the dropped middle).
+    assert!(r[3].as_str().unwrap().contains("tokenless:"));
+}
+
+#[test]
+fn test_array_tail_preserve_usize_max_does_not_overflow() {
+    // Regression: the CLI accepts `array_tail_preserve` as an unconstrained
+    // usize (e.g. usize::MAX). The head+tail budget must saturate instead of
+    // overflowing, keeping every index inside the array. A saturated budget
+    // means head+tail covers the array, so all items are preserved.
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(1)
+        .with_array_tail_preserve(usize::MAX);
+    let result = compressor.compress(&json!([1, 2, 3]));
+    let r = result.as_array().unwrap();
+    assert_eq!(r.len(), 3, "all items preserved, no marker");
+    assert_eq!(r[0].as_i64().unwrap(), 1);
+    assert_eq!(r[2].as_i64().unwrap(), 3);
+}
+
+#[test]
+fn test_array_tail_preserve_budget_wrapping_by_one_keeps_all() {
+    // head + tail wraps exactly one past usize::MAX; the array still fits
+    // inside the logical budget, so nothing may be dropped or panic.
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(usize::MAX - 1);
+    let result = compressor.compress(&json!(["a", "b", "c", "d", "e"]));
+    let r = result.as_array().unwrap();
+    assert_eq!(r.len(), 5, "head+tail covers the array, no marker");
+    assert_eq!(r[0].as_str().unwrap(), "a");
+    assert_eq!(r[4].as_str().unwrap(), "e");
 }
