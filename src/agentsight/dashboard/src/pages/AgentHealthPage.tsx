@@ -470,50 +470,83 @@ const AgentCard: React.FC<{
       </div>
       {latency && <LatencyMetricsRow metrics={latency} />}
       {!isOffline && (
-        <div className="mt-3 pt-2 border-t border-gray-100 flex items-center justify-between gap-2">
-          <div>
-            <div className="text-xs font-medium text-gray-700">安全保护</div>
-            <div className="text-[11px] text-gray-400">
-              {protectedByPolicy
-                ? (sources.length > 0 ? `审计保护中 · ${sources.length} 个敏感源` : '审计保护中')
-                : '默认保护工作目录中的凭据文件'}
+        <div className="mt-3 pt-2 border-t border-gray-100 space-y-2.5">
+          {/* 第一行：标题 + 当前状态描述  |  带文字标签的保护开关 */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-gray-700">安全保护</div>
+              <div className="text-[11px] text-gray-400 mt-0.5 leading-snug">
+                {protectedByPolicy
+                  ? (sources.length > 0
+                      ? `审计模式 · 记录风险不阻断 · ${sources.length} 个敏感源`
+                      : '审计模式 · 记录风险不阻断')
+                  : '未开启 · 开启后进入审计模式，仅记录风险不阻断'}
+              </div>
             </div>
+            {/* 开关 + 状态文字：垂直堆叠，让用户一眼看懂开/关及其含义 */}
+            <div className="flex flex-col items-end gap-1 flex-shrink-0">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={protectedByPolicy}
+                aria-label={protectedByPolicy ? '关闭 Agent 安全保护' : '开启 Agent 安全保护（进入审计模式）'}
+                title={protectedByPolicy ? '点击关闭安全保护' : '点击开启安全保护：进入审计模式，发现风险时记录证据、不阻断 Agent'}
+                disabled={protecting || detaching}
+                onClick={() => {
+                  if (protectedByPolicy) { void handleDetachProtection(); }
+                  else { void enableProtection(); }
+                }}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }}
+                className={[
+                  'relative inline-flex h-5 w-9 items-center rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1',
+                  protectedByPolicy ? 'bg-blue-600' : 'bg-gray-300',
+                  (protecting || detaching) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
+                ].join(' ')}
+              >
+                <span
+                  className={[
+                    'inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transform transition-transform duration-200',
+                    protectedByPolicy ? 'translate-x-[18px]' : 'translate-x-[3px]',
+                  ].join(' ')}
+                />
+                {(protecting || detaching) && (
+                  <span className="absolute inset-0 flex items-center justify-center">
+                    <span className="block h-2.5 w-2.5 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                  </span>
+                )}
+              </button>
+              <span className={`text-[10px] leading-none font-medium ${protectedByPolicy ? 'text-blue-600' : 'text-gray-400'}`}>
+                {protectedByPolicy ? '保护已开启' : '保护已关闭'}
+              </span>
+            </div>
+          </div>
+
+          {/* 第二行：待研判提醒（独占一行，仅开启且有待研判时显示，不再与开关重叠） */}
+          {protectedByPolicy && pendingCaseCount > 0 && (
+            <a href={`#/audit?agent_id=${encodeURIComponent(agent.agent_name)}`}
+               className="inline-flex items-center gap-1 text-xs text-red-600 hover:underline">
+              <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+              {pendingCaseCount} 件待研判
+            </a>
+          )}
+
+          {/* 第三行：查看链接 + 保护设置（右对齐，避免与开关拥挤） */}
+          <div className="flex items-center gap-3">
             {protectedByPolicy && (
               <>
-                {pendingCaseCount > 0 && (
-                  <a href={`#/audit?agent_id=${encodeURIComponent(agent.agent_name)}`}
-                     className="inline-flex items-center gap-1 text-xs text-red-600 hover:underline mt-1">
-                    <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                    {pendingCaseCount} 件待研判
-                  </a>
-                )}
-                <div className="flex gap-3 mt-1">
-                  <a href={`#/audit?agent_id=${encodeURIComponent(agent.agent_name)}`}
-                     className="text-xs text-blue-600 hover:underline">查看案件</a>
-                  <a href={`#/enforcement?agent_id=${encodeURIComponent(agent.agent_name)}`}
-                     className="text-xs text-blue-600 hover:underline">查看拦截</a>
-                </div>
+                <a href={`#/audit?agent_id=${encodeURIComponent(agent.agent_name)}`}
+                   className="text-xs text-blue-600 hover:underline">查看案件</a>
+                <a href={`#/enforcement?agent_id=${encodeURIComponent(agent.agent_name)}`}
+                   className="text-xs text-blue-600 hover:underline">查看拦截</a>
               </>
             )}
-          </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
-            {protectedByPolicy ? (
-              <>
-                <button onClick={openProtectionDialog} className="text-xs text-blue-600 hover:text-blue-700">设置</button>
-                {bindingId && (
-                  <button onClick={() => void handleDetachProtection()} disabled={detaching} className="text-xs px-2.5 py-1.5 rounded border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50">
-                    {detaching ? '停用中…' : '停用保护'}
-                  </button>
-                )}
-              </>
-            ) : (
-              <>
-                <button onClick={openProtectionDialog} className="text-xs text-gray-500 hover:text-gray-700">设置</button>
-                <button onClick={() => void enableProtection()} disabled={protecting} className="text-xs px-2.5 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">
-                  {protecting ? '开启中…' : '一键开启'}
-                </button>
-              </>
-            )}
+            <button
+              onClick={openProtectionDialog}
+              title="打开保护配置：设置保护目录、敏感文件与可信网络目标"
+              className={`ml-auto text-xs ${protectedByPolicy ? 'text-blue-600 hover:text-blue-700' : 'text-gray-500 hover:text-gray-700'}`}
+            >
+              保护设置
+            </button>
           </div>
         </div>
       )}
@@ -735,6 +768,8 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
         const nextBindings = new Map<number, string>();
         for (const binding of bindings) {
           if (binding.state !== 'pending' && binding.state !== 'enforced' && binding.state !== 'degraded') continue;
+          // Only track credential-protection bindings on Agent cards
+          if (!binding.request.policy_id.startsWith('credential-')) continue;
           const pid = binding.request.root_pid;
           // enforced 优先于 pending/degraded，避免同 pid 多 binding 时取错
           if (!nextBindings.has(pid) || binding.state === 'enforced') {
