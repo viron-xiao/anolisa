@@ -857,6 +857,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenless-pipeline"
+version = "0.7.12"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokenless-ccr",
+ "tokenless-protocol",
+ "tokenless-stats",
+]
+
+[[package]]
+name = "tokenless-protocol"
+version = "0.7.12"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tokenless-python"
 version = "0.7.12"
 dependencies = [

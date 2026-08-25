@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.1
+
+### Fixes
+- Keep null-session interruptions in breakdowns so per-session and per-conversation counts always sum to the total. (#2796)
+- Add Bun SSL_do_handshake prologue pattern so Claude Code (Bun builds >= 2.1.113) LLM traffic is captured. (#2782)
+
+## 0.11.0
+
+### Changes
+- Version bump for RPM packaging; no functional changes since 0.10.3.
+
 ## 0.10.3
 
 ### Features

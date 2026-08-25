@@ -2786,7 +2786,9 @@ pub async fn metrics(data: web::Data<AppState>) -> impl Responder {
 
     // agentsight_interruptions_total (per type, all-time)
     if let Some(ref istore) = data.interruption_store {
-        if let Ok(stats) = istore.stats(0, i64::MAX) {
+        // `None`: a Prometheus counter must never decrease, so resolving an
+        // event may not remove it from this total.
+        if let Ok(stats) = istore.stats(0, i64::MAX, None) {
             out.push_str(
                 "# HELP agentsight_interruptions_total Total interruption events by type\n",
             );
@@ -3099,6 +3101,8 @@ pub async fn list_interruptions(
 /// GET /api/interruptions/count?start_ns=<i64>&end_ns=<i64>&agent_name=<str>
 ///
 /// Returns total interruption count + breakdown by severity within a time range.
+/// Counts unresolved events only, so the total always equals the sum of the
+/// `session-counts` / `conversation-counts` breakdowns.
 /// Response: { total, by_severity: { critical, high, medium, low } }
 #[get("/interruptions/count")]
 pub async fn interruption_count(
@@ -3115,7 +3119,7 @@ pub async fn interruption_count(
         .start_ns
         .unwrap_or_else(|| end_ns - 86_400_000_000_000i64);
 
-    match istore.stats(start_ns, end_ns) {
+    match istore.stats(start_ns, end_ns, Some(false)) {
         Ok(stats) => {
             let mut total = 0u64;
             let mut critical = 0u64;
@@ -3149,7 +3153,8 @@ pub async fn interruption_count(
 
 /// GET /api/interruptions/stats
 ///
-/// Returns per-type count statistics within a time range.
+/// Returns per-type count statistics within a time range. Unresolved only, to
+/// stay consistent with the overview card whose tooltip this feeds.
 #[get("/interruptions/stats")]
 pub async fn interruption_stats(
     data: web::Data<AppState>,
@@ -3165,7 +3170,7 @@ pub async fn interruption_stats(
         .start_ns
         .unwrap_or_else(|| end_ns - 86_400_000_000_000i64);
 
-    match istore.stats(start_ns, end_ns) {
+    match istore.stats(start_ns, end_ns, Some(false)) {
         Ok(stats) => HttpResponse::Ok().json(stats),
         Err(e) => {
             HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -3191,7 +3196,8 @@ pub async fn interruption_session_counts(
         .start_ns
         .unwrap_or_else(|| end_ns - 86_400_000_000_000i64);
 
-    match istore.count_unresolved_by_session_detailed(start_ns, end_ns) {
+    match istore.count_unresolved_by_session_detailed(start_ns, end_ns, query.agent_name.as_deref())
+    {
         Ok(rows) => {
             let mut map: std::collections::HashMap<
                 String,
@@ -3255,7 +3261,11 @@ pub async fn interruption_conversation_counts(
         .start_ns
         .unwrap_or_else(|| end_ns - 86_400_000_000_000i64);
 
-    match istore.count_unresolved_by_conversation_detailed(start_ns, end_ns) {
+    match istore.count_unresolved_by_conversation_detailed(
+        start_ns,
+        end_ns,
+        query.agent_name.as_deref(),
+    ) {
         Ok(rows) => {
             let mut map: std::collections::HashMap<
                 String,
