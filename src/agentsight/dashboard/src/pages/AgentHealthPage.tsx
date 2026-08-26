@@ -18,6 +18,7 @@ import type { AgentActivitySummary, AgentHealthStatus } from '../types';
 import { useI18n, useLocaleTag, INTERRUPTION_TYPES, interruptionTypeKey } from '../i18n';
 import type { MessageKey } from '../i18n';
 import { formatNs } from '../utils/datetime';
+import { CREDENTIAL_POLICY_ID } from '../constants/policyIds';
 
 // ─── Agent status section ─────────────────────────────────────────────────────
 
@@ -756,8 +757,13 @@ const AgentGroupCard: React.FC<{
   onDelete: (pid: number) => void;
   onRestart: (pid: number) => void;
   restartingPids: Set<number>;
+  protectionBindings?: Map<number, string>;
+  onProtected?: (pid: number, bindingId: string) => void;
+  onDetachProtection?: (pid: number, bindingId: string) => Promise<void> | void;
+  addToast?: (message: string) => void;
+  pendingCaseCounts?: Map<string, number>;
   latency?: LatencyMetricsSummary;
-}> = ({ group, clientAgents, onDelete, onRestart, restartingPids, latency }) => {
+}> = ({ group, clientAgents, onDelete, onRestart, restartingPids, protectionBindings, onProtected, onDetachProtection, addToast, pendingCaseCounts, latency }) => {
   const { t } = useI18n();
   const isHung = group.status === 'hung';
   const isUnhealthy = group.status === 'unhealthy';
@@ -837,6 +843,12 @@ const AgentGroupCard: React.FC<{
                 onDelete={onDelete}
                 onRestart={onRestart}
                 restarting={restartingPids.has(agent.pid)}
+                protectedByPolicy={!!protectionBindings?.has(agent.pid)}
+                bindingId={protectionBindings?.get(agent.pid)}
+                onProtected={onProtected}
+                onDetachProtection={onDetachProtection}
+                addToast={addToast}
+                pendingCaseCount={pendingCaseCounts?.get(agent.agent_name) ?? 0}
                 showProcessDetails
               />
             ))}
@@ -903,7 +915,7 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
         for (const binding of bindings) {
           if (binding.state !== 'pending' && binding.state !== 'enforced' && binding.state !== 'degraded') continue;
           // Only track credential-protection bindings on Agent cards
-          if (!binding.request.policy_id.startsWith('credential-')) continue;
+          if (binding.request.policy_id !== CREDENTIAL_POLICY_ID) continue;
           const pid = binding.request.root_pid;
           // enforced 优先于 pending/degraded，避免同 pid 多 binding 时取错
           if (!nextBindings.has(pid) || binding.state === 'enforced') {
@@ -1122,6 +1134,11 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
                 onDelete={handleDelete}
                 onRestart={handleRestart}
                 restartingPids={restartingPids}
+                protectionBindings={protectionBindings}
+                onProtected={handleProtected}
+                onDetachProtection={handleDetachProtection}
+                addToast={addToast}
+                pendingCaseCounts={pendingCaseCounts}
                 latency={latencyForAgent(group.agentName)}
               />
             ),
