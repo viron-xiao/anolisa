@@ -332,7 +332,13 @@ export const SystemAuditPage: React.FC = () => {
     setLoading(true);
     const results = await Promise.allSettled([
       fetchAuditSummary({ limit: 10 }),
-      fetchSecurityCases({ limit: CASE_PAGE_SIZE, offset: caseOffset }),
+      fetchSecurityCases({
+        limit: CASE_PAGE_SIZE,
+        offset: caseOffset,
+        agent_id: caseAgentFilter ?? undefined,
+        status: caseStatusFilter !== 'all' ? caseStatusFilter : undefined,
+        blocked: caseBlockedOnly || undefined,
+      }),
       fetchAuditSessions({ limit: SESSION_PAGE_SIZE, offset: sessionOffset }),
       fetchAuditEvents({ limit: EVENT_PAGE_SIZE, offset: eventOffset, include_details: true }),
       fetchEnforcementBindings(),
@@ -466,18 +472,15 @@ export const SystemAuditPage: React.FC = () => {
     return out;
   }, [processTree]);
 
-  // URL 参数: case_id 自动展开
+  // URL 参数: case_id 直接打开详情(不依赖当前页列表)
   useEffect(() => {
     const caseIdParam = searchParams.get('case_id');
-    if (caseIdParam && cases.length > 0) {
-      const match = cases.find((c) => c.case_id === caseIdParam);
-      if (match) {
-        setActiveTab('cases');
-        void openCase(match.case_id);
-      }
+    if (caseIdParam) {
+      setActiveTab('cases');
+      void openCase(caseIdParam);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cases]);
+  }, []);
 
   const loadMoreEvents = async () => {
     if (eventNextOffset === null || loadingMore) return;
