@@ -47,7 +47,7 @@ ANOLISA provides a complete server-side runtime for AI Agent workloads. Componen
 
 | Document | Component | Description |
 |----------|-----------|-------------|
-| [AgentSight](agent-observability/agentsight.md) | agentsight | eBPF-based tracing, Token accounting, Web Dashboard |
+| [AgentSight](agent-observability/agentsight/README.md) | agentsight | eBPF-based tracing, Token accounting, Web Dashboard |
 | [AgentSight Quick Start](agent-observability/agentsight/QUICKSTART.md) | agentsight | Install, capture the first session, open the Dashboard |
 | [AgentSight Dashboard Guide](agent-observability/agentsight/dashboard.md) | agentsight | Token access and a page-by-page walkthrough |
 | [AgentSight CLI Reference](agent-observability/agentsight/cli-reference.md) | agentsight | Every command and flag with real output |

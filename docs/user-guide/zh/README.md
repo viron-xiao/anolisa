@@ -47,7 +47,7 @@ ANOLISA 为 AI Agent 提供完整的服务端运行时能力。通过 `anolisa` 
 
 | 文档 | 组件 | 说明 |
 |------|------|------|
-| [AgentSight](agent-observability/agentsight.md) | agentsight | eBPF 追踪、Token 计账、Web Dashboard |
+| [AgentSight](agent-observability/agentsight/README.md) | agentsight | eBPF 追踪、Token 计账、Web Dashboard |
 | [AgentSight 快速开始](agent-observability/agentsight/QUICKSTART.md) | agentsight | 安装、采集第一条会话、打开 Dashboard |
 | [AgentSight Dashboard 指南](agent-observability/agentsight/dashboard.md) | agentsight | 令牌访问方式与逐页说明 |
 | [AgentSight CLI 参考](agent-observability/agentsight/cli-reference.md) | agentsight | 全部命令与参数，附真实输出 |

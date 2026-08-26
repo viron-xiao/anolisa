@@ -33,13 +33,21 @@ impl AssistanceControl {
     }
 
     pub(crate) fn toggle(&self) -> std::io::Result<bool> {
-        let enabled = !self.is_enabled();
+        self.set_enabled(!self.is_enabled())
+    }
+
+    pub(crate) fn set_enabled(&self, enabled: bool) -> std::io::Result<bool> {
         if enabled {
-            OpenOptions::new()
+            if let Err(error) = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&self.state_file)?;
+                .open(&self.state_file)
+            {
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
         } else if let Err(error) = fs::remove_file(&self.state_file) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(error);
@@ -66,6 +74,7 @@ pub struct InputClassifier {
     slash_hint_commands: Vec<String>,
     ai_enabled: bool,
     shell_passthrough: bool,
+    bash_readline_history_privacy: bool,
     assistance_control: Option<AssistanceControl>,
 }
 
@@ -77,6 +86,11 @@ impl InputClassifier {
 
     pub(crate) fn with_shell_passthrough(mut self, shell_passthrough: bool) -> Self {
         self.shell_passthrough = shell_passthrough;
+        self
+    }
+
+    pub(crate) fn with_bash_readline_history_privacy(mut self, enabled: bool) -> Self {
+        self.bash_readline_history_privacy = enabled;
         self
     }
 
@@ -97,6 +111,7 @@ impl Default for InputClassifier {
                 .collect(),
             ai_enabled: true,
             shell_passthrough: false,
+            bash_readline_history_privacy: false,
             assistance_control: None,
         }
     }
@@ -111,6 +126,10 @@ impl InputClassifier {
         self.shell_passthrough
     }
 
+    pub(crate) fn bash_readline_history_privacy_enabled(&self) -> bool {
+        self.bash_readline_history_privacy
+    }
+
     pub(crate) fn assistance_control(&self) -> Option<&AssistanceControl> {
         self.assistance_control.as_ref()
     }
@@ -122,6 +141,9 @@ impl InputClassifier {
     }
 
     pub(crate) fn is_slash_control_candidate(&self, token: &str) -> bool {
+        if !self.assistance_enabled() {
+            return token == "/" || "/mode".starts_with(token);
+        }
         self.is_slash_control_input(token)
     }
 
@@ -139,6 +161,17 @@ impl InputClassifier {
         }
         let trimmed = input.trim();
         if trimmed.is_empty() {
+            return InputDecision::SendToShell(input.to_string());
+        }
+
+        if !self.assistance_enabled() {
+            let mut tokens = trimmed.split_whitespace();
+            if tokens.next() == Some("/mode") && tokens.next() == Some("routing") {
+                return InputDecision::Intercept {
+                    input: input.to_string(),
+                    reason: InterceptReason::Slash,
+                };
+            }
             return InputDecision::SendToShell(input.to_string());
         }
 
@@ -241,7 +274,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputClassifier, InputDecision, InterceptReason};
+    use super::{AssistanceControl, InputClassifier, InputDecision, InterceptReason};
 
     #[test]
     fn classifies_known_slash_commands_without_capturing_paths() {
@@ -573,6 +606,29 @@ mod tests {
             d.classify("\u{5e2e}\u{6211}\u{5206}\u{6790}"),
             InputDecision::SendToShell("\u{5e2e}\u{6211}\u{5206}\u{6790}".to_string())
         );
+
+        let state_file = std::env::temp_dir().join(format!(
+            "cosh-shell-only-classifier-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let control = AssistanceControl::enabled(state_file);
+        control.set_enabled(false).expect("disable assistance");
+        let shell_only = InputClassifier::default().with_assistance_control(control);
+        assert_eq!(
+            shell_only.classify("/mode routing assisted"),
+            InputDecision::Intercept {
+                input: "/mode routing assisted".to_string(),
+                reason: InterceptReason::Slash,
+            }
+        );
+        for input in ["/help", "/agent", "?? explain this", "hello"] {
+            assert_eq!(
+                shell_only.classify(input),
+                InputDecision::SendToShell(input.to_string()),
+                "{input}"
+            );
+        }
     }
 
     #[test]

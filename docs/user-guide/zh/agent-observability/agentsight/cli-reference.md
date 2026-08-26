@@ -10,7 +10,7 @@
 | 事项 | 说明 |
 |---|---|
 | 权限 | `trace` 需要 root（或 `CAP_BPF` + `CAP_PERFMON`）。查询类命令需要读取 `/var/log/sysak/.agentsight`，该目录归服务所有，请加 `sudo`。 |
-| 配置文件 | 需要读取规则的命令支持 `--config`，默认 `/etc/agentsight/config.json`。`discover` 是例外：它始终使用二进制内嵌的规则。 |
+| 配置文件 | 需要读取规则的命令支持 `--config`，默认 `/etc/agentsight/config.json`。`discover` 读取与 `trace` 相同的文件，因此会反映你的自定义规则。 |
 | 数据位置 | 固定为 `/var/log/sysak/.agentsight`。`serve`、`dashboard`、`skill-metrics` 支持用 `--db` 指定其他数据库文件。 |
 | 机器可读输出 | `token`、`audit`、`summary`、`interruption *`、`skill-metrics *` 都支持 `--json`。 |
 | 输出语言 | `summary`、`metrics`、`interruption` 输出英文；`discover`、`token` 无论 locale 都输出中文。需要稳定文本时请用 `--json`（`discover` 没有该参数）。 |
@@ -232,6 +232,9 @@ sudo agentsight audit --last 1 --exclude agent-sec-cli --exclude observability_h
 FLAGS:
         --list-known    List all known agents and show currently matched PIDs
     -v, --verbose       Show detailed output including executable path
+
+OPTIONS:
+    -c, --config <config>    Path to JSON configuration file [default: /etc/agentsight/config.json]
 ```
 
 ```bash
@@ -255,8 +258,9 @@ $ sudo agentsight discover --list-known | head -12
     Config-driven agent
 ```
 
-`--list-known` 列出的是**内置**规则集：`discover` 的两个模式都用二进制内嵌的规则构建扫描器，该命令也没有
-`--config` 参数。因此它无法告诉你写进 `/etc/agentsight/config.json` 的规则是否生效——能验证这件事的做法见
+`discover` 与 `discover --list-known` 读取的是 `trace` 所用的同一份配置（`--config`，默认
+`/etc/agentsight/config.json`），因此 `--list-known` 反映的是实际生效的规则——包括你新增的那些。
+文件缺失或无法解析时，会打印提示并回退到内置规则。详见
 [Agent 发现规则](configuration.md#agent-发现规则)。
 
 ## agentsight metrics
@@ -303,8 +307,13 @@ FLAGS:
 
 OPTIONS:
         --agent <agent>          Filter by agent name (exact match)
-        --type <itype>           [possible values: llm_error, sse_truncated, context_overflow,
-                                                   agent_crash, token_limit]
+        --type <itype>           [possible values: agent_crash, rate_limit, auth_error,
+                                                   network_timeout, service_unavailable,
+                                                   safety_filter, sse_truncated, context_overflow,
+                                                   token_limit, llm_error, retry_storm, dead_loop,
+                                                   tool_failure, empty_response, resource_exhaustion,
+                                                   slow_response, state_machine_error,
+                                                   unauthorized_action]
         --last <last>            Query last N hours (default: 24) [default: 24]
         --limit <limit>          Maximum number of results (default: 100) [default: 100]
         --severity <severity>    [possible values: critical, high, medium, low]
@@ -352,9 +361,9 @@ sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
 ```
 
-> 检测器一共产出 18 种中断类型，但 CLI 的 `--type` 只接受上面列出的 5 个值。要筛
-> `dead_loop`、`rate_limit`、`tool_failure` 等其他类型，请去掉 `--type` 后过滤 `--json` 输出，或者
-> 用 `GET /api/interruptions?type=…`。完整清单见[中断检测](interruption-detection.md#中断类型)。
+> `--type` 接受检测器能产出的所有中断类型（取值由 `InterruptionType::ALL` 派生）。
+> `agentsight interruption list --help` 会列出当前取值；带触发条件的完整清单见
+> [中断检测](interruption-detection.md#中断类型)。
 
 ## agentsight skill-metrics
 

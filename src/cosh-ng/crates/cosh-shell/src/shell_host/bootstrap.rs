@@ -20,7 +20,7 @@ const OUTPUT_REF_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const ISOLATED_INPUTRC: &str = "set input-meta on\nset convert-meta off\nset output-meta on\n";
 const ASSISTANCE_STATE_FILENAME: &str = "assistance-enabled";
 
-pub(super) fn assistance_state_file(config: &ShellHostConfig) -> PathBuf {
+pub(crate) fn assistance_state_file(config: &ShellHostConfig) -> PathBuf {
     config.work_dir.join(ASSISTANCE_STATE_FILENAME)
 }
 
@@ -56,8 +56,13 @@ fn start_shell_session(
     let marker = if config.integration.uses_markers() {
         let rcfile = config.work_dir.join(adapter.marker_filename());
         let assistance_state_file = assistance_state_file(config);
+        let history_file_state = config
+            .work_dir
+            .join("terminal-recovery-request.history-file");
         fs::write(&assistance_state_file, b"enabled\n")?;
         fs::set_permissions(&assistance_state_file, fs::Permissions::from_mode(0o600))?;
+        fs::write(&history_file_state, b"")?;
+        fs::set_permissions(&history_file_state, fs::Permissions::from_mode(0o600))?;
         let marker_token = generate_marker_token();
         let recovery_request_file_str = recovery_request_file.to_string_lossy().to_string();
         let handoff_request_file_str = handoff_request_file.to_string_lossy().to_string();

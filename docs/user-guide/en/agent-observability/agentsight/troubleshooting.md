@@ -23,15 +23,15 @@ and you simply see no events. Run `sudo agentsight trace`, or use the packaged s
 cannot load; `journalctl` shows a probe load error.
 
 **3. Your Agent is not matched by any rule.** This is the most common cause after privileges. Check
-whether a built-in rule covers it:
+whether a rule covers it:
 
 ```bash
 sudo agentsight discover --list-known | grep -i <your-agent>
 ```
 
-`discover` reads the rule set embedded in the binary, not `/etc/agentsight/config.json`, so a rule
-you added yourself will not appear here even when the tracer is using it. For custom rules, verify
-through captured data (`sudo agentsight summary --last 1`) as described in
+`discover` reads the same `config.json` the tracer uses, so `--list-known` reflects your custom
+rules (add `--config <path>` for a non-default file). If the file is missing or unparseable it warns
+and falls back to the built-in rules. See
 [Agent discovery rules](configuration.md#agent-discovery-rules).
 
 Remember that a user-provided `config.json` **replaces** the built-in rules instead of extending
@@ -71,9 +71,6 @@ sudo agentsight dashboard --no-open        # prints URL + token
 Then use `http://<host>:7396/?token=<TOKEN>`, or paste the token into the login form. Loopback
 access never asks. To disable authentication on a trusted network, set
 `server.auth.enabled` to `false` and reload.
-
-> The login screen mentions `agentsight dashboard --full-token`. That flag does not exist in 0.11 —
-> `--no-open` already prints the whole token.
 
 **The page does not load at all.** Check the listener and the network path:
 
@@ -141,8 +138,8 @@ The packaged unit caps the service at `CPUQuota=30%` and `MemoryMax=350M`, which
 - **Nothing detected although a task failed**: check `features.interruption_detection.enabled`, and
   remember detection is derived from captured traffic — an Agent that never reached the provider
   produces no LLM-side signal.
-- **`--type dead_loop` is rejected**: the CLI filter accepts only five types. Use `--json` plus `jq`,
-  or `GET /api/interruptions?type=dead_loop`.
+- **Unsure which `--type` values are valid**: `agentsight interruption list --help` prints the full
+  set; every detected type is accepted.
 - **Duplicate-looking events**: interruptions are de-duplicated per conversation, so the same
   underlying error in two conversations is intentionally two events.
 - **`token_limit` on healthy sessions**: it fires at 95% of `max_tokens`. Raise the Agent's

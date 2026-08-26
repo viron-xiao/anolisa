@@ -137,18 +137,17 @@ To add your own Agent, append a rule and reload:
 sudo systemctl reload agentsight.service
 ```
 
-Then run your Agent and confirm the tracer picked it up — data appearing is the proof that the rule
-is live:
+Then confirm the rule is live:
 
 ```bash
-sudo agentsight summary --last 1        # sessions and Tokens should be non-zero
-sudo agentsight audit --last 1 --type llm --json | jq -r '.[].extra.model'
+sudo agentsight discover --list-known | grep -i MyAgent   # rule now listed
+sudo agentsight discover                                   # run your Agent, then see it matched
 ```
 
-> `agentsight discover` and `discover --list-known` build their scanner from the rule set embedded in
-> the binary and accept no `--config`, so they keep reporting the built-in 31 rules and will not show
-> your addition even when the tracer is using it. Verify through captured data instead, and check
-> `journalctl -u agentsight.service` if nothing arrives.
+`discover` reads the same `config.json` the tracer uses, so `--list-known` reflects your addition
+(pass `--config <path>` to check a different file). You can also confirm through captured data —
+`sudo agentsight summary --last 1` should show non-zero sessions once the Agent runs; check
+`journalctl -u agentsight.service` if nothing arrives.
 
 `cmdline.deny` removes matches that would otherwise be traced — the default entry keeps
 `sftp-server` subprocesses out of the data.

@@ -11,7 +11,7 @@ it is a real capture.
 | Point | Detail |
 |---|---|
 | Privileges | `trace` needs root (or `CAP_BPF` + `CAP_PERFMON`). Query commands need read access to `/var/log/sysak/.agentsight`, which the packaged service owns — use `sudo`. |
-| Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` is the exception: it always uses the rules embedded in the binary. |
+| Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` reads the same file `trace` does, so it reflects your custom rules. |
 | Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, and `skill-metrics` accept `--db` to point at a different database file. |
 | Machine output | `--json` is available on `token`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
 | Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text — note `discover` has no such flag. |
@@ -235,6 +235,9 @@ Shows which Agent processes are running and which rules exist.
 FLAGS:
         --list-known    List all known agents and show currently matched PIDs
     -v, --verbose       Show detailed output including executable path
+
+OPTIONS:
+    -c, --config <config>    Path to JSON configuration file [default: /etc/agentsight/config.json]
 ```
 
 ```bash
@@ -258,10 +261,10 @@ $ sudo agentsight discover --list-known | head -12
     Config-driven agent
 ```
 
-`--list-known` prints the **built-in** rule set: both `discover` modes build their scanner from the
-rules embedded in the binary, and the command has no `--config` flag. So it does not tell you
-whether a rule you added to `/etc/agentsight/config.json` is active — see
-[Agent discovery rules](configuration.md#agent-discovery-rules) for a check that does.
+`discover` and `discover --list-known` read the same config file `trace` uses (`--config`, default
+`/etc/agentsight/config.json`), so `--list-known` reflects the rules actually in effect — including
+ones you added. If the file is missing or unparseable, it prints a hint and falls back to the
+built-in rules. See [Agent discovery rules](configuration.md#agent-discovery-rules).
 
 ## agentsight metrics
 
@@ -308,8 +311,13 @@ FLAGS:
 
 OPTIONS:
         --agent <agent>          Filter by agent name (exact match)
-        --type <itype>           [possible values: llm_error, sse_truncated, context_overflow,
-                                                   agent_crash, token_limit]
+        --type <itype>           [possible values: agent_crash, rate_limit, auth_error,
+                                                   network_timeout, service_unavailable,
+                                                   safety_filter, sse_truncated, context_overflow,
+                                                   token_limit, llm_error, retry_storm, dead_loop,
+                                                   tool_failure, empty_response, resource_exhaustion,
+                                                   slow_response, state_machine_error,
+                                                   unauthorized_action]
         --last <last>            Query last N hours (default: 24) [default: 24]
         --limit <limit>          Maximum number of results (default: 100) [default: 100]
         --severity <severity>    [possible values: critical, high, medium, low]
@@ -357,10 +365,9 @@ sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
 ```
 
-> The detector produces 18 interruption types, but `--type` on the CLI accepts only the five values
-> listed above. To filter the remaining types (`dead_loop`, `rate_limit`, `tool_failure`, …), drop
-> `--type` and filter the `--json` output, or use `GET /api/interruptions?type=…`. The full list is
-> in [Interruption detection](interruption-detection.md#interruption-types).
+> `--type` accepts every interruption type the detector can produce (the values are derived from
+> `InterruptionType::ALL`). `agentsight interruption list --help` prints the current list; the full
+> catalog with triggers is in [Interruption detection](interruption-detection.md#interruption-types).
 
 ## agentsight skill-metrics
 

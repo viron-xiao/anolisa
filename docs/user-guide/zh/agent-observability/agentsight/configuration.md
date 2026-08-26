@@ -135,16 +135,17 @@ Claude Code、Qwen Code 和 AgentScope，共 31 条。
 sudo systemctl reload agentsight.service
 ```
 
-然后跑一次自己的 Agent，确认 tracer 采到了数据——有数据就说明规则生效了：
+然后确认规则已生效：
 
 ```bash
-sudo agentsight summary --last 1        # 会话数与 Token 应当非零
-sudo agentsight audit --last 1 --type llm --json | jq -r '.[].extra.model'
+sudo agentsight discover --list-known | grep -i MyAgent   # 规则已列出
+sudo agentsight discover                                   # 跑一次自己的 Agent，然后看它被匹配
 ```
 
-> `agentsight discover` 和 `discover --list-known` 都用二进制内嵌的规则集构建扫描器，也不接受
-> `--config`，因此它们始终只报告内置的 31 条规则；即使 tracer 已经在用你新加的规则，这里也看不到。请以采集到
-> 的数据为准，若一直没有数据，用 `journalctl -u agentsight.service` 查看日志。
+`discover` 读取的是 tracer 所用的同一份 `config.json`，因此 `--list-known` 会反映你的新增规则
+（用 `--config <path>` 可指向其他文件）。也可以以采集到的数据为准——Agent 跑起来后
+`sudo agentsight summary --last 1` 的会话数应当非零；若一直没有数据，用
+`journalctl -u agentsight.service` 查看日志。
 
 `cmdline.deny` 用于剔除本会被匹配到的进程——默认那条规则把 `sftp-server` 子进程排除在数据之外。
 

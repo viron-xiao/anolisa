@@ -22,14 +22,14 @@ journalctl -u agentsight.service -n 50 --no-pager      # 它在抱怨什么？
 **2. 内核没有 BTF。** `ls /sys/kernel/btf/vmlinux` 必须成功。否则 CO-RE 探针无法加载，
 `journalctl` 里会有探针加载失败的报错。
 
-**3. 你的 Agent 没被任何规则命中。** 这是权限之外最常见的原因。先确认内置规则里有没有它：
+**3. 你的 Agent 没被任何规则命中。** 这是权限之外最常见的原因。先确认规则里有没有它：
 
 ```bash
 sudo agentsight discover --list-known | grep -i <你的-agent>
 ```
 
-`discover` 读的是二进制内嵌的规则集，不是 `/etc/agentsight/config.json`，所以你自己加的规则即使 tracer
-已经在用，这里也不会出现。自定义规则请以采集到的数据为准（`sudo agentsight summary --last 1`），做法见
+`discover` 读取的是 tracer 所用的同一份 `config.json`，因此 `--list-known` 会反映你的自定义规则
+（非默认文件用 `--config <path>`）。文件缺失或无法解析时会打印提示并回退到内置规则。做法见
 [Agent 发现规则](configuration.md#agent-发现规则)。
 
 请记住：用户提供的 `config.json` 是**替换**内置规则而不是追加——一个只改了一半的配置文件，会静默地让所有
@@ -65,8 +65,6 @@ sudo agentsight dashboard --no-open        # 打印地址 + 令牌
 
 然后用 `http://<host>:7396/?token=<TOKEN>`，或把令牌粘进登录框。本机回环访问不会要求令牌。可信内网想
 关闭认证，把 `server.auth.enabled` 设为 `false` 后 reload。
-
-> 登录页提到 `agentsight dashboard --full-token`。0.11 没有这个参数——`--no-open` 打印的已经是完整令牌。
 
 **页面根本打不开。** 依次检查监听和网络链路：
 
@@ -128,8 +126,8 @@ sudo du -sh /var/log/sysak/.agentsight
 
 - **任务确实失败了但没检测到**：先确认 `features.interruption_detection.enabled`；另外检测依赖采集到的
   流量，如果 Agent 根本没连上供应商，就没有 LLM 侧的信号。
-- **`--type dead_loop` 被拒绝**：CLI 过滤只接受 5 种类型，请改用 `--json` 配合 `jq`，或
-  `GET /api/interruptions?type=dead_loop`。
+- **不确定 `--type` 能填哪些值**：`agentsight interruption list --help` 会打印完整取值；检测器能产出的
+  每一种类型都可以填。
 - **看起来像重复的事件**：中断按对话去重，因此同一个底层错误出现在两个对话里，本就是两条事件。
 - **健康会话上出现 `token_limit`**：它在输出达到 `max_tokens` 的 95% 时触发。如果回答确实被截断，请调高
   Agent 的 `max_tokens`。

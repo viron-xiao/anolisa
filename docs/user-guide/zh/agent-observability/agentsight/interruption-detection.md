@@ -97,10 +97,8 @@ Total: 1 event(s)
 
 本页示例中的所有 ID 都是占位值，请替换成你自己输出里的实际 ID。
 
-> CLI 的 `--type` 只接受 `llm_error`、`sse_truncated`、`context_overflow`、`agent_crash`、
-> `token_limit`。其余类型请过滤 `--json` 输出
-> （`… --json | jq '.[] | select(.interruption_type=="dead_loop")'`），或使用
-> `GET /api/interruptions?type=dead_loop`。
+> `--type` 接受本页表格里的每一种中断类型。`agentsight interruption list --help` 会打印当前接受的
+> 全部取值。
 
 ### 4. 到底发生了什么
 

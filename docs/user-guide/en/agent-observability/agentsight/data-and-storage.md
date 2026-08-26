@@ -24,10 +24,10 @@ read them.
 `--db` on `serve`, `dashboard`, and `skill-metrics` points at a different database file, which is
 how you browse a copy or an archive. The tracer itself always writes to the default directory.
 
-> `--db` only redirects the GenAI event store. `serve` still reads interruption events from
-> `/var/log/sysak/.agentsight`, so an archived copy shows its own sessions and Tokens next to the
-> live host's interruptions. To browse an archive in full isolation, point the whole data directory
-> at it (for example with a bind mount) instead of using `--db`.
+> `serve --db <path>` resolves every sibling store from the `--db` directory — GenAI events, the
+> interruption store, the trajectory store, and the health checker all follow it. So an archived
+> copy is shown in isolation, without mixing in the live host's data. Put the sibling `.db` files in
+> the same directory as the one you pass. A bare relative `--db name.db` uses the current directory.
 
 > These files contain full prompts and model responses. Treat them as sensitive: keep the directory
 > permissions as installed, and be careful when copying them off the host.

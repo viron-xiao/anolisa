@@ -46,7 +46,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 | 目标 | 开始位置 |
 |------|----------|
-| 观察 Agent 活动与 Token 使用 | [AgentSight](user-guide/zh/agent-observability/agentsight.md) |
+| 观察 Agent 活动与 Token 使用 | [AgentSight](user-guide/zh/agent-observability/agentsight/README.md) |
 | 增加安全策略 | [Agent Sec Core](user-guide/zh/agent-security/agent-sec-core/QUICKSTART.md) |
 | 创建工作区恢复点 | [ws-ckpt](user-guide/zh/runtime/ws-ckpt.md) |
 | 按需挂载 Skills | [SkillFS](user-guide/zh/runtime/skillfs.md) |

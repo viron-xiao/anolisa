@@ -48,8 +48,7 @@ sudo agentsight dashboard --no-open
 sudo systemctl reload agentsight.service
 ```
 
-> 登录页提示可以用 `agentsight dashboard --full-token`。0.11 并没有这个参数；
-> `sudo agentsight dashboard --no-open` 打印的已经是完整令牌。
+> `sudo agentsight dashboard --no-open` 会打印完整令牌；登录页也指向这个命令。
 
 ## 导航与页面可见性
 

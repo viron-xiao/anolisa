@@ -74,7 +74,7 @@ fn raw_cli_zsh_native_pasted_mode_slash_does_not_reach_shell() {
         &[("COSH_SHELL_ISOLATED", "0")],
         vec![
             (
-                b"\x1b[200~/mode approval recommend\n\x1b[201~".to_vec(),
+                b"\x1b[200~/mode approval recommend\n\x1b[201~\n".to_vec(),
                 Duration::ZERO,
             ),
             (
@@ -378,7 +378,7 @@ fn raw_cli_mode_root_and_language_guidance_are_canonical() {
     assert!(output.contains("approval: auto"), "{output}");
     assert!(output.contains("analysis: smart"), "{output}");
     assert!(
-        output.contains("Use /mode approval [recommend|auto|trust]"),
+        output.contains("Use /mode approval, /mode analysis, or /mode routing"),
         "{output}"
     );
     assert!(

@@ -51,8 +51,8 @@ To turn authentication off — only sensible on a trusted internal network:
 sudo systemctl reload agentsight.service
 ```
 
-> The login screen suggests `agentsight dashboard --full-token`. That flag does not exist in 0.11;
-> `sudo agentsight dashboard --no-open` already prints the complete token.
+> `sudo agentsight dashboard --no-open` prints the complete token; the login screen links to that
+> command.
 
 ## Navigation and page availability
 

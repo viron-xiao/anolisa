@@ -100,10 +100,8 @@ Useful filters: `--severity critical`, `--agent CoshNG`, `--unresolved`, `--limi
 
 All IDs shown in this page's examples are placeholders — use the ones from your own output.
 
-> The CLI's `--type` filter only accepts `llm_error`, `sse_truncated`, `context_overflow`,
-> `agent_crash`, and `token_limit`. For the other types, filter the `--json` output
-> (`… --json | jq '.[] | select(.interruption_type=="dead_loop")'`) or use
-> `GET /api/interruptions?type=dead_loop`.
+> `--type` accepts every interruption type in this page's table. `agentsight interruption list
+> --help` prints the exact set of accepted values.
 
 ### 4. What exactly happened
 

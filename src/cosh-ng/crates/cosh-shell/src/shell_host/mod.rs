@@ -7,6 +7,8 @@ mod lifecycle;
 mod line_interactive;
 mod marker;
 mod model;
+#[cfg(test)]
+mod model_tests;
 mod osc;
 mod osc_output;
 #[cfg(test)]
@@ -20,6 +22,7 @@ mod scripted;
 pub(crate) mod sigpipe;
 mod transcript;
 
+pub(crate) use bootstrap::assistance_state_file;
 pub use line_interactive::{run_line_interactive_bash, LineInteractiveOutput};
 pub(crate) use model::{HintCardRenderer, ShellEventView};
 pub use model::{ScriptedInput, ShellHostConfig, ShellHostOutput, ShellIntegration};

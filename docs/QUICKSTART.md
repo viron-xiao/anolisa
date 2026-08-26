@@ -47,7 +47,7 @@ macOS arm64, use `--backend raw --install-mode user` instead.
 
 | Goal | Start here |
 |------|------------|
-| Observe Agent activity and Token usage | [AgentSight](user-guide/en/agent-observability/agentsight.md) |
+| Observe Agent activity and Token usage | [AgentSight](user-guide/en/agent-observability/agentsight/README.md) |
 | Add security enforcement | [Agent Sec Core](user-guide/en/agent-security/agent-sec-core/QUICKSTART.md) |
 | Create workspace recovery points | [ws-ckpt](user-guide/en/runtime/ws-ckpt.md) |
 | Mount Skills on demand | [SkillFS](user-guide/en/runtime/skillfs.md) |

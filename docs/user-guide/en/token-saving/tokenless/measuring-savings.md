@@ -224,7 +224,7 @@ Check access with:
 test -r ~/.tokenless/stats.db
 ```
 
-See the [AgentSight user guide](../../agent-observability/agentsight.md) for installation and dashboard use.
+See the [AgentSight user guide](../../agent-observability/agentsight/README.md) for installation and dashboard use.
 
 ## SLS JSONL
 

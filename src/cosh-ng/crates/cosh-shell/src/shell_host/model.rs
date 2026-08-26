@@ -38,7 +38,7 @@ impl ShellIntegration {
     }
 
     pub(crate) fn uses_markers(self) -> bool {
-        self == Self::Enhanced
+        matches!(self, Self::Enhanced)
     }
 }
 
@@ -157,11 +157,8 @@ pub struct ShellHostConfig {
     /// Cosh marker hooks.
     pub native_mode: bool,
     pub login_shell: bool,
-    /// Routes exact slash-control submissions through bash so they enter
-    /// native history (issue #1718). Defaults from `COSH_SLASH_VIA_SHELL`
-    /// (on unless "0"); disabling restores the pre-#1718 Rust intercept
-    /// path end to end. Only bash runners consult it; zsh has no extdebug
-    /// return-suppression equivalent and always keeps the Rust path.
+    /// Retained for source compatibility. Bounded Enhanced integration always
+    /// routes slash controls in Rust before they reach the shell.
     pub slash_via_shell: bool,
     pub env_overrides: Vec<(String, String)>,
     pub raw_action_watchdog: Duration,
@@ -178,6 +175,7 @@ pub struct ShellHostConfig {
     /// #2161: mirrors `shell.input_wait_timeout_secs` so the hint card can
     /// forecast the auto-interrupt (0 = disabled, no forecast line).
     pub(crate) input_wait_timeout_secs: u64,
+    pub(crate) assistance_control: Option<crate::input::AssistanceControl>,
     pub(super) shell_environment_observer: Option<ShellEnvironmentObserver>,
     pub(super) shell_history_file_observer: Option<ShellHistoryFileObserver>,
     pub(super) transcript_retention: TranscriptRetention,
@@ -197,13 +195,14 @@ impl ShellHostConfig {
             integration: ShellIntegration::Enhanced,
             native_mode: true,
             login_shell: false,
-            slash_via_shell: slash_via_shell_default(),
+            slash_via_shell: false,
             env_overrides: Vec::new(),
             raw_action_watchdog: Duration::from_secs(120),
             input_wait_status: InputWaitStatus::default(),
             hint_language: crate::config::Language::default(),
             hint_card_renderer: None,
             input_wait_timeout_secs: 120,
+            assistance_control: None,
             shell_environment_observer: None,
             shell_history_file_observer: None,
             transcript_retention: TranscriptRetention::Full,
@@ -224,6 +223,10 @@ impl ShellHostConfig {
     pub fn with_integration(mut self, integration: ShellIntegration) -> Self {
         self.integration = integration;
         self
+    }
+
+    pub(crate) fn set_assistance_control(&mut self, control: crate::input::AssistanceControl) {
+        self.assistance_control = Some(control);
     }
 
     /// Installs the input-wait hint card frame renderer (#2196 review):
@@ -268,14 +271,6 @@ impl ShellHostConfig {
             window_bytes: INTERACTIVE_TRANSCRIPT_WINDOW_BYTES,
         };
     }
-}
-
-/// `COSH_SLASH_VIA_SHELL` gates the shell routing of exact slash
-/// submissions; any value other than "0" (including unset) keeps it on.
-fn slash_via_shell_default() -> bool {
-    std::env::var("COSH_SLASH_VIA_SHELL")
-        .map(|value| value != "0")
-        .unwrap_or(true)
 }
 
 fn default_winsize() -> Winsize {

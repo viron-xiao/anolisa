@@ -1,32 +1,32 @@
 # AgentSight
 
-[中文版](../../zh/agent-observability/agentsight.md)
+[中文版](../../../zh/agent-observability/agentsight/README.md)
 
 AgentSight is a zero-instrumentation observability tool for AI Agents. It attaches eBPF probes
 to processes that are already running, so it records LLM calls, Token consumption, tool calls,
 and session interruptions without any change to Agent code, prompts, or configuration.
 
-![AgentSight Agent Observability page](../../../images/agentsight/en/dashboard-observability.png)
+![AgentSight Agent Observability page](../../../../images/agentsight/en/dashboard-observability.png)
 
 ## Start here
 
-- [Quick start](agentsight/QUICKSTART.md) — install, start tracing, produce the first session, open the Dashboard.
-- [Dashboard guide](agentsight/dashboard.md) — token access, page-by-page walkthrough.
-- [CLI reference](agentsight/cli-reference.md) — every command, flag, and real output.
-- [Configuration](agentsight/configuration.md) — config file, feature switches, Agent discovery rules.
+- [Quick start](QUICKSTART.md) — install, start tracing, produce the first session, open the Dashboard.
+- [Dashboard guide](dashboard.md) — token access, page-by-page walkthrough.
+- [CLI reference](cli-reference.md) — every command, flag, and real output.
+- [Configuration](configuration.md) — config file, feature switches, Agent discovery rules.
 
 ## What you can do with it
 
 | Goal | Read next |
 |---|---|
-| See which Agents are running and what they cost in Tokens | [Quick start](agentsight/QUICKSTART.md) |
-| Find out why an Agent task stalled, failed, or looped | [Interruption detection](agentsight/interruption-detection.md) |
-| Replay one session step by step (prompts, tool calls, results) | [Dashboard guide](agentsight/dashboard.md#trajectory-viewer) |
-| Add an Agent that AgentSight does not recognise yet | [Configuration](agentsight/configuration.md#agent-discovery-rules) |
-| Run it as a service, in a container, or on macOS | [Deployment](agentsight/deployment.md) |
-| Query data from scripts, Prometheus, or another system | [Data and storage](agentsight/data-and-storage.md) |
-| Combine it with Tokenless, agent-sec-core, or cosh | [Integrations](agentsight/integrations.md) |
-| Fix "no data", 401, or port problems | [Troubleshooting](agentsight/troubleshooting.md) |
+| See which Agents are running and what they cost in Tokens | [Quick start](QUICKSTART.md) |
+| Find out why an Agent task stalled, failed, or looped | [Interruption detection](interruption-detection.md) |
+| Replay one session step by step (prompts, tool calls, results) | [Dashboard guide](dashboard.md#trajectory-viewer) |
+| Add an Agent that AgentSight does not recognise yet | [Configuration](configuration.md#agent-discovery-rules) |
+| Run it as a service, in a container, or on macOS | [Deployment](deployment.md) |
+| Query data from scripts, Prometheus, or another system | [Data and storage](data-and-storage.md) |
+| Combine it with Tokenless, agent-sec-core, or cosh | [Integrations](integrations.md) |
+| Fix "no data", 401, or port problems | [Troubleshooting](troubleshooting.md) |
 
 ## Capabilities
 
@@ -49,7 +49,7 @@ and session interruptions without any change to Agent code, prompts, or configur
 | Kernel | >= 5.8 with BTF enabled |
 | Privileges | root (or `CAP_BPF` + `CAP_PERFMON`) for `agentsight trace` |
 | Install mode | system mode — eBPF needs root |
-| Disk | A few hundred MB under `/var/log/sysak/.agentsight` (size-capped, see [Data and storage](agentsight/data-and-storage.md)) |
+| Disk | A few hundred MB under `/var/log/sysak/.agentsight` (size-capped, see [Data and storage](data-and-storage.md)) |
 
 > **macOS**: only `agentsight trace` (scans local Agent JSONL session files, no eBPF) and
 > `agentsight serve` (Dashboard) are available. Every other command needs the Linux eBPF pipeline.
@@ -78,7 +78,7 @@ Two processes do the work, and the packaged service starts both:
 | `agentsight trace` | Loads eBPF probes, discovers Agents, writes events to SQLite (needs root) |
 | `agentsight serve` | Serves the HTTP API and the Dashboard from the same SQLite databases |
 
-Details: [ARCHITECTURE.md](../../../../src/agentsight/docs/ARCHITECTURE.md) in the source tree.
+Details: [ARCHITECTURE.md](../../../../../src/agentsight/docs/ARCHITECTURE.md) in the source tree.
 
 ## Terminology
 
@@ -104,18 +104,18 @@ sudo systemctl enable --now agentsight.service
 sudo agentsight dashboard --no-open
 ```
 
-Full walkthrough with expected output: [Quick start](agentsight/QUICKSTART.md).
+Full walkthrough with expected output: [Quick start](QUICKSTART.md).
 
 ## Reference pages
 
 | Page | Content |
 |---|---|
-| [Quick start](agentsight/QUICKSTART.md) | Install, verify capture, first Dashboard visit |
-| [Dashboard guide](agentsight/dashboard.md) | Authentication and all Dashboard pages |
-| [CLI reference](agentsight/cli-reference.md) | `trace`, `serve`, `dashboard`, `token`, `audit`, `discover`, `metrics`, `summary`, `interruption`, `skill-metrics` |
-| [Configuration](agentsight/configuration.md) | `config.json` schema, feature switches, runtime limits, discovery rules |
-| [Interruption detection](agentsight/interruption-detection.md) | The 18 interruption types and the triage workflow |
-| [Deployment](agentsight/deployment.md) | systemd, foreground, container/sidecar, macOS, upgrade, uninstall |
-| [Data and storage](agentsight/data-and-storage.md) | Databases, retention, HTTP API, Prometheus, ATIF export |
-| [Integrations](agentsight/integrations.md) | Tokenless, agent-sec-core, enforcer, cosh, Prometheus |
-| [Troubleshooting](agentsight/troubleshooting.md) | No data, 401, unreachable port, database growth |
+| [Quick start](QUICKSTART.md) | Install, verify capture, first Dashboard visit |
+| [Dashboard guide](dashboard.md) | Authentication and all Dashboard pages |
+| [CLI reference](cli-reference.md) | `trace`, `serve`, `dashboard`, `token`, `audit`, `discover`, `metrics`, `summary`, `interruption`, `skill-metrics` |
+| [Configuration](configuration.md) | `config.json` schema, feature switches, runtime limits, discovery rules |
+| [Interruption detection](interruption-detection.md) | The 18 interruption types and the triage workflow |
+| [Deployment](deployment.md) | systemd, foreground, container/sidecar, macOS, upgrade, uninstall |
+| [Data and storage](data-and-storage.md) | Databases, retention, HTTP API, Prometheus, ATIF export |
+| [Integrations](integrations.md) | Tokenless, agent-sec-core, enforcer, cosh, Prometheus |
+| [Troubleshooting](troubleshooting.md) | No data, 401, unreachable port, database growth |

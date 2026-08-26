@@ -218,7 +218,7 @@ AgentSight 的 Token savings 页面可以只读聚合 `~/.tokenless/stats.db`。
 test -r ~/.tokenless/stats.db
 ```
 
-AgentSight 的安装和 Dashboard 使用方式见[AgentSight 用户指南](../../agent-observability/agentsight.md)。
+AgentSight 的安装和 Dashboard 使用方式见[AgentSight 用户指南](../../agent-observability/agentsight/README.md)。
 
 ## SLS JSONL
 

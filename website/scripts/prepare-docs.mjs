@@ -265,6 +265,7 @@ const categoryPathNames = {
     'user-guide/user-entrypoint/cosh-ng/shell': 'Terminal',
     'user-guide/user-entrypoint/cosh-ng/core': 'Automation and Integration',
     'user-guide/user-entrypoint/cosh-ng/cli': 'System Operations',
+    'user-guide/agent-observability/agentsight': 'AgentSight',
     'developer-guide/cosh-ng': 'cosh-ng',
   },
   zh: {
@@ -272,6 +273,7 @@ const categoryPathNames = {
     'user-guide/user-entrypoint/cosh-ng/shell': '终端',
     'user-guide/user-entrypoint/cosh-ng/core': '自动化与集成',
     'user-guide/user-entrypoint/cosh-ng/cli': '系统操作',
+    'user-guide/agent-observability/agentsight': 'AgentSight',
     'developer-guide/cosh-ng': 'cosh-ng',
   },
 };
