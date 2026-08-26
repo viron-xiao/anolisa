@@ -744,6 +744,7 @@ fn run_command_compress_toon_from_file() {
         agent_id: Some("agent".to_string()),
         session_id: Some("sess".to_string()),
         tool_use_id: Some("tool".to_string()),
+        min_toon_chars: MIN_TOON_CHARS,
     });
     assert!(result.is_ok());
 }
@@ -1626,8 +1627,20 @@ fn run_command_compress_toon_tiny_input() {
         agent_id: None,
         session_id: None,
         tool_use_id: None,
+        min_toon_chars: MIN_TOON_CHARS,
     });
-    // A tiny JSON string compresses successfully.
+    // A tiny JSON string passes through the shared minimum-length gate
+    // without error.
+    assert!(result.is_ok());
+
+    // Disabling the gate keeps the legacy encode path available.
+    let result = run_command(Commands::CompressToon {
+        file: Some(f.to_str().unwrap().to_string()),
+        agent_id: None,
+        session_id: None,
+        tool_use_id: None,
+        min_toon_chars: 0,
+    });
     assert!(result.is_ok());
 }
 
@@ -1643,6 +1656,7 @@ fn run_command_compress_toon_empty_obj() {
         agent_id: None,
         session_id: None,
         tool_use_id: None,
+        min_toon_chars: MIN_TOON_CHARS,
     });
     // An empty JSON object compresses successfully.
     assert!(result.is_ok());

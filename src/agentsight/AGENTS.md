@@ -235,7 +235,8 @@ agentsight interruption --db /path/to/interruption_events.db list --last 48
 | `/api/agent-names` | GET | Agent 名称列表 |
 | `/api/timeseries` | GET | 时序 Token 统计 |
 | `/api/metrics/latency` | GET | LLM latency and throughput percentile metrics |
-| `/api/agent-health` | GET | Agent 健康状态 |
+| `/api/agent-health` | GET | 历史 Agent 活动（SQLite 聚合） |
+| `/api/agent-process-health` | GET | 当前 Agent 进程健康状态 |
 | `/api/agent-health/{pid}` | DELETE | 删除健康条目 |
 | `/api/agent-health/{pid}/restart` | POST | 重启 Agent |
 | `/api/export/atif/trace/{id}` | GET | ATIF trace 导出 |
@@ -268,7 +269,7 @@ React + TypeScript + Webpack + Tailwind CSS，位于 `dashboard/`。开发: `npm
 
 ## 10. Configuration
 
-`AgentsightConfig`（`src/config.rs`），关键环境变量：SLS_*（阿里云日志服务导出）、`AGENTSIGHT_TOKENIZER_PATH`、`AGENTSIGHT_CHROME_TRACE`、`RUST_LOG`。
+`AgentsightConfig`（`src/config.rs`），关键环境变量：SLS_*（阿里云日志服务导出）、`AGENTSIGHT_TOKENIZER_PATH`、`AGENTSIGHT_CHROME_TRACE`、`RUST_LOG`、`AGENTSIGHT_SSL_REATTACH_TTL_SECS`（SSL uprobe 陈旧重挂载 TTL，默认 300 秒；用于内核静默注销 uprobe consumer 的 serverless/overlayfs 场景，如 ACS；设为 `0` 表示每次匹配进程都强制重挂载，仅供测试）。
 
 ### 配置文件加载语义
 

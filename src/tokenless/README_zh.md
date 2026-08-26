@@ -159,6 +159,23 @@ tokenless compress-schema -f tools.json --batch
 tokenless compress-schema -f request.json
 ```
 
+### TOON 压缩 CLI
+
+`compress-toon` 将 JSON 编码为 TOON 格式（`decompress-toon` 解码回
+JSON）。短于 500 字符的负载默认原样透传（与 Adapter Hook 应用的最小
+长度一致）；传入 `--min-toon-chars 0` 可强制编码：
+
+```bash
+# TOON 编码（短负载，本次调用关闭最小长度门槛）
+echo '{"name":"Alice","age":30}' | tokenless compress-toon --min-toon-chars 0
+# name: Alice
+# age: 30
+
+# TOON 解码回 JSON
+printf 'name: Alice\nage: 30\n' | tokenless decompress-toon
+# {"name":"Alice","age":30}
+```
+
 从源码构建适合开发者。
 
 ```bash

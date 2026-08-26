@@ -316,16 +316,18 @@ tokenless retrieve c30ccf5ed1125e0ed871ba8e
 
 # Or paste the whole truncation line — the hash is extracted automatically.
 # (Use the FULL 24-hex hash from your output; the value below is shorthand.)
-tokenless retrieve "<... 160 items truncated, retrieve with <<tokenless:c30ccf5ed1125e0ed871ba8e>>"
+tokenless retrieve "<... 160 items truncated, run: tokenless retrieve '<<tokenless:c30ccf5ed1125e0ed871ba8e>>'>"
 ```
 
 ### compress-toon / decompress-toon
 
-Encode JSON to TOON format (or decode back to JSON):
+Encode JSON to TOON format (or decode back to JSON). Payloads shorter than
+500 characters pass through unchanged by default (the same minimum the
+adapter hooks apply); use `--min-toon-chars 0` to encode them anyway:
 
 ```bash
-# Encode JSON to TOON
-echo '{"name":"Alice","age":30}' | tokenless compress-toon
+# Encode JSON to TOON (short payload, gate disabled for this call)
+echo '{"name":"Alice","age":30}' | tokenless compress-toon --min-toon-chars 0
 # name: Alice
 # age: 30
 

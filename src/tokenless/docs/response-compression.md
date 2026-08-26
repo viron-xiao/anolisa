@@ -329,12 +329,17 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 ### 9.1 TOON 压缩 CLI
 
+短于 500 字符的负载默认原样透传（与 Hook 层阈值一致）；示例中使用
+`--min-toon-chars 0` 对短负载强制编码。透传和无收益场景会在 stdout 上
+逐字节原样复现输入（不添加、不去除末尾换行符），脚本可直接比较
+stdout 与输入来判断是否发生了编码。
+
 ```bash
 # TOON 编码（JSON → 紧凑二进制文本格式）
-echo '{"users":[{"id":1,"name":"Alice"}]}' | tokenless compress-toon
+echo '{"users":[{"id":1,"name":"Alice"}]}' | tokenless compress-toon --min-toon-chars 0
 
 # TOON 解码（往返验证）
-echo '{"name":"test","value":42}' | tokenless compress-toon | tokenless decompress-toon
+echo '{"name":"test","value":42}' | tokenless compress-toon --min-toon-chars 0 | tokenless decompress-toon
 
 # 附带统计追踪（自动记录到 SQLite 数据库）
 tokenless compress-toon -f data.json --agent-id my-agent --session-id sess-001

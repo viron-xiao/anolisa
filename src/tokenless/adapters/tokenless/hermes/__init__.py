@@ -184,6 +184,8 @@ _MIN_RESPONSE_LEN = 200
 # saves only a few characters (observed ~0.3% below ~500 chars) while
 # the per-event encode cost stays the same, so payloads under this
 # threshold keep the response-compressed form and skip TOON entirely.
+# Mirrors tokenless-runtime's MIN_TOON_CHARS, the default the
+# compress-toon CLI applies; keep the two values in sync.
 _MIN_TOON_CHARS = 500
 
 _SKIP_TOOLS: set[str] = _SKIP_TOOLS_SHARED | {

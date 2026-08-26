@@ -174,6 +174,26 @@ test_toon_compression() {
         log_pass "tokenless available: $(tokenless --version)"
     else log_fail "tokenless not found"; fi
 
+    # --- 5.0b Default minimum-length gate: short payloads pass through ---
+    # Like every case in this suite, 5.0b exercises the installed release
+    # binary on PATH on purpose (release-layout verification); it is
+    # intentionally decoupled from the cargo workspace. Binary-level
+    # coverage of the same gate that does not depend on the installed
+    # package lives in crates/tokenless-cli/tests/cli_integration.rs
+    # (compress_toon_short_payload_passes_through_by_default and
+    # compress_toon_min_chars_zero_encodes_short_payload).
+    log_info "Test 5.0b: TOON minimum-length gate (default 500 chars)"
+    local gate_json='{"a":"short"}'
+    local gate_out
+    gate_out=$(echo "$gate_json" | tokenless compress-toon 2>/dev/null)
+    if [ "$gate_out" = "$gate_json" ]; then
+        log_pass "Short payload passes through unchanged under default gate"
+    else log_fail "Short payload was encoded despite default gate: $gate_out"; fi
+    gate_out=$(echo "$gate_json" | tokenless compress-toon --min-toon-chars 0 2>/dev/null)
+    if [ "$gate_out" != "$gate_json" ]; then
+        log_pass "--min-toon-chars 0 encodes short payloads on demand"
+    else log_fail "--min-toon-chars 0 did not encode short payload"; fi
+
     # --- 5.1 Simple object: compress-response → stats + toon comparison ---
     log_info "Test 5.1: Simple object — compress-response stats + TOON encode"
     local simple_json='{"name":"Alice","age":30,"active":true,"email":"alice@example.com","role":"admin"}'
@@ -185,8 +205,9 @@ test_toon_compression() {
     local after_resp_chars=${#resp_compressed}
     local after_resp_tokens=$(( (after_resp_chars + 3) / 4 ))
 
-    # TOON encode separately
-    local toon_encoded=$(echo "$simple_json" | tokenless compress-toon 2>/dev/null)
+    # TOON encode separately (--min-toon-chars 0: these fixtures are under
+    # the shared 500-character default gate; this test verifies TOON itself)
+    local toon_encoded=$(echo "$simple_json" | tokenless compress-toon --min-toon-chars 0 2>/dev/null)
     local after_toon_chars=${#toon_encoded}
     local after_toon_tokens=$(( (after_toon_chars + 3) / 4 ))
     local toon_savings=$(( (before_chars - after_toon_chars) * 100 / before_chars ))
@@ -198,7 +219,7 @@ test_toon_compression() {
     local table_before_chars=${#table_json}
 
     resp_compressed=$(echo "$table_json" | tokenless compress-response --agent-id toon-test --session-id toon-session 2>/dev/null)
-    toon_encoded=$(echo "$table_json" | tokenless compress-toon 2>/dev/null)
+    toon_encoded=$(echo "$table_json" | tokenless compress-toon --min-toon-chars 0 2>/dev/null)
     local table_savings=$(( (table_before_chars - ${#toon_encoded}) * 100 / table_before_chars ))
     log_pass "Tabular data: JSON=${table_before_chars} → RESP=${#resp_compressed} → TOON=${#toon_encoded} (TOON ${table_savings}% vs raw)"
 
@@ -213,7 +234,7 @@ test_toon_compression() {
     local schema_compressed=$(echo "$schema_json" | tokenless compress-schema --agent-id toon-test --session-id toon-session 2>/dev/null)
     local schema_after_chars=${#schema_compressed}
 
-    toon_encoded=$(echo "$schema_json" | tokenless compress-toon 2>/dev/null)
+    toon_encoded=$(echo "$schema_json" | tokenless compress-toon --min-toon-chars 0 2>/dev/null)
     local schema_toon_chars=${#toon_encoded}
     local schema_savings=$(( (schema_before_chars - schema_after_chars) * 100 / schema_before_chars ))
     local schema_toon_savings=$(( (schema_before_chars - schema_toon_chars) * 100 / schema_before_chars ))
@@ -222,7 +243,7 @@ test_toon_compression() {
     # --- 5.4 Decompress-toon round-trip ---
     log_info "Test 5.4: TOON round-trip (encode→decode→verify)"
     local roundtrip_json='{"name":"test","value":42,"flag":true,"tags":["a","b","c"]}'
-    toon_encoded=$(echo "$roundtrip_json" | tokenless compress-toon 2>/dev/null)
+    toon_encoded=$(echo "$roundtrip_json" | tokenless compress-toon --min-toon-chars 0 2>/dev/null)
     local decoded=$(echo "$toon_encoded" | tokenless decompress-toon 2>/dev/null)
     if echo "$decoded" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['name']=='test' and d['value']==42 and d['flag']==True" 2>/dev/null; then
         log_pass "Round-trip: data integrity verified"
@@ -275,7 +296,9 @@ test_toon_compression() {
         '{"data":{"results":[{"k":"v1"},{"k":"v2"}],"count":2,"ok":true}}'
     do
         local plen=${#payload}
-        local tlen=$(echo "$payload" | tokenless compress-toon 2>/dev/null | wc -c)
+        # --min-toon-chars 0: payloads are under the shared 500-character
+        # default gate; this test measures TOON encoding effectiveness.
+        local tlen=$(echo "$payload" | tokenless compress-toon --min-toon-chars 0 2>/dev/null | wc -c)
         total_before=$((total_before + plen))
         total_after_toon=$((total_after_toon + tlen))
         total_records=$((total_records + 1))

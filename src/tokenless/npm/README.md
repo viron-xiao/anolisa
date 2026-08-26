@@ -72,7 +72,8 @@ tokenless compress-response -f response.json
 # Compress tool schemas
 tokenless compress-schema -f tools.json
 
-# Encode JSON to TOON format
+# Encode JSON to TOON format (payloads under 500 characters pass through
+# unchanged by default; use --min-toon-chars 0 to encode them anyway)
 tokenless compress-toon -f data.json
 
 # Decode TOON back to JSON

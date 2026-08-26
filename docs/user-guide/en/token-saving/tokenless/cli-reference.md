@@ -173,8 +173,10 @@ Most adapters override these standalone defaults. Their shared shell profile use
 JSON to TOON:
 
 ```bash
-echo '{"name":"Alice","age":30}' | tokenless compress-toon
+echo '{"name":"Alice","age":30}' | tokenless compress-toon --min-toon-chars 0
 ```
+
+Payloads shorter than 500 characters pass through unchanged by default: TOON savings on small JSON are near-zero, so the CLI applies the same minimum length as the adapter hooks. Pass `--min-toon-chars 0` to encode any payload that yields token savings anyway. Input is validated as JSON before the length check, so invalid JSON exits with code 2 even when it is below the threshold.
 
 TOON to JSON:
 
@@ -186,11 +188,11 @@ Round-trip verification:
 
 ```bash
 echo '{"name":"test","value":42}' \
-  | tokenless compress-toon \
+  | tokenless compress-toon --min-toon-chars 0 \
   | tokenless decompress-toon
 ```
 
-`compress-toon` supports `--agent-id`, `--session-id`, and `--tool-use-id`. When encoding provides no savings, it returns the original JSON and does not record that operation.
+`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
 
 ## `retrieve`
 

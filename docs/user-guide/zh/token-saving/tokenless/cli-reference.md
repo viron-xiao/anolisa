@@ -168,8 +168,10 @@ Stash 只作用于字符串、截断数组中被丢弃的中间段和深层子�
 JSON 转 TOON：
 
 ```bash
-echo '{"name":"Alice","age":30}' | tokenless compress-toon
+echo '{"name":"Alice","age":30}' | tokenless compress-toon --min-toon-chars 0
 ```
+
+短于 500 字符的负载默认原样透传：TOON 对小型 JSON 的节省近乎为零，因此 CLI 应用与 Adapter Hook 相同的最小长度。传入 `--min-toon-chars 0` 可对任意有 token 收益的负载编码。输入会先通过 JSON 校验再做长度判断，因此低于阈值的非法 JSON 仍会以退出码 2 失败。
 
 TOON 转 JSON：
 
@@ -181,11 +183,11 @@ printf 'name: Alice\nage: 30\n' | tokenless decompress-toon
 
 ```bash
 echo '{"name":"test","value":42}' \
-  | tokenless compress-toon \
+  | tokenless compress-toon --min-toon-chars 0 \
   | tokenless decompress-toon
 ```
 
-`compress-toon` 支持 `--agent-id`、`--session-id` 和 `--tool-use-id`。编码后无收益时会输出原 JSON，且不记录该次统计。
+`compress-toon` 支持 `--agent-id`、`--session-id`、`--tool-use-id` 和 `--min-toon-chars`。当负载低于最小长度或编码后无收益时会输出原 JSON，且不记录该次统计。这类透传场景退出码仍为 `0`，stderr 上的提示仅供参考：在脚本等自动化场景中，请通过比较 stdout 与输入负载来判断是否发生了编码，不要依赖 stderr。透传和无收益场景会在 stdout 上逐字节原样复现输入（不添加、不去除末尾换行符），任何字节差异都说明负载已被编码；作为兜底，也可以检查 stdout 是否仍为合法 JSON。
 
 ## `retrieve`
 

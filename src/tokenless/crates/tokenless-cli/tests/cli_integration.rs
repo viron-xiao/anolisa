@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use tokenless_ccr::StashStore;
-use tokenless_runtime::{CompressOptions, compress_response_with_store};
+use tokenless_runtime::{CompressOptions, MIN_TOON_CHARS, compress_response_with_store};
 use tokenless_stats::{
     CompressionMode, OperationType, StatsRecord, StatsRecorder, estimate_tokens,
     estimate_tokens_from_bytes, get_home_dir,
@@ -832,6 +832,79 @@ fn retrieve_stdout_is_byte_exact_without_extra_trailing_newline() {
 }
 
 #[test]
+fn retrieve_records_events_and_summary_reports_attribution() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let request = post_tool_request_json(
+        &format!(
+            r#"{{"records":[{}]}}"#,
+            (0..200)
+                .map(|i| format!(r#"{{"id":{i},"name":"row-{i}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        "Bash",
+        false,
+        "retrieve-attribution",
+    );
+    let output = spawn_with_stdin(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "1")
+            .env("TOKENLESS_SLS_ENABLED", "0"),
+        &["compress"],
+        &request,
+    );
+    assert!(output.status.success());
+    let response: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    let marker_text = response["output"].as_str().unwrap();
+    let marker_start = marker_text
+        .find("<<tokenless:")
+        .expect("array truncation should emit a stash marker");
+    let marker_end = marker_text[marker_start..]
+        .find(">>")
+        .map(|i| marker_start + i + 2)
+        .expect("stash marker should be closed");
+    let marker = &marker_text[marker_start..marker_end];
+
+    let hit = fixture
+        .command()
+        .env("TOKENLESS_STATS_ENABLED", "1")
+        .args(["retrieve", marker])
+        .output()
+        .unwrap();
+    assert!(hit.status.success());
+    let miss = fixture
+        .command()
+        .env("TOKENLESS_STATS_ENABLED", "1")
+        .args(["retrieve", "000000000000000000000000"])
+        .output()
+        .unwrap();
+    assert!(!miss.status.success());
+
+    let recorder = StatsRecorder::new(fixture.data_dir.join("stats.db")).unwrap();
+    let totals = recorder.retrieve_totals().unwrap();
+    assert_eq!(totals.hits, 1);
+    assert_eq!(totals.misses, 1);
+    assert!(totals.retrieved_tokens > 0);
+
+    let summary = fixture
+        .command()
+        .env("TOKENLESS_STATS_ENABLED", "1")
+        .args(["stats", "summary"])
+        .output()
+        .unwrap();
+    assert!(summary.status.success());
+    let text = String::from_utf8_lossy(&summary.stdout);
+    assert!(text.contains("Attribution:"));
+    assert!(text.contains("Retrieves:      1 hits / 1 misses / 0 errors"));
+}
+
+#[test]
 fn compress_response_no_savings_rolls_back_orphan_stash() {
     let fixture = match TempDataDir::new() {
         Some(fixture) => fixture,
@@ -1064,6 +1137,7 @@ fn run_compress_toon(
     input: &str,
     compression_enabled: &str,
     session_id: &str,
+    extra_args: &[&str],
 ) -> std::process::Output {
     fixture
         .command()
@@ -1077,6 +1151,7 @@ fn run_compress_toon(
             "--session-id",
             session_id,
         ])
+        .args(extra_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1097,17 +1172,20 @@ fn compress_toon_dry_run_predicted_tokens_match_recorded_stats_for_cjk() {
         Some(fixture) => fixture,
         None => return,
     };
+    // Repeated far enough past the 500-character TOON minimum that the
+    // shared gate does not intercept this estimator-focused fixture.
     let input = serde_json::to_string(&serde_json::json!({
-        "msg": "你好世界你好世界"
+        "msg": "你好世界".repeat(130)
     }))
     .unwrap();
+    assert!(input.chars().count() >= MIN_TOON_CHARS);
     assert_ne!(
         estimate_tokens(&input),
         estimate_tokens_from_bytes(input.len()),
         "fixture must be a CJK case where the two estimators disagree"
     );
 
-    let output = run_compress_toon(&fixture, &input, "0", "cjk-toon-dry-run");
+    let output = run_compress_toon(&fixture, &input, "0", "cjk-toon-dry-run", &[]);
     assert!(
         output.status.success(),
         "compress-toon dry-run failed: {}",
@@ -1145,14 +1223,21 @@ fn compress_toon_ascii_emits_toon_when_character_estimator_saves() {
         Some(fixture) => fixture,
         None => return,
     };
-    let input = r#"{"content":"some content","debug":"remove"}"#;
+    // Filler pushes the fixture past the 500-character TOON minimum while
+    // staying pure ASCII, so the two estimators still agree.
+    let filler_input = format!(
+        r#"{{"content":"some content","debug":"remove","filler":"{}"}}"#,
+        "a".repeat(520)
+    );
+    let input = filler_input.as_str();
+    assert!(input.chars().count() >= MIN_TOON_CHARS);
     assert_eq!(
         estimate_tokens(input),
         estimate_tokens_from_bytes(input.len()),
         "ascii fixture should keep the two estimators in agreement"
     );
 
-    let output = run_compress_toon(&fixture, input, "1", "ascii-toon-active");
+    let output = run_compress_toon(&fixture, input, "1", "ascii-toon-active", &[]);
     assert!(
         output.status.success(),
         "compress-toon failed: {}",
@@ -1183,10 +1268,11 @@ fn compress_toon_cjk_active_emits_toon_and_records_character_tokens() {
         None => return,
     };
     let input = serde_json::to_string(&serde_json::json!({
-        "msg": "你好世界你好世界"
+        "msg": "你好世界".repeat(130)
     }))
     .unwrap();
-    let output = run_compress_toon(&fixture, &input, "1", "cjk-toon-active");
+    assert!(input.chars().count() >= MIN_TOON_CHARS);
+    let output = run_compress_toon(&fixture, &input, "1", "cjk-toon-active", &[]);
     assert!(
         output.status.success(),
         "compress-toon failed: {}",
@@ -1217,11 +1303,30 @@ fn compress_toon_invalid_json_exits_with_code_2() {
         Some(fixture) => fixture,
         None => return,
     };
-    let output = run_compress_toon(&fixture, "not json", "1", "toon-invalid-json");
+    // Validation runs before the minimum-length gate, so a short invalid
+    // payload fails with exit code 2 under the default threshold instead
+    // of passing through untouched.
+    let output = run_compress_toon(&fixture, "not json", "1", "toon-invalid-json", &[]);
     assert_eq!(
         output.status.code(),
         Some(2),
-        "invalid JSON must exit 2, stderr={}",
+        "invalid JSON under the default gate must exit 2, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JSON parse error"));
+
+    // The same contract holds with the gate disabled.
+    let output = run_compress_toon(
+        &fixture,
+        "not json",
+        "1",
+        "toon-invalid-json-gate-off",
+        &["--min-toon-chars", "0"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid JSON must exit 2 with the gate disabled, stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("JSON parse error"));
@@ -1831,6 +1936,17 @@ fn compress_records_stats_by_the_winning_operation() {
         cleanup_records[0].operation,
         OperationType::CompressResponse
     );
+    // §4.6 attribution columns arrive with the row.
+    assert_eq!(cleanup_records[0].seam.as_deref(), Some("post_tool"));
+    assert!(cleanup_records[0].content_type.is_some());
+    assert_eq!(
+        cleanup_records[0].compressor_chain.as_deref(),
+        Some(r#"["response-cleanup"]"#)
+    );
+    assert_eq!(
+        cleanup_records[0].tokenizer_id.as_deref(),
+        Some("heuristic-v1")
+    );
     let toon_records = recorder.records_by_session("winner-toon", None).unwrap();
     assert_eq!(toon_records.len(), 1);
     assert_eq!(toon_records[0].operation, OperationType::CompressToon);
@@ -1947,4 +2063,90 @@ fn compress_cli_and_embedded_runtime_share_dispositions_and_counts() {
             .collect();
         assert_eq!(cli_chain, embedded.compressor_chain);
     }
+}
+
+/// Regression for GH-2838: a short payload with real token savings must
+/// pass through unchanged by default, matching the adapter hooks' shared
+/// 500-character minimum instead of being TOON-encoded.
+#[test]
+fn compress_toon_short_payload_passes_through_by_default() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let input = r#"{"a":"short"}"#;
+    assert!(input.chars().count() < MIN_TOON_CHARS);
+
+    let output = run_compress_toon(&fixture, input, "1", "toon-min-skip", &[]);
+    assert!(
+        output.status.success(),
+        "compress-toon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Byte-for-byte contract: stdout must equal the input payload with no
+    // bytes added or stripped (in particular no appended trailing LF), so
+    // automation can detect passthrough by comparing stdout with the input.
+    let emitted = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        emitted, input,
+        "payloads under the minimum must pass through byte-for-byte"
+    );
+    // Legitimate trailing whitespace must survive the gate too: a trailing
+    // LF in the input must neither be stripped nor doubled.
+    let input_lf = format!("{input}\n");
+    let output = run_compress_toon(&fixture, &input_lf, "1", "toon-min-skip-lf", &[]);
+    assert!(
+        output.status.success(),
+        "compress-toon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let emitted = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        emitted, input_lf,
+        "passthrough must preserve a trailing newline byte-for-byte"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("TOON minimum") && stderr.contains("skipping encoding"),
+        "expected the minimum-length skip note on stderr, got {stderr:?}"
+    );
+
+    // Skipped payloads record no stats, same as no-savings runs; the
+    // recorder database is never created when nothing was recorded.
+    let stats_db = fixture.data_dir.join("stats.db");
+    if stats_db.exists() {
+        let recorder = StatsRecorder::new(stats_db).unwrap();
+        let records = recorder.records_by_session("toon-min-skip", None).unwrap();
+        assert!(records.is_empty());
+    }
+}
+
+/// `--min-toon-chars 0` restores the pre-gate behavior for callers that
+/// explicitly want short payloads encoded.
+#[test]
+fn compress_toon_min_chars_zero_encodes_short_payload() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let input = r#"{"a":"short"}"#;
+
+    let output = run_compress_toon(
+        &fixture,
+        input,
+        "1",
+        "toon-min-force",
+        &["--min-toon-chars", "0"],
+    );
+    assert!(
+        output.status.success(),
+        "compress-toon --min-toon-chars 0 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Encoded output is emitted byte-for-byte as well: the TOON text is
+    // already trimmed by the runtime, so no trailing LF is appended.
+    let emitted = String::from_utf8(output.stdout).unwrap();
+    assert_ne!(emitted, input, "min-chars 0 must encode a saving payload");
+    assert_eq!(emitted, "a: short", "expected TOON object encoding");
 }
