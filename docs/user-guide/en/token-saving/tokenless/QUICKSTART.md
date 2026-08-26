@@ -83,7 +83,7 @@ tokenless stats diff <record-id>
 ```
 
 For a visual view of savings over time, follow the
-[AgentSight guide](../../agent-observability/agentsight.md#token-savings-tokenless-integration).
+[AgentSight guide](../../agent-observability/agentsight/integrations.md#tokenless-token-savings).
 When Tokenless and AgentSight run as the same user, the Dashboard reads local
 Tokenless statistics without requiring SLS.
 

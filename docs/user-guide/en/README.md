@@ -48,6 +48,15 @@ ANOLISA provides a complete server-side runtime for AI Agent workloads. Componen
 | Document | Component | Description |
 |----------|-----------|-------------|
 | [AgentSight](agent-observability/agentsight.md) | agentsight | eBPF-based tracing, Token accounting, Web Dashboard |
+| [AgentSight Quick Start](agent-observability/agentsight/QUICKSTART.md) | agentsight | Install, capture the first session, open the Dashboard |
+| [AgentSight Dashboard Guide](agent-observability/agentsight/dashboard.md) | agentsight | Token access and a page-by-page walkthrough |
+| [AgentSight CLI Reference](agent-observability/agentsight/cli-reference.md) | agentsight | Every command and flag with real output |
+| [AgentSight Configuration](agent-observability/agentsight/configuration.md) | agentsight | Config file, feature switches, Agent discovery rules |
+| [Interruption Detection](agent-observability/agentsight/interruption-detection.md) | agentsight | The 18 interruption types and the triage workflow |
+| [AgentSight Deployment](agent-observability/agentsight/deployment.md) | agentsight | systemd, containers/sidecars, macOS, upgrade, uninstall |
+| [AgentSight Data and Storage](agent-observability/agentsight/data-and-storage.md) | agentsight | Databases, retention, HTTP API, Prometheus, ATIF export |
+| [AgentSight Integrations](agent-observability/agentsight/integrations.md) | agentsight | Tokenless, agent-sec-core, enforcer, cosh, Prometheus |
+| [AgentSight Troubleshooting](agent-observability/agentsight/troubleshooting.md) | agentsight | No data, 401, unreachable port, database growth |
 
 ### Agent Security (`agent-security/`)
 

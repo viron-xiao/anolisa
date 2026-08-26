@@ -48,6 +48,15 @@ ANOLISA 为 AI Agent 提供完整的服务端运行时能力。通过 `anolisa` 
 | 文档 | 组件 | 说明 |
 |------|------|------|
 | [AgentSight](agent-observability/agentsight.md) | agentsight | eBPF 追踪、Token 计账、Web Dashboard |
+| [AgentSight 快速开始](agent-observability/agentsight/QUICKSTART.md) | agentsight | 安装、采集第一条会话、打开 Dashboard |
+| [AgentSight Dashboard 指南](agent-observability/agentsight/dashboard.md) | agentsight | 令牌访问方式与逐页说明 |
+| [AgentSight CLI 参考](agent-observability/agentsight/cli-reference.md) | agentsight | 全部命令与参数，附真实输出 |
+| [AgentSight 配置](agent-observability/agentsight/configuration.md) | agentsight | 配置文件、功能开关、Agent 发现规则 |
+| [中断检测](agent-observability/agentsight/interruption-detection.md) | agentsight | 18 种中断类型与排查流程 |
+| [AgentSight 部署](agent-observability/agentsight/deployment.md) | agentsight | systemd、容器/Sidecar、macOS、升级、卸载 |
+| [AgentSight 数据与存储](agent-observability/agentsight/data-and-storage.md) | agentsight | 数据库、保留策略、HTTP API、Prometheus、ATIF 导出 |
+| [AgentSight 集成](agent-observability/agentsight/integrations.md) | agentsight | Tokenless、agent-sec-core、enforcer、cosh、Prometheus |
+| [AgentSight 排查](agent-observability/agentsight/troubleshooting.md) | agentsight | 没数据、401、端口不通、数据库增长 |
 
 ### 安全 `agent-security/`
 

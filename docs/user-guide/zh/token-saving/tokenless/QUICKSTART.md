@@ -81,7 +81,7 @@ tokenless stats diff <record-id>
 ```
 
 需要查看一段时间内的可视化节省趋势时，前往
-[AgentSight 用户指南](../../agent-observability/agentsight.md#token-节省tokenless-集成)。
+[AgentSight 用户指南](../../agent-observability/agentsight/integrations.md#tokenlesstoken-节省)。
 Tokenless 与 AgentSight 由同一用户运行时，Dashboard 可以直接读取本地统计，不需要
 配置 SLS。
 
