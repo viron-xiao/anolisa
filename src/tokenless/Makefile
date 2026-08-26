@@ -65,7 +65,8 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
         setup help \
         npm-package npm-package-all npm-publish prepare-npm-native-binaries \
         python-wheel test-python-runtime agentscope-wheel \
-        test-agentscope-integration test-hooks test-claude-code-detect
+        test-agentscope-integration test-hooks test-claude-code-detect \
+        test-hook-parity
 
 # Default target
 all: build
@@ -141,7 +142,7 @@ $(AGENTSCOPE_PACKAGE_DIR)/pyproject.toml: \
 # for `openclaw plugins install` to succeed.
 build-openclaw-plugin: stamp-adapter-templates
 	@echo "==> Building tokenless OpenClaw plugin..."
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund --package-lock=false
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
@@ -227,9 +228,9 @@ uninstall:
 	rm -rf $(DESTDIR)$(COSH_EXTENSION_DIR)
 
 # Run tests
-test: test-tokenless test-hooks test-integration test-adapters \
-      test-claude-code-detect test-raw-package test-npm-package \
-      test-toon-cleanup
+test: test-tokenless test-hooks test-integration test-hook-parity \
+      test-adapters test-claude-code-detect test-raw-package \
+      test-npm-package test-toon-cleanup
 
 test-tokenless:
 	@echo "==> Testing tokenless..."
@@ -249,15 +250,24 @@ test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_compress_toon_hook.py
-	python3 tests/test_codex_toon_threshold.py
+	python3 tests/test_codex_response_diagnostics.py
 	python3 tests/test_hermes_toon_threshold.py
 	python3 tests/test_compress_schema_hook.py
+	python3 tests/test_hook_contract.py
 	python3 tests/test_hermes_plugin_import.py
 	python3 tests/test_agentscope_middleware.py
 	python3 tests/test_agentscope_v1.py
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_cosh_extension_matcher.py
 	python3 tests/test_resolve_agent_id.py
+
+# Golden parity for the unified-entry hooks (roadmap §5.6): replays the
+# tests/contract corpus through the current hooks against the real debug
+# binary and diffs against goldens captured from the pre-PR-6 hooks.
+test-hook-parity:
+	@echo "==> Testing hook golden parity (real binary)..."
+	cargo build -p tokenless-cli
+	python3 tests/test_hook_parity.py
 
 test-adapters: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Testing openclaw RTK context propagation..."
@@ -347,7 +357,6 @@ clean:
 	cargo clean --release --manifest-path third_party/rtk/Cargo.toml 2>/dev/null || true
 	rm -rf $(OPENCLAW_PLUGIN_SRC_DIR)/dist $(OPENCLAW_PLUGIN_SRC_DIR)/node_modules
 	rm -rf $(ADAPTER_SRC_DIR)/agentscope
-	rm -f  $(OPENCLAW_PLUGIN_SRC_DIR)/package-lock.json
 	rm -f  $(ADAPTER_TEMPLATES) $(COMPONENT_CONTRACT)
 	rm -f  $(AGENTSCOPE_PACKAGE_DIR)/pyproject.toml
 

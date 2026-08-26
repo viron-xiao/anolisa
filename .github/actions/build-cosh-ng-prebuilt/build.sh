@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ACTION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$(cd "$ACTION_DIR/../prebuilt-rust-common" && pwd)"
 FIXED_WORKTREE="${COSH_NG_SOURCE_WORKTREE:-/tmp/anolisa-raw-release-source-worktrees/cosh-ng}"
 VERSION=""
 TARGET_OS=""
@@ -78,7 +79,7 @@ if [ -n "$TAG" ]; then
 fi
 
 install -d -m 0755 "$(dirname "$FIXED_WORKTREE")"
-exec 9>"${FIXED_WORKTREE%/cosh-ng}.lock"
+exec 9>"${FIXED_WORKTREE}.lock"
 flock -n 9 || die "cosh-ng source worktree is already in use"
 
 worktree_registered() {
@@ -145,10 +146,10 @@ cargo metadata \
 
 (
     cd "$FIXED_WORKTREE"
-    python3 "$ACTION_DIR/reproducible-build.py" \
+    python3 "$COMMON_DIR/reproducible-build.py" \
         --source-root "$COMPONENT_ROOT" \
         --source-date-epoch "$SOURCE_DATE_EPOCH" \
-        -- "$ACTION_DIR/cross-profile.sh" "$PROFILE" build \
+        -- "$COMMON_DIR/cross-profile.sh" "$PROFILE" build \
         --release \
         --workspace \
         --locked \
@@ -163,9 +164,9 @@ for binary in cosh-cli cosh-core cosh-gateway cosh-shell; do
         die "Cross build did not produce $TARGET_BIN_DIR/$binary"
     install -p -m 0755 "$TARGET_BIN_DIR/$binary" "$BIN_DIR/$binary"
     if [ "$TARGET_OS" = macos ]; then
-        python3 "$ACTION_DIR/verify-macho.py" --min 11.0 "$BIN_DIR/$binary"
+        python3 "$COMMON_DIR/verify-macho.py" --min 11.0 "$BIN_DIR/$binary"
     else
-        python3 "$ACTION_DIR/verify-glibc.py" \
+        python3 "$COMMON_DIR/verify-glibc.py" \
             --arch "$TARGET_ARCH" --max 2.28 "$BIN_DIR/$binary"
     fi
 done
@@ -202,16 +203,18 @@ ARCHIVE="cosh-ng-$VERSION-$TARGET_OS-$TARGET_ARCH.tar.gz"
     cd "$OUTPUT_DIR"
     sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 )
-python3 "$ACTION_DIR/generate-sbom.py" \
+python3 "$COMMON_DIR/generate-sbom.py" \
     --artifact "$OUTPUT_DIR/$ARCHIVE" \
+    --component cosh-ng \
     --version "$VERSION" \
     --os "$TARGET_OS" \
     --arch "$TARGET_ARCH" \
     --target "$RUST_TARGET" \
     --project-dir "$COMPONENT_ROOT" \
     --source-date-epoch "$SOURCE_DATE_EPOCH" >/dev/null
-python3 "$ACTION_DIR/verify-artifacts.py" \
+python3 "$COMMON_DIR/verify-artifacts.py" \
     --directory "$OUTPUT_DIR" \
+    --component cosh-ng \
     --version "$VERSION" \
     --layout flat \
     --os "$TARGET_OS" \

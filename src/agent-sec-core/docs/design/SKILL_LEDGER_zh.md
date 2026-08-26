@@ -631,7 +631,7 @@ agent-sec-cli skill-ledger certify <skill_dir> --findings /tmp/skill-vetter-find
 
 ### 设计原则
 
-推荐部署模式是 SkillFS 捕获变更并触发 daemon activation refresh。宿主 hook/capability 作为兼容入口保留并默认挂载。除 Hermes 使用 `policy = "observe"` 外，其余支持提示或确认的宿主默认 `policy = "ask"`。OpenClaw、copilot-shell、Hermes 和 Qwen Code 根据 `skill-ledger show` 的统一 exposure summary 决定宿主动作；Codex 和 Qoder CLI 在各自的 Skill 触发边界直接消费只读 `skill-ledger check` 状态。
+推荐部署模式是 SkillFS 捕获变更并触发 daemon activation refresh。宿主 hook/capability 作为兼容入口保留并默认挂载。除 Hermes 使用 `policy = "observe"` 外，其余支持提示或确认的宿主默认 `policy = "ask"`。OpenClaw、Cosh（Legacy 与 NG）、Hermes 和 Qwen Code 根据 `skill-ledger show` 的统一 exposure summary 决定宿主动作；Codex 和 Qoder CLI 在各自的 Skill 触发边界直接消费只读 `skill-ledger check` 状态。
 
 使用 exposure summary 的宿主不直接读取 `check.status`，也不自行实现扫描状态分支：
 
@@ -655,7 +655,7 @@ Policy 语义：
 | `ask` | 默认值。`message == null` 静默放行；`message != null` 时请求用户确认或使用宿主 approval UI。 |
 | `block` | `message != null` 时直接阻断，并把 message 作为原因或告警信息。 |
 
-OpenClaw、copilot-shell、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、执行失败、超时或输出不可解析时保持 fail-open。Qoder CLI 将这些基础设施异常归一为 `error`，继续通过 `observe` / `warn` / `ask` / `block` policy 处理。`block_statuses` / `blockStatuses` 是旧配置字段，新逻辑不再按状态列表判断；旧 `enable_block` / `enableBlock` 仅适用于已有兼容实现。所有宿主都把旧值 `debug` 映射为 `observe`、把旧值 `deny` 映射为 `block`。
+OpenClaw、Cosh（Legacy 与 NG）、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、执行失败、超时或输出不可解析时保持 fail-open。Qoder CLI 将这些基础设施异常归一为 `error`，继续通过 `observe` / `warn` / `ask` / `block` policy 处理。`block_statuses` / `blockStatuses` 是旧配置字段，新逻辑不再按状态列表判断；旧 `enable_block` / `enableBlock` 仅适用于已有兼容实现。所有宿主都把旧值 `debug` 映射为 `observe`、把旧值 `deny` 映射为 `block`。
 
 ### message 触发规则
 
@@ -683,7 +683,7 @@ OpenClaw、copilot-shell、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、�
 | 宿主 | 触发与检查 | `observe` | `warn` | `ask` | `block` | 覆盖与默认值 |
 |------|------------|-----------|--------|-------|---------|------------|
 | OpenClaw | `before_tool_call` 读取 SKILL.md → `show` | debug 后放行 | logger warning 后放行 | `requireApproval` | `block` / `blockReason` | `~/.openclaw/skills/`；`enabled=true, policy="ask"` |
-| copilot-shell | `PreToolUse(skill)` → `show` | stderr 审计后放行 | `decision: "allow"` + `reason` | `decision: "ask"` | `decision: "block"` | project / user / system；默认注册且 policy 为 `ask` |
+| Cosh Legacy / Cosh-NG | `PreToolUse(skill)` → 归一化调用身份 → `show` | stderr 审计后放行 | `decision: "allow"` + `reason` | `decision: "ask"` | `decision: "block"` | project / user / system；默认注册且 policy 为 `ask` |
 | Hermes | `pre_tool_call(skill_view)` → `show` | logger 审计后放行 | 降级为 `observe` 并记录诊断 | 降级为 `observe` 并记录诊断 | `{"action": "block"}` | `~/.hermes/skills/**`；`enabled=true, policy="observe"` |
 | Qoder CLI | `PreToolUse(Skill)` → `check` | stderr 审计后放行 | `decision: "allow"` + `systemMessage` | `permissionDecision: "ask"` | `permissionDecision: "deny"` | project / user；默认注册且 policy 为 `ask` |
 | Codex | `UserPromptSubmit($skill-name)` → `check` | 静默审计后放行 | `systemMessage` 后放行 | fallback 为 `warn` | `decision: "block"` | repo / user / system；默认注册且 policy 为 `ask` |
@@ -693,9 +693,9 @@ OpenClaw、copilot-shell、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、�
 
 以 OpenClaw Plugin 形式分发，默认注册 `skill-ledger` capability，`capabilities.skill-ledger.policy` 默认为 `ask`。`before_tool_call` handler 过滤 read tool 对 `*/SKILL.md` 的访问，解析 `skill_dir` 后调用 `agent-sec-cli skill-ledger show`。`enabled=false` 时完全不注册；`policy=observe` 时只写 debug 审计并放行；`policy=warn` 时通过 `api.logger.warn` 输出告警并放行；`policy=block` 在 summary message 非空时返回 `block`。旧 `enableBlock` 仅在未配置 `policy` 时作为兼容映射，旧 `blockStatuses` 不再参与运行态判断。
 
-### 6.2 copilot-shell（Command Hook）
+### 6.2 Cosh Legacy / Cosh-NG（Command Hook）
 
-独立 Python 脚本 `cosh-extension/hooks/skill_ledger_hook.py`，专为 stdin/stdout 协议设计，不依赖 `agent_sec_cli` 包。默认 Cosh manifest 挂载该 hook，默认 `SKILL_LEDGER_MODE=ask`。该环境变量属于可信宿主或部署环境配置，不应由 Skill、项目脚本或不可信 shell 启动逻辑设置；若需要防止本地 shell profile 被篡改后降级策略，后续应迁移到可信宿主配置源：
+独立 Python 脚本 `cosh-extension/hooks/skill_ledger_hook.py`，专为 stdin/stdout 协议设计，不依赖 `agent_sec_cli` 包。同一 hook 同时接受 Cosh Legacy 和 Cosh-NG 的 `PreToolUse(skill)` 事件，并先把宿主输入归一化为唯一的 Skill 身份，再解析目录并调用 `agent-sec-cli skill-ledger show`。默认 Cosh manifest 挂载该 hook，默认 `SKILL_LEDGER_MODE=ask`。该环境变量属于可信宿主或部署环境配置，不应由 Skill、项目脚本或不可信 shell 启动逻辑设置；若需要防止本地 shell profile 被篡改后降级策略，后续应迁移到可信宿主配置源：
 
 配置：
 ```jsonc
@@ -715,15 +715,41 @@ OpenClaw、copilot-shell、Hermes、Codex 和 Qwen Code 遇到 CLI 不可用、�
 }
 ```
 
-**Skill 目录定位（当前版本范围）**：copilot-shell hook 仅覆盖 project → user → system 三类 skill：
+两种宿主的输入协议分别为：
+
+```jsonc
+// Cosh Legacy
+{ "tool_input": { "skill": "github" } }
+
+// Cosh-NG：显式 invoke
+{ "tool_input": { "action": "invoke", "name": "github" } }
+
+// Cosh-NG：省略 action 时仍表示 invoke
+{ "tool_input": { "name": "github" } }
+```
+
+**调用身份归一化**：只要 `tool_input` 出现 `action` 或 `name` 字段，hook 就按 Cosh-NG 协议解释，且只把 `name` 作为宿主实际执行的 canonical Skill 身份，不回退到 legacy `skill`。`action="invoke"`、缺失 action 和非字符串 action 均按 Cosh-NG 当前的 invoke 语义处理，并要求 `name` 是非空字符串；不支持的字符串 action 属于协议契约异常。若 `action/name` 均未出现，则按 Cosh Legacy 协议读取 `skill`。`name` 与 `skill` 同时出现时必须完全相同，hook 只使用 `strip()` 判断空白值，不改变身份的大小写或原始内容。
+
+`action="list"` 不执行 Skill，hook 因此立即静默放行；该分支不会读取 policy、解析 Skill 目录、初始化密钥或调用 CLI。其它缺失、空白、非字符串或互相冲突的身份，以及缺损或身份冲突的 `skill_context`，都作为协议契约异常按当前 hook policy 返回：
+
+| Policy | 协议契约异常行为 |
+|--------|------------------|
+| `observe` | 写入 stderr 诊断并放行。 |
+| `warn` | 返回 `decision: "allow"` 和用户可见的 `reason`。 |
+| `ask` | 返回 `decision: "ask"` 和确认原因。 |
+| `block` | 返回 `decision: "block"` 和阻断原因。 |
+
+**Skill 目录定位（当前版本范围）**：两种 Cosh 输入协议共用同一目录边界，hook 仅覆盖 project → user → system 三类 Skill：
 - project：`<cwd>/.copilot-shell/skills/<skill>/`
 - user：`~/.copilot-shell/skills/<skill>/`
 - system（RPM）：`/usr/share/anolisa/skills/<skill>/`
 - system（raw install）：`/usr/local/share/anolisa/skills/<skill>/`
 
-当 PreToolUse 事件包含 `skill_context.file_path` 时，hook 优先使用该路径解决 `SKILL.md` 中 `name` 与目录名不一致的问题；但该路径仍必须落在上述 project/user/system 根目录内。若路径落在 custom、extension、remote 或其他目录，当前版本不执行 skill-ledger 检查，hook fail-open，并仅写入 debug 日志说明该 skill 不在当前 hook 支持范围内。
+`skill_context` 是可选的身份佐证和路径来源，不会覆盖归一化后的调用身份。事件不含该字段时，hook 保留按名称查找目录的行为；事件包含该字段时，`skill_name` 必须与归一化身份一致，`file_path` 必须指向现有 `SKILL.md`，且 canonical path 必须落在上述 project/user/system 根目录内。若路径落在 custom、extension、remote 或其他目录，当前版本不执行 skill-ledger 检查，hook 保持既有 fail-open，并仅写入 debug 日志说明该 Skill 不在当前 hook 支持范围内。
 
-**custom / extension / remote Skills**：当前版本的 copilot-shell hook 不覆盖这些来源。未来若扩展覆盖范围，需要单独补充目录解析、信任边界和测试用例。
+**custom / extension / remote Skills**：当前版本的 Cosh hook 不覆盖这些来源。未来若扩展覆盖范围，需要单独补充目录解析、信任边界和测试用例。目录未找到、范围外路径、CLI 缺失或超时、执行失败及输出不可解析等既有基础设施路径仍保持 fail-open；这些路径与上述输入协议契约异常的 policy 映射相互独立。
+
+**检查边界**：该 hook 只保证对 sec-core 收到的原始 `PreToolUse` 快照完成身份归一化和检查，不提供端到端 fail-closed 保证。若同一轮后续 hook 通过 `tool_input_patch` 改写 `action` / `name` / `skill`，可能使最终执行身份与已检查身份不同；该 TOCTOU 问题需要宿主侧身份改写约束作为独立 follow-up 处理。
 
 ### 6.3 Hermes（Plugin Hook）
 
