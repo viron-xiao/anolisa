@@ -477,7 +477,7 @@ export const RiskEnforcementPage: React.FC = () => {
                 <option value="audit" disabled={!supportsMode('audit')}>
                   {t('risk.form.mode.auditOption')}
                 </option>
-                <option value="enforce" disabled={!supportsMode('enforce')}>
+                <option value="enforce" disabled title={t('risk.form.mode.enforceDisabledTooltip')}>
                   {t('risk.form.mode.enforceOption')}
                 </option>
               </select>
