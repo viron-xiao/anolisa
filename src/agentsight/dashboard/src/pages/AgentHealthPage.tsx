@@ -256,6 +256,12 @@ const AgentCard: React.FC<{
     // 后端保证 workspace_path 非根，但仍归一化兜底：无效时回退到 agent 真实工作目录，绝不落到 `/`。
     setDirectory(defaultProtectionDir(preview.workspace_path) || defaultProtectionDir(agent.workspace_path));
     setSources(preview.source_paths);
+    // 回填已有策略的可信目标，避免在保存时被清空丢失（P2）。仅当 preview 含可信目标时
+    // 才覆盖，扫描无策略目录返回空数组时保留用户当前输入。
+    const existingTrusted = (preview.trusted_endpoints ?? [])[0];
+    if (existingTrusted) {
+      setTrustedTarget(existingTrusted);
+    }
     return preview;
   };
 
@@ -289,6 +295,11 @@ const AgentCard: React.FC<{
     }
     setProtecting(true);
     try {
+      // 若该 Agent 已有活跃 binding，先解绑旧的再新建，做替换：避免与已有 ActPlane
+      // binding 冲突、留下重复 binding，或在保存时丢失可信目标（P2）。
+      if (bindingId) {
+        await detachEnforcementBinding(bindingId);
+      }
       const created = await createCredentialBinding({
         agent_id: agent.agent_name,
         root_pid: agent.pid,
