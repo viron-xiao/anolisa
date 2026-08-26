@@ -1135,10 +1135,10 @@ const AgentStatusSection: React.FC<{ addToast: (msg: string) => void }> = ({ add
                 onRestart={handleRestart}
                 restartingPids={restartingPids}
                 protectionBindings={protectionBindings}
-                onProtected={handleProtected}
+                onProtected={(pid, bindingId) => setProtectionBindings(previous => new Map(previous).set(pid, bindingId))}
                 onDetachProtection={handleDetachProtection}
                 addToast={addToast}
-                pendingCaseCounts={pendingCaseCounts}
+                pendingCaseCounts={pendingCasesByAgent}
                 latency={latencyForAgent(group.agentName)}
               />
             ),
