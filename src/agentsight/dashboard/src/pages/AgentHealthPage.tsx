@@ -419,11 +419,10 @@ const AgentCard: React.FC<{
     }
     setProtecting(true);
     try {
-      // 若该 Agent 已有活跃 binding，先解绑旧的再新建，做替换：避免与已有 ActPlane
-      // binding 冲突、留下重复 binding，或在保存时丢失可信目标（P2）。
-      if (bindingId) {
-        await detachEnforcementBinding(bindingId);
-      }
+      // 原子替换（先建后删）：先创建新的凭据保护绑定，成功后再解绑旧绑定。
+      // 严禁先删旧、再建新——一旦创建失败（503/校验/网络），旧绑定已被删除，
+      // 会留下 Agent 静默失去保护的空窗（最坏失败模式）。
+      const previousBindingId = bindingId;
       const created = await createCredentialBinding({
         agent_id: agent.agent_name,
         root_pid: agent.pid,
@@ -434,6 +433,17 @@ const AgentCard: React.FC<{
         taint_ttl_secs: 900,
         destination_scope: 'public_ipv4',
       });
+      // 新保护已生效，再清理旧绑定。删旧失败不算失败（新绑定已在，保护未中断），
+      // 仅告警提示可稍后手动解绑，避免与已有 ActPlane binding 冲突/留下重复 binding。
+      if (previousBindingId && previousBindingId !== created.request.binding_id) {
+        try {
+          await detachEnforcementBinding(previousBindingId);
+        } catch (detachError: any) {
+          addToast(
+            `⚠️ 新保护已生效，但旧绑定清理失败：${detachError.message ?? '请稍后在设置中手动解绑'}`
+          );
+        }
+      }
       onProtected(agent.pid, created.request.binding_id);
       setShowProtection(false);
       addToast('✅ 已开启审计保护：发现风险时记录证据，不阻断 Agent');
